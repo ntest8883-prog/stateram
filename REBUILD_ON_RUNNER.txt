@@ -1,0 +1,1 @@
+GitHub Actions runs ./build.sh and rebuilds all binaries for its own VM.
