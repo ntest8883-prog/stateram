@@ -1,4 +1,4 @@
-name: StateRAM real-kernel probe
+name: StateRAM automated real-memory lab
 
 on:
   workflow_dispatch:
@@ -7,104 +7,225 @@ permissions:
   contents: read
 
 jobs:
-  probe:
+  lab:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 75
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Show runner environment
+      - name: Show host
         shell: bash
         run: |
           set -euxo pipefail
+
           uname -a
           free -h
-          df -h /
+          swapon --show || true
 
-          echo "=== cgroup ==="
-          if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
-            echo "cgroup v2: YES"
-            cat /sys/fs/cgroup/cgroup.controllers
-          else
-            echo "cgroup v2: NO"
-          fi
+          echo "=== cgroup v2 ==="
+          cat /sys/fs/cgroup/cgroup.controllers
 
-          echo "=== userfaultfd sysctl/device ==="
+          echo "=== userfaultfd policy ==="
           cat /proc/sys/vm/unprivileged_userfaultfd 2>/dev/null || true
           ls -l /dev/userfaultfd 2>/dev/null || true
 
-          echo "=== process security ==="
-          grep -E 'NoNewPrivs|Seccomp' /proc/self/status || true
-
-      - name: Build StateRAM-12
+      - name: Build StateRAM
         shell: bash
         run: |
           set -euxo pipefail
+
           chmod +x *.sh *.py
           ./build.sh
 
-      - name: Probe userfaultfd
-        id: probe
+      - name: Require working userfaultfd
         shell: bash
         run: |
-          set +e
+          set -euo pipefail
 
-          echo "=== normal-user probe ===" | tee userfaultfd_probe.log
-          ./userfaultfd_probe 2>&1 | tee -a userfaultfd_probe.log
+          ./userfaultfd_probe 2>&1 | tee userfaultfd_probe.log
 
-          echo | tee -a userfaultfd_probe.log
-          echo "=== root probe ===" | tee -a userfaultfd_probe.log
-          sudo ./userfaultfd_probe 2>&1 | tee -a userfaultfd_probe.log
+          grep -q "UFFDIO_API.*OK" userfaultfd_probe.log
 
-          if grep -q "UFFDIO_API.*OK" userfaultfd_probe.log; then
-            echo "uffd_ok=true" >> "$GITHUB_OUTPUT"
-            echo "STATE-RAM CORE MECHANISM: AVAILABLE"
-          else
-            echo "uffd_ok=false" >> "$GITHUB_OUTPUT"
-            echo "STATE-RAM CORE MECHANISM: NOT AVAILABLE"
-          fi
+          echo "userfaultfd requirement PASSED"
 
-          exit 0
+      # ------------------------------------------------------------
+      # STAGE 1
+      # Small real StateRAM run under an actual hard memory ceiling.
+      #
+      # 256 MiB logical state
+      # 128 MiB StateRAM raw target
+      # 192 MiB kernel-enforced total memory limit
+      # swap disabled
+      # ------------------------------------------------------------
 
-      - name: Tiny real StateRAM reconstruction smoke test
-        if: steps.probe.outputs.uffd_ok == 'true'
+      - name: Stage 1 - 256 MiB logical under 192 MiB hard cap
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo ./run_in_cgroup.py \
+            --memory 192M \
+            --swap 0 \
+            -- \
+            ./stateram12_real_bench \
+              --mode stateram \
+              --logical-gb 0.25 \
+              --objects 4 \
+              --segment-mb 8 \
+              --raw-target-mb 128 \
+              --shadow-depth 2 \
+              --profile normal \
+              --steps 200 \
+              --csv sr_256m.csv \
+            2>&1 | tee sr_256m.log
+
+          python3 analyze.py sr_256m.csv \
+            | tee sr_256m_analysis.json
+
+      # ------------------------------------------------------------
+      # STAGE 2
+      #
+      # 1 GiB logical
+      # 512 MiB StateRAM raw target
+      # 640 MiB hard memory limit
+      # swap disabled
+      # ------------------------------------------------------------
+
+      - name: Stage 2 - 1 GiB logical under 640 MiB hard cap
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo ./run_in_cgroup.py \
+            --memory 640M \
+            --swap 0 \
+            -- \
+            ./stateram12_real_bench \
+              --mode stateram \
+              --logical-gb 1 \
+              --objects 8 \
+              --segment-mb 8 \
+              --raw-target-mb 512 \
+              --shadow-depth 2 \
+              --profile normal \
+              --steps 500 \
+              --csv sr_1g.csv \
+            2>&1 | tee sr_1g.log
+
+          python3 analyze.py sr_1g.csv \
+            | tee sr_1g_analysis.json
+
+      # ------------------------------------------------------------
+      # STAGE 3
+      #
+      # REAL 4 -> 8 TEST
+      #
+      # 8 GiB logical state
+      # 3 GiB StateRAM raw target
+      # HARD 4 GiB cgroup memory ceiling
+      # swap disabled
+      # ------------------------------------------------------------
+
+      - name: Stage 3 - REAL 4 to 8 GiB test
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo ./run_in_cgroup.py \
+            --memory 4G \
+            --swap 0 \
+            -- \
+            ./stateram12_real_bench \
+              --mode stateram \
+              --logical-gb 8 \
+              --objects 16 \
+              --segment-mb 8 \
+              --raw-target-mb 3000 \
+              --shadow-depth 2 \
+              --profile normal \
+              --steps 1000 \
+              --csv sr_4to8.csv \
+            2>&1 | tee sr_4to8.log
+
+          python3 analyze.py sr_4to8.csv \
+            | tee sr_4to8_analysis.json
+
+      # ------------------------------------------------------------
+      # SAME-MACHINE 12 GiB REFERENCE
+      #
+      # This gives us the proper latency baseline on the SAME
+      # GitHub runner environment used by StateRAM.
+      # ------------------------------------------------------------
+
+      - name: Stage 4 - 12 GiB real-RAM reference
         shell: bash
         run: |
           set -euxo pipefail
 
           ./stateram12_real_bench \
-            --mode stateram \
-            --logical-gb 0.0625 \
-            --objects 4 \
-            --segment-mb 2 \
-            --raw-target-mb 32 \
-            --shadow-depth 2 \
+            --mode raw \
+            --logical-gb 12 \
+            --objects 24 \
+            --segment-mb 8 \
+            --raw-target-mb 3000 \
+            --shadow-depth 0 \
             --profile normal \
-            --steps 100 \
-            --csv github_tiny_stateram.csv \
-            2>&1 | tee github_tiny_stateram.log
+            --steps 2000 \
+            --csv raw_12g_same_runner.csv \
+            2>&1 | tee raw_12g_same_runner.log
 
-          python3 analyze.py github_tiny_stateram.csv
+          python3 analyze.py raw_12g_same_runner.csv \
+            | tee raw_12g_same_runner_analysis.json
 
-      - name: Test cgroup-v2 control
+      # ------------------------------------------------------------
+      # STAGE 5 — THE MAIN EXPERIMENT
+      #
+      # 12 GiB logical state
+      # HARD 4 GiB RAM ceiling
+      # swap disabled
+      #
+      # This is the actual real 4 -> 12 StateRAM experiment.
+      # ------------------------------------------------------------
+
+      - name: Stage 5 - REAL 4 to 12 GiB StateRAM test
         shell: bash
         run: |
-          set +e
+          set -euxo pipefail
 
-          CG="/sys/fs/cgroup/stateram-probe-$RANDOM"
+          sudo ./run_in_cgroup.py \
+            --memory 4G \
+            --swap 0 \
+            -- \
+            ./stateram12_real_bench \
+              --mode stateram \
+              --logical-gb 12 \
+              --objects 24 \
+              --segment-mb 8 \
+              --raw-target-mb 3000 \
+              --shadow-depth 2 \
+              --profile normal \
+              --steps 2000 \
+              --csv sr_4to12.csv \
+            2>&1 | tee sr_4to12.log
 
-          if sudo mkdir "$CG"; then
-            echo "child_cgroup_create=OK"
+          python3 analyze.py sr_4to12.csv \
+            | tee sr_4to12_analysis.json
 
-            if echo $((256*1024*1024)) | sudo tee "$CG/memory.max"; then
-              echo "memory.max_write=OK"
-            else
-              echo "memory.max_write=FAIL"
-            fi
+      # ------------------------------------------------------------
+      # SAVE EVERYTHING
+      # Runs even if one of the experiments fails.
+      # ------------------------------------------------------------
 
-            sudo rmdir "$CG" || true
-          else
-            echo "child_cgroup_create=FAIL"
-          fi
+      - name: Upload all StateRAM results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stateram-automated-lab-results
+          if-no-files-found: warn
+          path: |
+            *.csv
+            *.log
+            *_analysis.json
+            userfaultfd_probe.log
