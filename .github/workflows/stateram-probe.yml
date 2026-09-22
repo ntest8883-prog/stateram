@@ -1,0 +1,110 @@
+name: StateRAM real-kernel probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show runner environment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          uname -a
+          free -h
+          df -h /
+
+          echo "=== cgroup ==="
+          if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+            echo "cgroup v2: YES"
+            cat /sys/fs/cgroup/cgroup.controllers
+          else
+            echo "cgroup v2: NO"
+          fi
+
+          echo "=== userfaultfd sysctl/device ==="
+          cat /proc/sys/vm/unprivileged_userfaultfd 2>/dev/null || true
+          ls -l /dev/userfaultfd 2>/dev/null || true
+
+          echo "=== process security ==="
+          grep -E 'NoNewPrivs|Seccomp' /proc/self/status || true
+
+      - name: Build StateRAM-12
+        shell: bash
+        run: |
+          set -euxo pipefail
+          chmod +x *.sh *.py
+          ./build.sh
+
+      - name: Probe userfaultfd
+        id: probe
+        shell: bash
+        run: |
+          set +e
+
+          echo "=== normal-user probe ===" | tee userfaultfd_probe.log
+          ./userfaultfd_probe 2>&1 | tee -a userfaultfd_probe.log
+
+          echo | tee -a userfaultfd_probe.log
+          echo "=== root probe ===" | tee -a userfaultfd_probe.log
+          sudo ./userfaultfd_probe 2>&1 | tee -a userfaultfd_probe.log
+
+          if grep -q "UFFDIO_API.*OK" userfaultfd_probe.log; then
+            echo "uffd_ok=true" >> "$GITHUB_OUTPUT"
+            echo "STATE-RAM CORE MECHANISM: AVAILABLE"
+          else
+            echo "uffd_ok=false" >> "$GITHUB_OUTPUT"
+            echo "STATE-RAM CORE MECHANISM: NOT AVAILABLE"
+          fi
+
+          exit 0
+
+      - name: Tiny real StateRAM reconstruction smoke test
+        if: steps.probe.outputs.uffd_ok == 'true'
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          ./stateram12_real_bench \
+            --mode stateram \
+            --logical-gb 0.0625 \
+            --objects 4 \
+            --segment-mb 2 \
+            --raw-target-mb 32 \
+            --shadow-depth 2 \
+            --profile normal \
+            --steps 100 \
+            --csv github_tiny_stateram.csv \
+            2>&1 | tee github_tiny_stateram.log
+
+          python3 analyze.py github_tiny_stateram.csv
+
+      - name: Test cgroup-v2 control
+        shell: bash
+        run: |
+          set +e
+
+          CG="/sys/fs/cgroup/stateram-probe-$RANDOM"
+
+          if sudo mkdir "$CG"; then
+            echo "child_cgroup_create=OK"
+
+            if echo $((256*1024*1024)) | sudo tee "$CG/memory.max"; then
+              echo "memory.max_write=OK"
+            else
+              echo "memory.max_write=FAIL"
+            fi
+
+            sudo rmdir "$CG" || true
+          else
+            echo "child_cgroup_create=FAIL"
+          fi
