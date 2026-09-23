@@ -1,4 +1,4 @@
-name: StateRAM decisive 4-to-12 proof
+name: StateRAM decisive 4-to-12 proof v2
 
 on:
   workflow_dispatch:
@@ -15,7 +15,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Verify host and userfaultfd
+      - name: Build and verify userfaultfd
         shell: bash
         run: |
           set -euxo pipefail
@@ -27,17 +27,18 @@ jobs:
           ./userfaultfd_probe 2>&1 | tee userfaultfd_probe.log
           grep -q "UFFDIO_API.*OK" userfaultfd_probe.log
 
-      - name: Generate decisive full-coverage benchmark
+      - name: Create deterministic full-coverage benchmark
         shell: bash
         run: |
-          cat > stateram12_decisive.c <<'STATE_RAM_C_EOF'
-          #define _GNU_SOURCE
-          #include "stateram9.h"
-          #include <errno.h>
-          #include <inttypes.h>
-          #include <stdint.h>
-          #include <stdio.h>
-          #include <stdlib.h>
-          #include <string.h>
-          #include <sys/mman.h>
-         
+          set -euxo pipefail
+          cp stateram12_real_bench.c stateram12_decisive.c
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p=Path("stateram12_decisive.c")
+          s=p.read_text()
+
+          s=s.replace(
+              "static size_t tracked_raw_bytes=0;",
+              "static size_t tracked_ra
