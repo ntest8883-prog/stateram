@@ -1,0 +1,219 @@
+            std::lock_guard<std::mutex> capacity_lk(ctx->capacity_mu);
+            if (!ensure_foreground_capacity(ctx, SEGMENT_BYTES)) {
+                std::lock_guard<std::mutex> lk(s.mu);
+                s.restoring = false;
+                s.cv.notify_all();
+                ctx->promotion_failures.fetch_add(1, std::memory_order_relaxed);
+                return SR_ERR_BUDGET;
+            }
+            ctx->raw_inflight_bytes.fetch_add(SEGMENT_BYTES, std::memory_order_relaxed);
+        }
+
+        BaseKind base_kind = BaseKind::NONE;
+        sr::platform::Blob base_blob;
+        uint64_t overlay_bitmap = 0;
+        std::array<std::unique_ptr<OverlayPage>, PAGES_PER_SEGMENT> overlay_copy{};
+        uint64_t expected_hash = 0;
+        bool hash_valid = false;
+
+        {
+            std::lock_guard<std::mutex> lk(s.mu);
+            base_kind = s.base_kind;
+            base_blob = s.base_blob;
+            overlay_bitmap = s.overlay_bitmap;
+            expected_hash = s.authoritative_hash;
+            hash_valid = s.hash_valid;
+
+            for (size_t p = 0; p < PAGES_PER_SEGMENT; ++p) {
+                if ((overlay_bitmap & (1ull << p)) != 0 && s.overlay[p]) {
+                    overlay_copy[p] = std::make_unique<OverlayPage>(*s.overlay[p]);
+                }
+            }
+        }
+
+        std::vector<uint8_t> scratch;
+        bool ok = build_from_base(
+            obj,
+            seg_index,
+            base_kind,
+            base_blob,
+            overlay_bitmap,
+            overlay_copy,
+            scratch);
+
+        if (ok && hash_valid) {
+            const uint64_t got = fnv1a64(scratch.data(), scratch.size());
+            ok = got == expected_hash;
+        }
+
+        uint8_t* target = obj->arena + seg_index * SEGMENT_BYTES;
+        if (ok) {
+            ok = sr::platform::commit_pages(target, SEGMENT_BYTES);
+        }
+
+        if (ok) {
+            std::memset(target, 0, SEGMENT_BYTES);
+            std::memcpy(target, scratch.data(), scratch.size());
+        }
+
+        const double elapsed = sr::platform::now_ms() - t0;
+
+        {
+            std::lock_guard<std::mutex> lk(s.mu);
+            if (ok) {
+                s.raw_committed = true;
+                s.measured_restore_ms = elapsed;
+                s.last_access_tick = sr::platform::monotonic_tick_ns();
+                ++s.promotion_count;
+
+                if (!s.hash_valid) {
+                    s.authoritative_hash = fnv1a64(target, obj->segment_actual_bytes(seg_index));
+                    s.hash_valid = true;
+                }
+
+                ctx->raw_resident_bytes.fetch_add(SEGMENT_BYTES, std::memory_order_relaxed);
+                obj->raw_resident_bytes.fetch_add(SEGMENT_BYTES, std::memory_order_relaxed);
+                ctx->promotions.fetch_add(1, std::memory_order_relaxed);
+                obj->promotion_count.fetch_add(1, std::memory_order_relaxed);
+
+                if (pin) {
+                    if (s.pin_count == 0) {
+                        ctx->pinned_bytes.fetch_add(SEGMENT_BYTES, std::memory_order_relaxed);
+                    }
+                    ++s.pin_count;
+                }
+            } else {
+                ctx->promotion_failures.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            s.restoring = false;
+            s.cv.notify_all();
+        }
+
+        ctx->raw_inflight_bytes.fetch_sub(SEGMENT_BYTES, std::memory_order_relaxed);
+        set_metric_promotion(ctx, elapsed);
+        return ok ? SR_OK : (hash_valid ? SR_ERR_CORRUPTION : SR_ERR_BACKING);
+    }
+}
+
+static void unpin_segment(Context* ctx, const std::shared_ptr<Object>& obj, size_t seg_index) {
+    if (!ctx || !obj || seg_index >= obj->segment_count()) return;
+    Segment& s = *obj->segments[seg_index];
+    std::lock_guard<std::mutex> lk(s.mu);
+    if (s.pin_count > 0) {
+        --s.pin_count;
+        if (s.pin_count == 0) {
+            ctx->pinned_bytes.fetch_sub(SEGMENT_BYTES, std::memory_order_relaxed);
+        }
+    }
+}
+
+static double semantic_protection(const Object& obj) {
+    switch (obj.semantic_class) {
+        case SR_SEM_CRITICAL_INTERACTIVE: return 8.0e15;
+        case SR_SEM_USER_DOCUMENT: return 5.0e15;
+        case SR_SEM_HISTORY: return 2.5e15;
+        case SR_SEM_DERIVED_INDEX: return 1.5e15;
+        case SR_SEM_SHARED_IMMUTABLE: return 1.0e15;
+        case SR_SEM_FILE_BACKED_ASSET: return 0.5e15;
+        case SR_SEM_REBUILDABLE_DERIVED: return 0.2e15;
+        case SR_SEM_CACHE:
+        default: return 0.0;
+    }
+}
+
+struct Candidate {
+    std::shared_ptr<Object> obj;
+    size_t seg_index = 0;
+    double score = -std::numeric_limits<double>::infinity();
+};
+
+static Candidate choose_eviction_candidate(Context* ctx, uint32_t pressure) {
+    Candidate best{};
+    const uint64_t now = sr::platform::monotonic_tick_ns();
+
+    for (auto& obj : snapshot_objects(ctx)) {
+        const double protect = semantic_protection(*obj);
+        const bool cold = obj->cold_hint.load(std::memory_order_relaxed) != 0;
+        const bool hot = obj->hot_hint.load(std::memory_order_relaxed) != 0;
+
+        for (size_t i = 0; i < obj->segment_count(); ++i) {
+            Segment& s = *obj->segments[i];
+            std::unique_lock<std::mutex> lk(s.mu, std::try_to_lock);
+            if (!lk.owns_lock()) continue;
+            if (!s.raw_committed || s.pin_count != 0 || s.restoring || s.retired) continue;
+
+            const uint64_t seg_off = obj->segment_offset(i);
+            const bool protected_prefix =
+                (obj->flags & SR_OBJECT_PROTECT_CRITICAL_PREFIX) != 0 &&
+                seg_off < obj->critical_prefix_bytes;
+
+            if (protected_prefix && pressure < 3) continue;
+
+            const double age = s.last_access_tick == 0
+                ? 1.0e15
+                : static_cast<double>(now - s.last_access_tick);
+
+            double score = age;
+            if (cold) score += 1.0e16;
+            if (hot) score -= 1.0e16;
+            score -= protect;
+
+            if (s.base_kind == BaseKind::RECIPE ||
+                s.base_kind == BaseKind::FILE_REF ||
+                s.base_kind == BaseKind::DISCARDABLE) {
+                score += 2.0e15;
+            }
+
+            if (score > best.score) {
+                best.obj = obj;
+                best.seg_index = i;
+                best.score = score;
+            }
+        }
+    }
+
+    return best;
+}
+
+static bool direct_decommit_with_existing_base(
+    Context* ctx,
+    const std::shared_ptr<Object>& obj,
+    size_t seg_index,
+    uint32_t overlay_limit
+) {
+    Segment& s = *obj->segments[seg_index];
+    std::lock_guard<std::mutex> lk(s.mu);
+
+    if (!s.raw_committed || s.pin_count != 0 || s.restoring || s.retired) return false;
+    if (s.base_kind == BaseKind::NONE) return false;
+
+    const size_t overlay_pages = overlay_page_count(s.overlay_bitmap);
+    if (overlay_pages > overlay_limit) return false;
+
+    uint8_t* addr = obj->arena + seg_index * SEGMENT_BYTES;
+    if (!sr::platform::decommit_pages(addr, SEGMENT_BYTES)) return false;
+
+    s.raw_committed = false;
+    ++s.eviction_count;
+    obj->eviction_count.fetch_add(1, std::memory_order_relaxed);
+    ctx->streaming_evictions.fetch_add(1, std::memory_order_relaxed);
+    ctx->raw_resident_bytes.fetch_sub(SEGMENT_BYTES, std::memory_order_relaxed);
+    obj->raw_resident_bytes.fetch_sub(SEGMENT_BYTES, std::memory_order_relaxed);
+    return true;
+}
+
+static bool consolidate_and_decommit(
+    Context* ctx,
+    const std::shared_ptr<Object>& obj,
+    size_t seg_index
+) {
+    Segment& s = *obj->segments[seg_index];
+
+    uint64_t generation = 0;
+    std::vector<uint8_t> raw;
+    const size_t actual = obj->segment_actual_bytes(seg_index);
+
+    {
+        std::lock_guard<std::mutex> lk(s.mu);
+        if (!s.raw_committed || s.pin_count != 0 || s.restoring || s.retired) return false;
