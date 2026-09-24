@@ -390,6 +390,26 @@ static DWORD WINAPI deep_thread_proc(
     Region* r =
         static_cast<Region*>(arg);
 
+    /*
+      Phase 14 foreground-aware policy:
+
+      This thread restores state that is NOT required for the immediate
+      foreground resume. It therefore enters Windows background mode and
+      cooperatively yields between small batches.
+
+      The synchronous sr_resume_core() path remains on the caller thread and
+      is NOT placed in background mode. That is the critical distinction:
+      background work gives way, while the tiny resume core may burst briefly.
+    */
+    bool background_ok =
+        SetThreadPriority(
+            GetCurrentThread(),
+            THREAD_MODE_BACKGROUND_BEGIN) != FALSE;
+
+    if (background_ok) {
+        r->metrics.deep_background_mode_entered = 1;
+    }
+
     double t0 =
         now_ms();
 
@@ -397,14 +417,85 @@ static DWORD WINAPI deep_thread_proc(
         r->core_bytes /
         UNIT_BYTES;
 
-    bool ok =
-        restore_range(
-            r,
-            core_units,
-            r->units);
+    std::vector<uint8_t> raw(
+        UNIT_BYTES);
+
+    bool ok = true;
+
+    for (size_t u = core_units;
+         u < r->units;
+         ++u) {
+        if (!build_unit(
+                r,
+                u,
+                raw)) {
+            ok = false;
+            break;
+        }
+
+        uint8_t* target =
+            r->arena +
+            u * UNIT_BYTES;
+
+        void* p =
+            VirtualAlloc(
+                target,
+                UNIT_BYTES,
+                MEM_COMMIT,
+                PAGE_READWRITE);
+
+        if (p != target) {
+            ok = false;
+            break;
+        }
+
+        std::memcpy(
+            target,
+            raw.data(),
+            UNIT_BYTES);
+
+        r->metrics.deep_slices += 1;
+
+        /*
+          2 x 256 KiB = 512 KiB per cooperative slice.
+          This intentionally trades some deep-restore completion time for
+          foreground safety on weak CPUs.
+        */
+        size_t restored =
+            (u - core_units) + 1;
+
+        if ((restored % 2) == 0 &&
+            (u + 1) < r->units) {
+            DWORD sleep_ms = 1;
+
+            MEMORYSTATUSEX ms{};
+            ms.dwLength = sizeof(ms);
+
+            if (GlobalMemoryStatusEx(&ms)) {
+                constexpr uint64_t PRESSURE_AVAIL =
+                    768ull * 1024ull * 1024ull;
+
+                if (ms.dwMemoryLoad >= 85 ||
+                    ms.ullAvailPhys <
+                        PRESSURE_AVAIL) {
+                    sleep_ms = 10;
+                    r->metrics.deep_pressure_yields += 1;
+                }
+            }
+
+            Sleep(sleep_ms);
+            r->metrics.deep_yields += 1;
+        }
+    }
 
     r->metrics.deep_restore_ms =
         now_ms() - t0;
+
+    if (background_ok) {
+        SetThreadPriority(
+            GetCurrentThread(),
+            THREAD_MODE_BACKGROUND_END);
+    }
 
     r->deep_ok.store(
         ok ? 1 : 0,
@@ -718,7 +809,7 @@ static DWORD WINAPI baseline_thread_proc(
 
 
 SR_API uint32_t sr_api_version() {
-    return 0x000B0001u;
+    return 0x000E0001u;
 }
 
 SR_API SRHandle sr_create(
