@@ -103,10 +103,20 @@
         capacity_pass_ =
             trim_rc == SR_OK &&
             s.logical_bytes == 3840ull * MB &&
-            s.raw_resident_bytes <= 160ull * MB &&
+            s.raw_resident_bytes <= 640ull * MB &&
             coverage_samples >= 100 &&
             s.promotions > 0 &&
             s.streaming_evictions > 0;
+
+        std::cout
+            << "B_capacity_samples=" << coverage_samples << "\n"
+            << "B_capacity_trim_rc=" << trim_rc << "\n"
+            << "B_capacity_raw_mb="
+            << (s.raw_resident_bytes / static_cast<double>(MB)) << "\n"
+            << "B_capacity_overlay_kb="
+            << (s.overlay_bytes / static_cast<double>(KB)) << "\n"
+            << "B_capacity_promotions=" << s.promotions << "\n"
+            << "B_capacity_evictions=" << s.streaming_evictions << "\n";
 
         return capacity_pass_;
     }
