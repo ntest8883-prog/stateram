@@ -718,7 +718,7 @@ static DWORD WINAPI baseline_thread_proc(
 
 
 SR_API uint32_t sr_api_version() {
-    return 0x00090001u;
+    return 0x000B0001u;
 }
 
 SR_API SRHandle sr_create(
@@ -1346,6 +1346,50 @@ SR_API int sr_wait_deep(
     }
 
     return ok ? 1 : 0;
+}
+
+SR_API int sr_rearm_existing_capsule(
+    SRHandle handle
+) {
+    Region* r =
+        static_cast<Region*>(
+            handle);
+
+    if (!r ||
+        !r->arena ||
+        !r->pack ||
+        r->deep_thread ||
+        r->baseline_thread) {
+        return 0;
+    }
+
+    if (r->state.load(
+            std::memory_order_acquire) !=
+            SR_ACTIVE_CAPSULE) {
+        return 0;
+    }
+
+    /*
+       At this point the raw state has been completely reconstructed and
+       the capsule represents exactly that same state. Reset write-watch
+       now, before the cooperative application resumes mutating the arena.
+       The next sr_enter_dormant() appends only pages changed since here.
+    */
+    if (ResetWriteWatch(
+            r->arena,
+            r->bytes) != 0) {
+        return 0;
+    }
+
+    r->metrics.capsule_rearms += 1;
+
+    r->state.store(
+        SR_ACTIVE_BASELINE,
+        std::memory_order_release);
+
+    sync_metric_state(r);
+
+    return 1;
 }
 
 SR_API int sr_release_capsule(
