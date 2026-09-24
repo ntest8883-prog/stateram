@@ -29,9 +29,6 @@ endif()
 add_executable(stateram_core_selfcheck examples/core_selfcheck.cpp)
 target_link_libraries(stateram_core_selfcheck PRIVATE stateram_core)
 
-add_executable(stateram_cooperative_demo examples/cooperative_demo.cpp)
-target_link_libraries(stateram_cooperative_demo PRIVATE stateram_core)
-
 if (WIN32)
     add_executable(stateram_workbench WIN32 workbench/workbench_win32.cpp)
     set_target_properties(stateram_workbench PROPERTIES OUTPUT_NAME "StateRAM_Workbench")
