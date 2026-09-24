@@ -18,7 +18,7 @@ target_include_directories(stateram_core
 target_compile_definitions(stateram_core PRIVATE STATERAM_CORE_BUILD)
 
 if (MSVC)
-    target_compile_options(stateram_core PRIVATE /W4 /EHsc)
+    target_compile_options(stateram_core PRIVATE /W4 /EHsc /utf-8)
     target_link_libraries(stateram_core PRIVATE Cabinet)
 else()
     target_compile_options(stateram_core PRIVATE -Wall -Wextra -Wpedantic)
