@@ -1,4 +1,4 @@
-name: StateRAM Windows Phase 2 user-mode engine
+name: StateRAM Windows Phase 3 app-aware prewarm
 
 on:
   workflow_dispatch:
@@ -7,79 +7,44 @@ permissions:
   contents: read
 
 jobs:
-  phase2:
+  phase3:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build Windows StateRAM with MSVC
+      - name: Build with MSVC
         shell: powershell
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (-not $vs) { throw "Visual Studio C++ toolchain not found" }
           $devcmd = Join-Path $vs "Common7\Tools\VsDevCmd.bat"
-          cmd /c "`"$devcmd`" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /O2 /EHsc /W4 stateram_win_bench.cpp /link Psapi.lib /out:stateram_win_bench.exe"
+          cmd /c "`"$devcmd`" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /O2 /EHsc /W4 stateram_phase3_appaware.cpp /link Psapi.lib /out:stateram_phase3_appaware.exe"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: 8 GiB target-machine simulation
+      - name: Run one disposable app-awareness experiment
         shell: powershell
         run: |
-          .\stateram_win_bench.exe `
-            --logical-gb 8 `
-            --max-budget-mb 543 `
-            --min-budget-mb 256 `
-            --safety-reserve-mb 878 `
-            --hard-limit-mb 4096 `
-            --shadow-depth 4 `
-            --profile normal `
-            --steps 2500 `
-            --seed 81001 `
-            --json win8.json
+          .\stateram_phase3_appaware.exe `
+            --parent `
+            --mb 256 `
+            --prefetch-mb 192 `
+            --json windows_phase3.json
 
-      - name: 12 GiB stretch simulation
+      - name: Gate
         shell: powershell
         run: |
-          .\stateram_win_bench.exe `
-            --logical-gb 12 `
-            --max-budget-mb 543 `
-            --min-budget-mb 256 `
-            --safety-reserve-mb 878 `
-            --hard-limit-mb 4096 `
-            --shadow-depth 4 `
-            --profile normal `
-            --steps 2500 `
-            --seed 12001 `
-            --json win12.json
-
-      - name: Weak-CPU hostile switching simulation
-        shell: powershell
-        run: |
-          .\stateram_win_bench.exe `
-            --logical-gb 12 `
-            --max-budget-mb 543 `
-            --min-budget-mb 256 `
-            --safety-reserve-mb 878 `
-            --hard-limit-mb 4096 `
-            --shadow-depth 2 `
-            --profile high-switch `
-            --steps 2000 `
-            --seed 12002 `
-            --json win12_highswitch.json
-
-      - name: Phase 2 gate
-        shell: powershell
-        run: |
-          .\phase2_gate.ps1 -Files win8.json,win12.json,win12_highswitch.json
+          $r = Get-Content .\windows_phase3.json -Raw | ConvertFrom-Json
+          $r | ConvertTo-Json -Depth 5
+          if (-not $r.pass) { throw "WINDOWS_STATERAM_PHASE3_GATE=FAIL" }
+          Write-Host "WINDOWS_STATERAM_PHASE3_GATE=PASS"
 
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stateram-windows-phase2-results
-          path: |
-            win*.json
-            windows_phase2_summary.json
+          name: stateram-windows-phase3-results
+          path: windows_phase3.json
