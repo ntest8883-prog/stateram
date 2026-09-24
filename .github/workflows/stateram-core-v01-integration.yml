@@ -167,16 +167,36 @@ jobs:
             ".\core-v01\build\Release\stateram_core_selfcheck.exe"
           )
 
-          $report = @()
+          $scanDir = Join-Path $PWD "defender-scan-targets"
+          New-Item -ItemType Directory -Force -Path $scanDir | Out-Null
+
           foreach ($f in $files) {
             if (-not (Test-Path $f)) { throw "Expected binary missing: $f" }
-            & $mp -Scan -ScanType 3 -File $f
-            $code = $LASTEXITCODE
-            $report += "$f : Defender exit code $code"
-            if ($code -ne 0) { throw "Defender scan failed for $f" }
+            Copy-Item $f $scanDir
           }
 
-          $report | Set-Content -Encoding UTF8 .\CORE_V01_DEFENDER_SCAN.txt
+          $status = Get-MpComputerStatus
+          @(
+            "AntivirusEnabled=$($status.AntivirusEnabled)"
+            "AMServiceEnabled=$($status.AMServiceEnabled)"
+            "RealTimeProtectionEnabled=$($status.RealTimeProtectionEnabled)"
+            "AntivirusSignatureVersion=$($status.AntivirusSignatureVersion)"
+            "ScanTarget=$scanDir"
+          ) | Set-Content -Encoding UTF8 .\CORE_V01_DEFENDER_SCAN.txt
+
+          & $mp -Scan -ScanType 3 -File $scanDir
+          $code = $LASTEXITCODE
+          "MpCmdRunExitCode=$code" | Add-Content .\CORE_V01_DEFENDER_SCAN.txt
+
+          if ($code -ne 0) {
+            $mpLog = Join-Path $env:TEMP "MpCmdRun.log"
+            if (Test-Path $mpLog) {
+              "---- MpCmdRun.log ----" | Add-Content .\CORE_V01_DEFENDER_SCAN.txt
+              Get-Content $mpLog | Add-Content .\CORE_V01_DEFENDER_SCAN.txt
+            }
+            throw "Microsoft Defender custom directory scan failed with exit code $code"
+          }
+
           Write-Host "MICROSOFT_DEFENDER_SCAN=PASS"
 
       - name: SHA-256 manifest and candidate package
