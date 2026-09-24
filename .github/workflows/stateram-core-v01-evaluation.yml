@@ -109,7 +109,8 @@ jobs:
           if (-not $r.correctness_pass) { throw "A correctness did not pass" }
           if (-not $r.capacity_pass) { throw "B capacity did not pass" }
           if (-not $r.experience_pass) { throw "C experience did not pass" }
-          if ($r.capacity_raw_after_trim_mb -gt 640) { throw "Capacity raw-residency gate exceeded" }
+          if ($r.capacity_raw_before_forced_trim_mb -gt 640) { throw "Steady-state raw-residency gate exceeded" }
+          if ($r.capacity_raw_after_trim_mb -gt 160) { throw "Forced-trim raw-residency gate exceeded" }
           if ($r.capacity_promotions -le 0 -or $r.capacity_streaming_evictions -le 0) {
             throw "Promotion and eviction were not both exercised"
           }
