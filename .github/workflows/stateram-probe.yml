@@ -1,4 +1,4 @@
-name: StateRAM-13 final performance candidate
+name: StateRAM-13 release qualification
 
 on:
   workflow_dispatch:
@@ -7,15 +7,15 @@ permissions:
   contents: read
 
 jobs:
-  final:
+  qualify:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build and verify userfaultfd
+      - name: Build and verify real backend
         shell: bash
         run: |
           set -euxo pipefail
@@ -39,49 +39,51 @@ jobs:
             --raw-target-mb 3000 \
             --shadow-depth 0 \
             --profile normal \
+            --seed 12012 \
             --steps 2000 \
             --csv stateram13_raw_12g_reference.csv \
             2>&1 | tee stateram13_raw_12g_reference.log
-          python3 analyze.py stateram13_raw_12g_reference.csv \
-            | tee stateram13_raw_12g_reference_analysis.json
 
-      - name: Final 4 to 12 StateRAM-13 run
+      - name: Real 4-to-12 qualification matrix
         shell: bash
         run: |
           set -euxo pipefail
-          sudo ./run_in_cgroup.py --memory 4G --swap 0 -- \
-            ./stateram13_final_bench \
-              --mode stateram \
-              --logical-gb 12 \
-              --objects 24 \
-              --segment-kb 256 \
-              --raw-target-mb 3000 \
-              --shadow-depth 32 \
-              --profile normal \
-              --steps 2000 \
-              --csv stateram13_final_4to12.csv \
-            2>&1 | tee stateram13_final_4to12.log
-          python3 analyze.py stateram13_final_4to12.csv \
-            | tee stateram13_final_4to12_analysis.json
+          for profile in normal bursty high-switch low-locality; do
+            for seed in 12012 27183 77123; do
+              name="qual_${profile}_${seed}"
+              sudo ./run_in_cgroup.py --memory 4G --swap 0 -- \
+                ./stateram13_final_bench \
+                  --mode stateram \
+                  --logical-gb 12 \
+                  --objects 24 \
+                  --segment-kb 256 \
+                  --raw-target-mb 3000 \
+                  --shadow-depth 32 \
+                  --profile "$profile" \
+                  --seed "$seed" \
+                  --steps 2000 \
+                  --csv "${name}.csv" \
+                2>&1 | tee "${name}.log"
+            done
+          done
 
-      - name: Final candidate comparison
+      - name: Release gate
         shell: bash
         run: |
           set -euxo pipefail
-          python3 final_compare.py \
-            stateram13_raw_12g_reference.csv \
-            stateram13_final_4to12.csv \
-            | tee stateram13_final_gate.log
+          python3 qualification.py | tee stateram13_release_gate.log
 
-      - name: Upload final results
+      - name: Upload all evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stateram13-final-results
+          name: stateram13-release-qualification
           if-no-files-found: warn
           path: |
-            stateram13_*.csv
-            stateram13_*.log
-            stateram13_*_analysis.json
-            stateram13_final_comparison.json
+            qual_*.csv
+            qual_*.log
+            stateram13_raw_12g_reference.csv
+            stateram13_raw_12g_reference.log
+            stateram13_release_qualification.json
+            stateram13_release_gate.log
             userfaultfd_probe.log
