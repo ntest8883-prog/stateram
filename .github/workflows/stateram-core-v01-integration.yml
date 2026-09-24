@@ -1,0 +1,243 @@
+name: StateRAM Core v0.1 Windows integration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integrate-core-v01:
+    runs-on: windows-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Expand StateRAM Core v0.1 source bundle
+        shell: powershell
+        run: |
+          if (-not (Test-Path .\stateram-core-v01-source.zip)) {
+            throw "Missing stateram-core-v01-source.zip at repository root"
+          }
+
+          if (Test-Path .\core-v01) {
+            Remove-Item .\core-v01 -Recurse -Force
+          }
+
+          Expand-Archive .\stateram-core-v01-source.zip -DestinationPath .\core-v01 -Force
+
+          $required = @(
+            ".\core-v01\CMakeLists.txt",
+            ".\core-v01\include\stateram_core.h",
+            ".\core-v01\src\stateram_core.cpp",
+            ".\core-v01\src\platform.cpp",
+            ".\core-v01\workbench\workbench_win32.cpp",
+            ".\core-v01\workbench\workbench_launcher.cpp"
+          )
+
+          foreach ($f in $required) {
+            if (-not (Test-Path $f)) { throw "Source bundle missing $f" }
+          }
+
+          Write-Host "CORE_V01_SOURCE_BUNDLE=OK"
+
+      - name: Configure x64 Release
+        shell: powershell
+        run: |
+          cmake -S .\core-v01 -B .\core-v01\build -A x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build integrated Core and Workbench
+        shell: powershell
+        run: |
+          cmake --build .\core-v01\build --config Release --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Integrated Core self-check
+        shell: powershell
+        run: |
+          Push-Location .\core-v01
+          .\build\Release\stateram_core_selfcheck.exe
+          $code = $LASTEXITCODE
+          Pop-Location
+
+          if ($code -ne 0) { exit $code }
+          Write-Host "STATERAM_CORE_V01_SELF_CHECK_WINDOWS=PASS"
+
+      - name: Workbench headless integration smoke
+        shell: powershell
+        run: |
+          Push-Location .\core-v01
+          .\build\Release\StateRAM_Workbench.exe --headless-smoke
+          $code = $LASTEXITCODE
+
+          if ($code -ne 0) {
+            Pop-Location
+            exit $code
+          }
+
+          if (-not (Test-Path .\core_v01_workbench_smoke.json)) {
+            Pop-Location
+            throw "Workbench did not produce core_v01_workbench_smoke.json"
+          }
+
+          $r = Get-Content .\core_v01_workbench_smoke.json -Raw | ConvertFrom-Json
+          $r | ConvertTo-Json -Depth 8
+
+          if (-not $r.pass) {
+            Pop-Location
+            throw "WORKBENCH_HEADLESS_SMOKE=FAIL"
+          }
+
+          if ($r.logical_mb -ne 3840) {
+            Pop-Location
+            throw "Expected exactly 3840 MiB logical Workbench state"
+          }
+
+          if ($r.raw_resident_mb -gt 96) {
+            Pop-Location
+            throw "Headless smoke left >96 MiB raw-resident after explicit trim"
+          }
+
+          if ($r.promotions -le 0) {
+            Pop-Location
+            throw "No StateRAM promotions were exercised"
+          }
+
+          if ($r.streaming_evictions -le 0) {
+            Pop-Location
+            throw "No streaming evictions were exercised"
+          }
+
+          Copy-Item .\core_v01_workbench_smoke.json ..\core_v01_workbench_smoke.json
+          Pop-Location
+
+          Write-Host "STATERAM_CORE_V01_WINDOWS_INTEGRATION=PASS"
+
+      - name: Find Microsoft Defender scanner
+        id: defender
+        shell: powershell
+        run: |
+          $platformRoot = Join-Path $env:ProgramData "Microsoft\Windows Defender\Platform"
+          $mp = $null
+
+          if (Test-Path $platformRoot) {
+            $latest = Get-ChildItem $platformRoot -Directory |
+              Sort-Object Name -Descending |
+              Select-Object -First 1
+
+            if ($latest) {
+              $candidate = Join-Path $latest.FullName "MpCmdRun.exe"
+              if (Test-Path $candidate) { $mp = $candidate }
+            }
+          }
+
+          if (-not $mp) {
+            $candidate = Join-Path $env:ProgramFiles "Windows Defender\MpCmdRun.exe"
+            if (Test-Path $candidate) { $mp = $candidate }
+          }
+
+          if (-not $mp) {
+            throw "Microsoft Defender scanner unavailable; failing closed"
+          }
+
+          "mp=$mp" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Microsoft Defender scan
+        shell: powershell
+        run: |
+          $mp = '${{ steps.defender.outputs.mp }}'
+
+          $files = @(
+            ".\core-v01\build\Release\stateram_core.dll",
+            ".\core-v01\build\Release\StateRAM_Workbench.exe",
+            ".\core-v01\build\Release\StateRAM_Workbench_Safe.exe",
+            ".\core-v01\build\Release\stateram_core_selfcheck.exe"
+          )
+
+          $report = @()
+
+          foreach ($f in $files) {
+            if (-not (Test-Path $f)) { throw "Expected binary missing: $f" }
+
+            & $mp -Scan -ScanType 3 -File $f
+            $code = $LASTEXITCODE
+
+            $report += "$f : Defender exit code $code"
+
+            if ($code -ne 0) {
+              throw "Defender scan failed or reported a problem for $f"
+            }
+          }
+
+          $report | Set-Content -Encoding UTF8 .\CORE_V01_DEFENDER_SCAN.txt
+          Write-Host "MICROSOFT_DEFENDER_SCAN=PASS"
+
+      - name: SHA-256 manifest
+        shell: powershell
+        run: |
+          $files = @(
+            ".\core-v01\build\Release\stateram_core.dll",
+            ".\core-v01\build\Release\StateRAM_Workbench.exe",
+            ".\core-v01\build\Release\StateRAM_Workbench_Safe.exe",
+            ".\core-v01\build\Release\stateram_core_selfcheck.exe"
+          )
+
+          $lines = foreach ($f in $files) {
+            $h = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower()
+            "SHA256  $([IO.Path]::GetFileName($f))  $h"
+          }
+
+          $lines | Set-Content -Encoding ASCII .\CORE_V01_SHA256SUMS.txt
+          Get-Content .\CORE_V01_SHA256SUMS.txt
+
+      - name: Assemble frozen candidate package
+        shell: powershell
+        run: |
+          $dst = ".\StateRAM-Core-v0.1-Windows-Candidate"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+
+          Copy-Item .\core-v01\build\Release\stateram_core.dll $dst\
+          Copy-Item .\core-v01\build\Release\StateRAM_Workbench.exe $dst\
+          Copy-Item .\core-v01\build\Release\StateRAM_Workbench_Safe.exe $dst\
+          Copy-Item .\CORE_V01_DEFENDER_SCAN.txt $dst\
+          Copy-Item .\CORE_V01_SHA256SUMS.txt $dst\
+          Copy-Item .\core-v01\README.md $dst\README_SOURCE_AND_SCOPE.md
+          Copy-Item .\core-v01\ARCHITECTURE_SPEC.md $dst\ARCHITECTURE_SPEC.md
+
+          @'
+          StateRAM Core v0.1 — Windows Integration Candidate
+
+          This artifact exists only after:
+            1. native Windows x64 compilation,
+            2. integrated Core self-check,
+            3. 3.75 GiB logical Workbench headless smoke,
+            4. explicit promotion + streaming-eviction exercise,
+            5. Microsoft Defender scans.
+
+          DO NOT run StateRAM_Workbench.exe directly.
+
+          For any later guarded machine evaluation, the only user entry point is:
+            StateRAM_Workbench_Safe.exe
+
+          Passing this workflow does NOT prove 4→8.
+          It means the integrated implementation candidate is ready to freeze
+          before the agreed decisive A/B/C evaluation.
+          '@ | Set-Content -Encoding UTF8 $dst\README_FIRST.txt
+
+      - name: Upload integration evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: StateRAM-Core-v0.1-Integration-Evidence
+          path: |
+            core_v01_workbench_smoke.json
+            CORE_V01_DEFENDER_SCAN.txt
+            CORE_V01_SHA256SUMS.txt
+
+      - name: Upload Windows candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: StateRAM-Core-v0.1-Windows-Candidate
+          path: StateRAM-Core-v0.1-Windows-Candidate
