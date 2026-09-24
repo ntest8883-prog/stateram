@@ -1,0 +1,83 @@
+    if (!model.initialize()) return 10;
+
+    bool ok = true;
+    for (int i = 0; i < 12; ++i) {
+        ok = ok && model.switch_workspace(i % WORKSPACES);
+        std::string text = model.load_visible_document();
+        if (text.empty()) ok = false;
+        text.insert(0, "[edited by headless smoke]\r\n");
+        ok = ok && model.save_visible_document(text);
+        const std::string search = model.run_search("semantic state");
+        const std::string preview = model.open_preview();
+        if (search.find("failed") != std::string::npos ||
+            preview.find("failed") != std::string::npos) ok = false;
+    }
+
+    (void)model.trim_to(8 * MB);
+    const SRStats s = model.stats();
+
+    std::ofstream out("core_v01_workbench_smoke.json", std::ios::binary);
+    out << "{\n"
+        << "  \"logical_mb\": " << (s.logical_bytes / MB) << ",\n"
+        << "  \"raw_resident_mb\": " << (s.raw_resident_bytes / MB) << ",\n"
+        << "  \"compressed_mb\": " << (s.compressed_bytes / MB) << ",\n"
+        << "  \"overlay_kb\": " << (s.overlay_bytes / 1024) << ",\n"
+        << "  \"promotions\": " << s.promotions << ",\n"
+        << "  \"streaming_evictions\": " << s.streaming_evictions << ",\n"
+        << "  \"pass\": " << (ok ? "true" : "false") << "\n"
+        << "}\n";
+
+    return ok ? 0 : 11;
+}
+
+int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR cmdline, int show) {
+    if (cmdline && std::strstr(cmdline, "--headless-smoke")) {
+        return headless_smoke();
+    }
+
+    if (!cmdline || !std::strstr(cmdline, "--guarded-child")) {
+        MessageBoxA(nullptr,
+            "For safety, start StateRAM_Workbench_Safe.exe instead of launching the Workbench directly.",
+            "StateRAM Workbench", MB_ICONINFORMATION);
+        return 1;
+    }
+
+    WorkbenchModel model;
+    if (!model.initialize()) {
+        MessageBoxA(nullptr, "StateRAM Core could not initialize.", "StateRAM Workbench", MB_ICONERROR);
+        return 2;
+    }
+    g_model = &model;
+
+    const char* cls = "StateRAMWorkbenchV01";
+    WNDCLASSA wc{};
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = instance;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    wc.lpszClassName = cls;
+    if (!RegisterClassA(&wc)) return 3;
+
+    HWND hwnd = CreateWindowExA(
+        0, cls,
+        "StateRAM Workbench — Core v0.1 4→8",
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, 1050, 720,
+        nullptr, nullptr, instance, nullptr);
+
+    if (!hwnd) return 4;
+    ShowWindow(hwnd, show);
+    UpdateWindow(hwnd);
+
+    MSG msg{};
+    while (GetMessageA(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+
+    g_model = nullptr;
+    return static_cast<int>(msg.wParam);
+}
+#else
+int main() { return 0; }
+#endif
