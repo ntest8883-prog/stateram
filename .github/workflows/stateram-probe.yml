@@ -1,4 +1,4 @@
-name: StateRAM Windows Phase 6 physically packed capsule
+name: StateRAM Windows Phase 7 cooperative SDK
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 jobs:
-  phase6:
+  phase7:
     runs-on: windows-latest
     timeout-minutes: 15
 
@@ -15,37 +15,36 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build with MSVC
+      - name: Build SDK DLL and host with MSVC
         shell: powershell
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (-not $vs) { throw "Visual Studio C++ toolchain not found" }
           $devcmd = Join-Path $vs "Common7\Tools\VsDevCmd.bat"
-          cmd /c "`"$devcmd`" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /O2 /EHsc /W4 stateram_phase6_packed.cpp /link Psapi.lib Cabinet.lib /out:stateram_phase6_packed.exe"
+
+          cmd /c "`"$devcmd`" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /O2 /EHsc /W4 /LD stateram_sdk.cpp /link Cabinet.lib /out:stateram_sdk.dll"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Run one physical-footprint experiment
+          cmd /c "`"$devcmd`" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /O2 /EHsc /W4 phase7_host.cpp /link Psapi.lib /out:phase7_host.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run one cooperative integration experiment
         shell: powershell
         run: |
-          .\stateram_phase6_packed.exe `
-            --parent `
-            --mb 256 `
-            --core-mb 8 `
-            --dirty-pages 512 `
-            --json windows_phase6.json
+          .\phase7_host.exe
 
       - name: Gate
         shell: powershell
         run: |
-          $r = Get-Content .\windows_phase6.json -Raw | ConvertFrom-Json
+          $r = Get-Content .\windows_phase7.json -Raw | ConvertFrom-Json
           $r | ConvertTo-Json -Depth 5
-          if (-not $r.pass) { throw "WINDOWS_STATERAM_PHASE6_GATE=FAIL" }
-          Write-Host "WINDOWS_STATERAM_PHASE6_GATE=PASS"
+          if (-not $r.pass) { throw "WINDOWS_STATERAM_PHASE7_GATE=FAIL" }
+          Write-Host "WINDOWS_STATERAM_PHASE7_GATE=PASS"
 
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stateram-windows-phase6-results
-          path: windows_phase6.json
+          name: stateram-windows-phase7-results
+          path: windows_phase7.json
