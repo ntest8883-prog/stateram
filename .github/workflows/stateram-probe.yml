@@ -1,4 +1,4 @@
-name: StateRAM Windows Phase 9 background baseline
+name: Build StateRAM Phase 10 local safe test
 
 on:
   workflow_dispatch:
@@ -7,15 +7,15 @@ permissions:
   contents: read
 
 jobs:
-  phase9:
+  build-local-safe-test:
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build SDK DLL and Phase 9 host
+      - name: Build DLL and isolated local harness
         shell: powershell
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -26,25 +26,74 @@ jobs:
           cmd /c "`"$devcmd`" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /O2 /EHsc /W4 /LD stateram_sdk.cpp /link Cabinet.lib /out:stateram_sdk.dll"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          cmd /c "`"$devcmd`" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /O2 /EHsc /W4 phase9_host.cpp /link Psapi.lib /out:phase9_host.exe"
+          cmd /c "`"$devcmd`" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /O2 /EHsc /W4 phase10_local.cpp /link Psapi.lib /out:StateRAM_Local_SafeTest.exe"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Run one paced background-baseline experiment
+      - name: Assemble local package
         shell: powershell
         run: |
-          .\phase9_host.exe
+          New-Item -ItemType Directory -Force -Path .\StateRAM_Local_SafeTest | Out-Null
+          Copy-Item .\StateRAM_Local_SafeTest.exe .\StateRAM_Local_SafeTest\
+          Copy-Item .\stateram_sdk.dll .\StateRAM_Local_SafeTest\
 
-      - name: Gate
-        shell: powershell
-        run: |
-          $r = Get-Content .\windows_phase9.json -Raw | ConvertFrom-Json
-          $r | ConvertTo-Json -Depth 8
-          if (-not $r.pass) { throw "WINDOWS_STATERAM_PHASE9_GATE=FAIL" }
-          Write-Host "WINDOWS_STATERAM_PHASE9_GATE=PASS"
+          @'
+          @echo off
+          cd /d "%~dp0"
+          echo StateRAM isolated local safety test
+          echo.
+          echo IMPORTANT: do NOT choose "Run as administrator".
+          echo Save your current work before starting.
+          echo.
+          StateRAM_Local_SafeTest.exe
+          echo.
+          echo Result files, if produced:
+          echo   stateram_local_result.json
+          echo   stateram_guard_result.json
+          echo.
+          pause
+          '@ | Set-Content -Encoding ASCII .\StateRAM_Local_SafeTest\RUN_SAFE_TEST.cmd
 
-      - name: Upload evidence
-        if: always()
+          @'
+          StateRAM Phase 10 - Local Safe Test
+
+          This is the FIRST active local test and is intentionally isolated.
+
+          RUN:
+            Double-click RUN_SAFE_TEST.cmd normally.
+            Do NOT run as Administrator.
+
+          HARD SAFETY BOUNDARIES:
+            - child process hard commit limit: 320 MiB
+            - child process hard CPU cap: 35% total CPU
+            - BELOW_NORMAL process priority
+            - parent watchdog checks Windows memory every 250 ms
+            - abort at >=88% memory load
+            - abort below 640 MiB available physical memory
+            - refuses to start below 1024 MiB available memory or above 80% load
+            - 90 second maximum runtime
+            - worker killed if parent closes because JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE is enabled
+
+          SCOPE:
+            - 128 MiB StateRAM-owned synthetic region only
+            - no Chrome/VS Code/other-process memory
+            - no driver
+            - no registry changes
+            - no page-file changes
+            - no boot changes
+            - no administrator privilege
+            - no installation
+
+          A safety abort is a GOOD outcome from the guard, not damage.
+
+          After the test, send ChatGPT:
+            - the console output, OR
+            - stateram_local_result.json and stateram_guard_result.json
+
+          Delete this folder to remove the test.
+          '@ | Set-Content -Encoding UTF8 .\StateRAM_Local_SafeTest\README_FIRST.txt
+
+      - name: Upload ready-to-run local package
         uses: actions/upload-artifact@v4
         with:
-          name: stateram-windows-phase9-results
-          path: windows_phase9.json
+          name: StateRAM-Phase10-Local-Safe-Test
+          path: StateRAM_Local_SafeTest
