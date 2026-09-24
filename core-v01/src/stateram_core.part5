@@ -1,0 +1,220 @@
+    ctx->bg_cv.notify_one();
+}
+
+static bool validate_descriptor(const SRObjectDescriptor& d) {
+    if (!d.name || d.logical_size == 0) return false;
+    if (d.semantic_class > SR_SEM_SHARED_IMMUTABLE) return false;
+    if (d.backing_kind > SR_BACKING_DISCARDABLE_RECIPE) return false;
+
+    if ((d.backing_kind == SR_BACKING_RECIPE ||
+         d.backing_kind == SR_BACKING_DISCARDABLE_RECIPE) &&
+        !d.rebuild) {
+        return false;
+    }
+
+    if (d.backing_kind == SR_BACKING_FILE && !d.backing_read) {
+        return false;
+    }
+
+    return true;
+}
+
+static uint64_t overlapping_pages_bitmap(
+    const Object& obj,
+    size_t seg_index,
+    uint64_t lease_offset,
+    uint64_t lease_length
+) {
+    const uint64_t seg_begin = obj.segment_offset(seg_index);
+    const uint64_t seg_end = seg_begin + SEGMENT_BYTES;
+    const uint64_t lease_end = lease_offset + lease_length;
+
+    const uint64_t begin = std::max(seg_begin, lease_offset);
+    const uint64_t end = std::min(seg_end, lease_end);
+    if (begin >= end) return 0;
+
+    const size_t first_page = static_cast<size_t>((begin - seg_begin) / PAGE_BYTES);
+    const size_t last_page = static_cast<size_t>((end - 1 - seg_begin) / PAGE_BYTES);
+
+    uint64_t bits = 0;
+    for (size_t p = first_page; p <= last_page && p < PAGES_PER_SEGMENT; ++p) {
+        bits |= 1ull << p;
+    }
+    return bits;
+}
+
+static int journal_write_segment(
+    Context* ctx,
+    const std::shared_ptr<Object>& obj,
+    size_t seg_index,
+    uint64_t lease_offset,
+    uint64_t lease_length
+) {
+    Segment& s = *obj->segments[seg_index];
+    std::lock_guard<std::mutex> lk(s.mu);
+
+    if (!s.raw_committed || s.pin_count == 0 || s.retired) return SR_ERR_INTERNAL;
+
+    const uint64_t bits = overlapping_pages_bitmap(*obj, seg_index, lease_offset, lease_length);
+    if (bits == 0) return SR_OK;
+
+    uint8_t* seg_raw = obj->arena + seg_index * SEGMENT_BYTES;
+
+    for (size_t p = 0; p < PAGES_PER_SEGMENT; ++p) {
+        if ((bits & (1ull << p)) == 0) continue;
+
+        if (!s.overlay[p]) {
+            s.overlay[p] = std::make_unique<OverlayPage>();
+            s.overlay_bitmap |= (1ull << p);
+            ctx->overlay_bytes.fetch_add(PAGE_BYTES, std::memory_order_relaxed);
+            obj->overlay_bytes.fetch_add(PAGE_BYTES, std::memory_order_relaxed);
+        }
+
+        std::memcpy(
+            s.overlay[p]->bytes.data(),
+            seg_raw + p * PAGE_BYTES,
+            PAGE_BYTES);
+    }
+
+    ++s.generation;
+    s.authoritative_hash = fnv1a64(seg_raw, obj->segment_actual_bytes(seg_index));
+    s.hash_valid = true;
+    s.last_access_tick = sr::platform::monotonic_tick_ns();
+    return SR_OK;
+}
+
+} // namespace
+
+SR_API uint32_t sr_core_api_version() {
+    return 0x00010000u;
+}
+
+SR_API int sr_context_create(
+    const SRContextConfig* config,
+    SRContext* out_context
+) {
+    if (!out_context) return SR_ERR_INVALID;
+    *out_context = nullptr;
+
+    try {
+        auto ctx = std::make_unique<Context>();
+        ctx->cfg = normalized_config(config);
+        ctx->bg_thread = std::thread(background_main, ctx.get());
+        *out_context = ctx.release();
+        return SR_OK;
+    } catch (...) {
+        return SR_ERR_NOMEM;
+    }
+}
+
+SR_API void sr_context_destroy(SRContext context) {
+    auto* ctx = static_cast<Context*>(context);
+    if (!ctx) return;
+
+    {
+        std::lock_guard<std::mutex> g(ctx->bg_mu);
+        ctx->stop = true;
+        ctx->wake = true;
+    }
+    ctx->bg_cv.notify_all();
+    if (ctx->bg_thread.joinable()) ctx->bg_thread.join();
+
+    {
+        std::lock_guard<std::mutex> g(ctx->objects_mu);
+        for (auto& kv : ctx->objects) {
+            kv.second->retired.store(1, std::memory_order_release);
+        }
+        ctx->objects.clear();
+    }
+
+    delete ctx;
+}
+
+SR_API int sr_register_object(
+    SRContext context,
+    const SRObjectDescriptor* descriptor,
+    const void* initial_data,
+    uint64_t initial_data_bytes,
+    SRObjectId* out_object_id
+) {
+    auto* ctx = static_cast<Context*>(context);
+    if (!ctx || !descriptor || !out_object_id || !validate_descriptor(*descriptor)) {
+        return SR_ERR_INVALID;
+    }
+
+    *out_object_id = 0;
+
+    if (initial_data_bytes != 0 && initial_data_bytes != descriptor->logical_size) {
+        return SR_ERR_INVALID;
+    }
+    if (initial_data_bytes != 0 && !initial_data) return SR_ERR_INVALID;
+    if (initial_data_bytes == 0 && descriptor->backing_kind == SR_BACKING_NONE) {
+        return SR_ERR_INVALID;
+    }
+
+    try {
+        auto obj = std::make_shared<Object>();
+        obj->id = ctx->next_id.fetch_add(1, std::memory_order_relaxed);
+        obj->name = descriptor->name;
+        obj->logical_size = descriptor->logical_size;
+        obj->reserved_size = round_up(static_cast<size_t>(descriptor->logical_size), SEGMENT_BYTES);
+        obj->critical_prefix_bytes = std::min(descriptor->critical_prefix_bytes, descriptor->logical_size);
+        obj->semantic_class = descriptor->semantic_class;
+        obj->backing_kind = descriptor->backing_kind;
+        obj->flags = descriptor->flags;
+        obj->rebuild = descriptor->rebuild;
+        obj->backing_read = descriptor->backing_read;
+        obj->user = descriptor->user;
+
+        obj->arena = static_cast<uint8_t*>(
+            sr::platform::reserve_address_space(static_cast<size_t>(obj->reserved_size)));
+        if (!obj->arena) return SR_ERR_NOMEM;
+
+        const size_t segment_count = static_cast<size_t>(obj->reserved_size / SEGMENT_BYTES);
+        obj->segments.reserve(segment_count);
+
+        const BaseKind backing_base = initial_base_kind(*obj);
+        const bool trust_initial_backing =
+            (descriptor->flags & SR_OBJECT_INITIAL_MATCHES_BACKING) != 0;
+
+        for (size_t i = 0; i < segment_count; ++i) {
+            auto seg = std::make_unique<Segment>();
+            seg->last_access_tick = sr::platform::monotonic_tick_ns();
+
+            if (initial_data_bytes == 0 || trust_initial_backing) {
+                seg->base_kind = backing_base;
+                seg->base_generation = 0;
+            }
+
+            obj->segments.push_back(std::move(seg));
+        }
+
+        if (initial_data_bytes != 0) {
+            const uint8_t* src = static_cast<const uint8_t*>(initial_data);
+
+            for (size_t i = 0; i < segment_count; ++i) {
+                if (!ensure_foreground_capacity(ctx, SEGMENT_BYTES)) {
+                    return SR_ERR_BUDGET;
+                }
+
+                uint8_t* dst = obj->arena + i * SEGMENT_BYTES;
+                if (!sr::platform::commit_pages(dst, SEGMENT_BYTES)) {
+                    return SR_ERR_NOMEM;
+                }
+
+                std::memset(dst, 0, SEGMENT_BYTES);
+                const size_t actual = obj->segment_actual_bytes(i);
+                std::memcpy(dst, src + i * SEGMENT_BYTES, actual);
+
+                Segment& s = *obj->segments[i];
+                s.raw_committed = true;
+                s.hash_valid = true;
+                s.authoritative_hash = fnv1a64(dst, actual);
+
+                obj->raw_resident_bytes.fetch_add(SEGMENT_BYTES, std::memory_order_relaxed);
+                ctx->raw_resident_bytes.fetch_add(SEGMENT_BYTES, std::memory_order_relaxed);
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> g(ctx->objects_mu);
