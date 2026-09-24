@@ -1,4 +1,4 @@
-name: StateRAM Windows Phase 8 lifecycle reclamation
+name: StateRAM Windows Phase 9 background baseline
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 jobs:
-  phase8:
+  phase9:
     runs-on: windows-latest
     timeout-minutes: 15
 
@@ -15,7 +15,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build SDK DLL and lifecycle host
+      - name: Build SDK DLL and Phase 9 host
         shell: powershell
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -26,25 +26,25 @@ jobs:
           cmd /c "`"$devcmd`" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /O2 /EHsc /W4 /LD stateram_sdk.cpp /link Cabinet.lib /out:stateram_sdk.dll"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          cmd /c "`"$devcmd`" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /O2 /EHsc /W4 phase8_host.cpp /link Psapi.lib /out:phase8_host.exe"
+          cmd /c "`"$devcmd`" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /O2 /EHsc /W4 phase9_host.cpp /link Psapi.lib /out:phase9_host.exe"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Run one two-cycle lifecycle experiment
+      - name: Run one paced background-baseline experiment
         shell: powershell
         run: |
-          .\phase8_host.exe
+          .\phase9_host.exe
 
       - name: Gate
         shell: powershell
         run: |
-          $r = Get-Content .\windows_phase8.json -Raw | ConvertFrom-Json
+          $r = Get-Content .\windows_phase9.json -Raw | ConvertFrom-Json
           $r | ConvertTo-Json -Depth 8
-          if (-not $r.pass) { throw "WINDOWS_STATERAM_PHASE8_GATE=FAIL" }
-          Write-Host "WINDOWS_STATERAM_PHASE8_GATE=PASS"
+          if (-not $r.pass) { throw "WINDOWS_STATERAM_PHASE9_GATE=FAIL" }
+          Write-Host "WINDOWS_STATERAM_PHASE9_GATE=PASS"
 
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stateram-windows-phase8-results
-          path: windows_phase8.json
+          name: stateram-windows-phase9-results
+          path: windows_phase9.json
