@@ -1,4 +1,4 @@
-name: StateRAM Windows Phase 3 app-aware prewarm
+name: StateRAM Windows Phase 4 external capsule
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 jobs:
-  phase3:
+  phase4:
     runs-on: windows-latest
     timeout-minutes: 15
 
@@ -22,29 +22,28 @@ jobs:
           $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (-not $vs) { throw "Visual Studio C++ toolchain not found" }
           $devcmd = Join-Path $vs "Common7\Tools\VsDevCmd.bat"
-          cmd /c "`"$devcmd`" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /O2 /EHsc /W4 stateram_phase3_appaware.cpp /link Psapi.lib /out:stateram_phase3_appaware.exe"
+          cmd /c "`"$devcmd`" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /O2 /EHsc /W4 stateram_phase4_capsule.cpp /link Psapi.lib Cabinet.lib /out:stateram_phase4_capsule.exe"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Run one disposable app-awareness experiment
+      - name: Run one external-capsule experiment
         shell: powershell
         run: |
-          .\stateram_phase3_appaware.exe `
+          .\stateram_phase4_capsule.exe `
             --parent `
             --mb 256 `
-            --prefetch-mb 192 `
-            --json windows_phase3.json
+            --json windows_phase4.json
 
       - name: Gate
         shell: powershell
         run: |
-          $r = Get-Content .\windows_phase3.json -Raw | ConvertFrom-Json
+          $r = Get-Content .\windows_phase4.json -Raw | ConvertFrom-Json
           $r | ConvertTo-Json -Depth 5
-          if (-not $r.pass) { throw "WINDOWS_STATERAM_PHASE3_GATE=FAIL" }
-          Write-Host "WINDOWS_STATERAM_PHASE3_GATE=PASS"
+          if (-not $r.pass) { throw "WINDOWS_STATERAM_PHASE4_GATE=FAIL" }
+          Write-Host "WINDOWS_STATERAM_PHASE4_GATE=PASS"
 
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stateram-windows-phase3-results
-          path: windows_phase3.json
+          name: stateram-windows-phase4-results
+          path: windows_phase4.json
