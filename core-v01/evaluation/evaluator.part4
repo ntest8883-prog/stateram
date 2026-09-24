@@ -1,0 +1,54 @@
+int main(int argc, char** argv) {
+    bool cloud = false;
+
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--cloud-validate") == 0) {
+            cloud = true;
+        }
+    }
+
+    Evaluation eval(cloud);
+
+    if (!eval.initialize()) {
+        std::cerr << "EVALUATION_INIT=FAIL\n";
+        return 20;
+    }
+
+    if (eval.logical_bytes() != 3840ull * MB) {
+        std::cerr << "LOGICAL_WORKLOAD_SIZE=FAIL\n";
+        return 21;
+    }
+
+    if (!eval.run_correctness()) {
+        std::cerr << "A_CORRECTNESS=FAIL\n";
+        (void)eval.write_report();
+        return 30;
+    }
+
+    if (!eval.run_capacity()) {
+        std::cerr << "B_CAPACITY=FAIL\n";
+        (void)eval.write_report();
+        return 40;
+    }
+
+    if (!eval.run_experience()) {
+        std::cerr << "C_EXPERIENCE=FAIL\n";
+        (void)eval.write_report();
+        return 50;
+    }
+
+    if (!eval.write_report()) {
+        std::cerr << "REPORT_WRITE=FAIL\n";
+        return 60;
+    }
+
+    if (!eval.overall_pass()) {
+        return 70;
+    }
+
+    std::cout << "STATERAM_CORE_V01_4TO8_EVALUATION=PASS\n";
+    return 0;
+}
+#else
+int main() { return 1; }
+#endif
