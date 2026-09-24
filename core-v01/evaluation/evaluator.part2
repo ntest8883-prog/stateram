@@ -89,12 +89,16 @@
             }
         }
 
-        const int trim_rc = sr_trim(ctx_, 128ull * MB);
+        SRStats before_trim{};
+        if (sr_get_stats(ctx_, &before_trim) != SR_OK) return false;
+
+        const int trim_rc = sr_trim(ctx_, 32ull * MB);
 
         SRStats s{};
         if (sr_get_stats(ctx_, &s) != SR_OK) return false;
 
         capacity_coverage_samples_ = coverage_samples;
+        capacity_raw_before_trim_ = before_trim.raw_resident_bytes;
         capacity_raw_after_trim_ = s.raw_resident_bytes;
         capacity_overlay_bytes_ = s.overlay_bytes;
         capacity_promotions_ = s.promotions;
@@ -103,7 +107,8 @@
         capacity_pass_ =
             trim_rc == SR_OK &&
             s.logical_bytes == 3840ull * MB &&
-            s.raw_resident_bytes <= 640ull * MB &&
+            before_trim.raw_resident_bytes <= 640ull * MB &&
+            s.raw_resident_bytes <= 160ull * MB &&
             coverage_samples >= 100 &&
             s.promotions > 0 &&
             s.streaming_evictions > 0;
@@ -111,6 +116,8 @@
         std::cout
             << "B_capacity_samples=" << coverage_samples << "\n"
             << "B_capacity_trim_rc=" << trim_rc << "\n"
+            << "B_capacity_raw_before_forced_trim_mb="
+            << (before_trim.raw_resident_bytes / static_cast<double>(MB)) << "\n"
             << "B_capacity_raw_mb="
             << (s.raw_resident_bytes / static_cast<double>(MB)) << "\n"
             << "B_capacity_overlay_kb="
