@@ -126,7 +126,6 @@ jobs:
             throw "Promotion/streaming eviction paths were not both exercised"
           }
 
-          Copy-Item .\core_v01_workbench_smoke.json ..\core_v01_workbench_smoke.json
           Pop-Location
 
           Write-Host "STATERAM_CORE_V01_WINDOWS_INTEGRATION=PASS"
@@ -223,7 +222,7 @@ jobs:
           Copy-Item .\core-v01\build\Release\StateRAM_Workbench_Safe.exe $dst\
           Copy-Item .\CORE_V01_DEFENDER_SCAN.txt $dst\
           Copy-Item .\CORE_V01_SHA256SUMS.txt $dst\
-          Copy-Item .\core_v01_workbench_smoke.json $dst\
+          Copy-Item .\core-v01\core_v01_workbench_smoke.json $dst\
 
           @'
           StateRAM Core v0.1 Windows integration candidate
@@ -239,7 +238,7 @@ jobs:
         with:
           name: StateRAM-Core-v0.1-Integration-Evidence
           path: |
-            core_v01_workbench_smoke.json
+            core-v01/core_v01_workbench_smoke.json
             CORE_V01_DEFENDER_SCAN.txt
             CORE_V01_SHA256SUMS.txt
 
