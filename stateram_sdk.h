@@ -39,6 +39,9 @@ struct SRMetrics {
     uint64_t baseline_cpu_backoffs;
     uint64_t capsule_releases;
     uint64_t capsule_rearms;
+    uint64_t deep_slices;
+    uint64_t deep_yields;
+    uint64_t deep_pressure_yields;
 
     double baseline_ms;
     double baseline_wall_ms;
@@ -52,6 +55,7 @@ struct SRMetrics {
     int low_memory_signal;
     int deep_restore_ok;
     int background_mode_entered;
+    int deep_background_mode_entered;
     uint32_t lifecycle_state;
 };
 
