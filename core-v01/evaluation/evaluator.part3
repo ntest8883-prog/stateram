@@ -30,8 +30,10 @@
             << "  \"correctness_patches_verified\": " << patches_.size() << ",\n"
             << "  \"capacity_pass\": " << (capacity_pass_ ? "true" : "false") << ",\n"
             << "  \"capacity_coverage_samples\": " << capacity_coverage_samples_ << ",\n"
-            << "  \"capacity_raw_after_trim_mb\": "
+            << "  \"capacity_raw_before_forced_trim_mb\": "
             << std::fixed << std::setprecision(3)
+            << (capacity_raw_before_trim_ / static_cast<double>(MB)) << ",\n"
+            << "  \"capacity_raw_after_trim_mb\": "
             << (capacity_raw_after_trim_ / static_cast<double>(MB)) << ",\n"
             << "  \"capacity_overlay_kb\": "
             << (capacity_overlay_bytes_ / static_cast<double>(KB)) << ",\n"
@@ -102,6 +104,7 @@ private:
     bool overall_pass_ = false;
 
     size_t capacity_coverage_samples_ = 0;
+    uint64_t capacity_raw_before_trim_ = 0;
     uint64_t capacity_raw_after_trim_ = 0;
     uint64_t capacity_overlay_bytes_ = 0;
     uint64_t capacity_promotions_ = 0;
