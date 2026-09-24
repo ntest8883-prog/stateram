@@ -22,9 +22,9 @@ Pass condition: zero lost or corrupted checked state.
 - logical application state must equal exactly 3840 MiB;
 - samples span every semantic object across the whole logical range;
 - on-demand promotion and streaming eviction must both occur;
-- explicit trim must return raw residency to <=160 MiB.
+- the broker must keep raw residency within the 640 MiB evaluation ceiling after the capacity pass.
 
-This is a cooperative semantic capacity test. It does not claim that 3.75 GiB of arbitrary incompressible simultaneously-hot bytes are stored in 160 MiB.
+This is a cooperative semantic capacity test. It does not claim that 3.75 GiB of arbitrary incompressible simultaneously-hot bytes are stored in 640 MiB. The ceiling is intentionally aligned with the Core v0.1 steady-state 4-to-8 design budget rather than forcing the prewarmer to stay artificially empty.
 
 ## C — experience
 
