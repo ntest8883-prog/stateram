@@ -18,7 +18,8 @@ enum SRState : uint32_t {
     SR_DORMANT           = 2,
     SR_CORE_RESUMED      = 3,
     SR_DEEP_RESTORING    = 4,
-    SR_ACTIVE_CAPSULE    = 5
+    SR_ACTIVE_CAPSULE    = 5,
+    SR_BASELINE_BUILDING  = 6
 };
 
 struct SRMetrics {
@@ -31,9 +32,16 @@ struct SRMetrics {
     uint64_t dirty_pages;
 
     uint64_t baseline_epochs;
+    uint64_t baseline_attempts;
+    uint64_t baseline_cancellations;
+    uint64_t baseline_pressure_aborts;
+    uint64_t baseline_slices;
+    uint64_t baseline_cpu_backoffs;
     uint64_t capsule_releases;
 
     double baseline_ms;
+    double baseline_wall_ms;
+    double baseline_work_ms;
     double finalization_ms;
     double decommit_ms;
     double core_restore_ms;
@@ -42,6 +50,7 @@ struct SRMetrics {
 
     int low_memory_signal;
     int deep_restore_ok;
+    int background_mode_entered;
     uint32_t lifecycle_state;
 };
 
@@ -51,7 +60,18 @@ SR_API uint32_t sr_api_version();
 SR_API SRHandle sr_create(uint64_t bytes, uint64_t core_bytes);
 SR_API void* sr_data(SRHandle handle);
 
+SR_API int sr_begin_background_baseline(
+    SRHandle handle,
+    uint32_t units_per_slice,
+    uint32_t base_sleep_ms);
+SR_API int sr_baseline_done(SRHandle handle);
+SR_API uint32_t sr_baseline_progress_permille(SRHandle handle);
+SR_API int sr_wait_baseline(SRHandle handle, uint32_t timeout_ms);
+SR_API int sr_cancel_background_baseline(SRHandle handle);
+
+/* Compatibility helper: builds one baseline and waits for it. */
 SR_API int sr_checkpoint_baseline(SRHandle handle);
+
 SR_API int sr_enter_dormant(SRHandle handle);
 SR_API int sr_resume_core(SRHandle handle);
 SR_API int sr_start_deep_restore(SRHandle handle);
