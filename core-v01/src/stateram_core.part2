@@ -1,0 +1,217 @@
+    const uint64_t MB = 1024ull * 1024ull;
+
+    if (c.target_raw_bytes == 0) c.target_raw_bytes = 768ull * MB;
+    if (c.hard_raw_bytes == 0) c.hard_raw_bytes = 1024ull * MB;
+    if (c.hard_raw_bytes < c.target_raw_bytes) c.hard_raw_bytes = c.target_raw_bytes;
+    if (c.foreground_burst_bytes == 0) c.foreground_burst_bytes = 64ull * MB;
+    if (c.comfortable_available_bytes == 0) c.comfortable_available_bytes = 1024ull * MB;
+    if (c.emergency_available_bytes == 0) c.emergency_available_bytes = 640ull * MB;
+    if (c.background_period_ms == 0) c.background_period_ms = 25;
+    if (c.prewarm_segments_per_hint == 0) c.prewarm_segments_per_hint = 4;
+    if (c.overlay_consolidate_pages == 0 || c.overlay_consolidate_pages > 64) {
+        c.overlay_consolidate_pages = 32;
+    }
+    return c;
+}
+
+static std::shared_ptr<Object> find_object(Context* ctx, SRObjectId id) {
+    if (!ctx || id == 0) return {};
+    std::lock_guard<std::mutex> g(ctx->objects_mu);
+    auto it = ctx->objects.find(id);
+    if (it == ctx->objects.end()) return {};
+    if (it->second->retired.load(std::memory_order_acquire)) return {};
+    return it->second;
+}
+
+static std::vector<std::shared_ptr<Object>> snapshot_objects(Context* ctx) {
+    std::vector<std::shared_ptr<Object>> v;
+    std::lock_guard<std::mutex> g(ctx->objects_mu);
+    v.reserve(ctx->objects.size());
+    for (auto& kv : ctx->objects) {
+        if (!kv.second->retired.load(std::memory_order_acquire)) {
+            v.push_back(kv.second);
+        }
+    }
+    return v;
+}
+
+static size_t overlay_page_count(uint64_t bitmap) {
+    size_t n = 0;
+    while (bitmap) {
+        bitmap &= (bitmap - 1);
+        ++n;
+    }
+    return n;
+}
+
+static uint32_t dominant_representation_locked(const Segment& s) {
+    if (s.raw_committed) return SR_REP_RAW;
+
+    const bool delta = s.overlay_bitmap != 0;
+    switch (s.base_kind) {
+        case BaseKind::COMPRESSED:
+            return SR_REP_COMPRESSED;
+        case BaseKind::RECIPE:
+            return delta ? SR_REP_RECIPE_DELTA : SR_REP_RECIPE;
+        case BaseKind::FILE_REF:
+            return delta ? SR_REP_FILE_DELTA : SR_REP_FILE_REF;
+        case BaseKind::DISCARDABLE:
+            return SR_REP_DISCARDABLE;
+        case BaseKind::NONE:
+        default:
+            return SR_REP_NONE;
+    }
+}
+
+static void set_metric_promotion(Context* ctx, double ms) {
+    std::lock_guard<std::mutex> g(ctx->metric_mu);
+    ctx->last_promotion_ms = ms;
+    ctx->max_promotion_ms = std::max(ctx->max_promotion_ms, ms);
+}
+
+static void set_metric_compaction(Context* ctx, double ms) {
+    std::lock_guard<std::mutex> g(ctx->metric_mu);
+    ctx->last_compaction_ms = ms;
+}
+
+static void record_access(Context* ctx, SRObjectId id) {
+    if (!ctx || id == 0) return;
+    std::lock_guard<std::mutex> g(ctx->predictor_mu);
+    if (ctx->last_accessed_object != 0 && ctx->last_accessed_object != id) {
+        ctx->transitions[ctx->last_accessed_object][id] += 1;
+    }
+    ctx->last_accessed_object = id;
+}
+
+static BaseKind initial_base_kind(const Object& obj) {
+    switch (obj.backing_kind) {
+        case SR_BACKING_RECIPE:
+            return BaseKind::RECIPE;
+        case SR_BACKING_FILE:
+            return BaseKind::FILE_REF;
+        case SR_BACKING_DISCARDABLE_RECIPE:
+            return BaseKind::DISCARDABLE;
+        case SR_BACKING_NONE:
+        default:
+            return BaseKind::NONE;
+    }
+}
+
+static bool build_from_base(
+    const std::shared_ptr<Object>& obj,
+    size_t seg_index,
+    BaseKind base_kind,
+    const sr::platform::Blob& base_blob,
+    uint64_t overlay_bitmap,
+    const std::array<std::unique_ptr<OverlayPage>, PAGES_PER_SEGMENT>& overlay,
+    std::vector<uint8_t>& scratch
+) {
+    const size_t actual = obj->segment_actual_bytes(seg_index);
+    if (actual == 0) return false;
+
+    scratch.assign(actual, 0);
+    const uint64_t off = obj->segment_offset(seg_index);
+
+    bool ok = false;
+    switch (base_kind) {
+        case BaseKind::COMPRESSED:
+            ok = sr::platform::decompress_fast(base_blob, scratch.data(), actual);
+            break;
+        case BaseKind::RECIPE:
+        case BaseKind::DISCARDABLE:
+            ok = obj->rebuild &&
+                obj->rebuild(obj->id, off, actual, scratch.data(), obj->user) != 0;
+            break;
+        case BaseKind::FILE_REF:
+            ok = obj->backing_read &&
+                obj->backing_read(obj->id, off, actual, scratch.data(), obj->user) != 0;
+            break;
+        case BaseKind::NONE:
+        default:
+            ok = false;
+            break;
+    }
+
+    if (!ok) return false;
+
+    for (size_t page = 0; page < PAGES_PER_SEGMENT; ++page) {
+        if ((overlay_bitmap & (1ull << page)) == 0) continue;
+        if (!overlay[page]) return false;
+
+        const size_t page_off = page * PAGE_BYTES;
+        if (page_off >= actual) break;
+        const size_t n = std::min(PAGE_BYTES, actual - page_off);
+        std::memcpy(scratch.data() + page_off, overlay[page]->bytes.data(), n);
+    }
+
+    return true;
+}
+
+static bool compact_to(Context* ctx, uint64_t target, uint32_t pressure);
+
+static bool ensure_foreground_capacity(Context* ctx, uint64_t needed) {
+    if (!ctx) return false;
+
+    uint64_t raw = ctx->raw_resident_bytes.load(std::memory_order_acquire);
+    uint64_t inflight = ctx->raw_inflight_bytes.load(std::memory_order_acquire);
+    const uint64_t hard_with_burst = ctx->cfg.hard_raw_bytes + ctx->cfg.foreground_burst_bytes;
+
+    if (raw + inflight + needed <= ctx->cfg.target_raw_bytes) {
+        return true;
+    }
+
+    uint64_t desired = 0;
+    if (ctx->cfg.hard_raw_bytes > inflight + needed) {
+        desired = ctx->cfg.hard_raw_bytes - inflight - needed;
+    }
+
+    (void)compact_to(ctx, desired, std::max<uint32_t>(2, ctx->pressure_level()));
+
+    raw = ctx->raw_resident_bytes.load(std::memory_order_acquire);
+    inflight = ctx->raw_inflight_bytes.load(std::memory_order_acquire);
+    return raw + inflight + needed <= hard_with_burst;
+}
+
+static int materialize_and_pin(
+    Context* ctx,
+    const std::shared_ptr<Object>& obj,
+    size_t seg_index,
+    bool pin,
+    uint32_t latency_class
+) {
+    if (!ctx || !obj || seg_index >= obj->segment_count()) return SR_ERR_INVALID;
+    (void)latency_class;
+
+    Segment& s = *obj->segments[seg_index];
+
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lk(s.mu);
+
+            if (s.retired || obj->retired.load(std::memory_order_acquire)) {
+                return SR_ERR_NOT_FOUND;
+            }
+
+            if (s.raw_committed) {
+                if (pin) {
+                    if (s.pin_count == 0) {
+                        ctx->pinned_bytes.fetch_add(SEGMENT_BYTES, std::memory_order_relaxed);
+                    }
+                    ++s.pin_count;
+                }
+                s.last_access_tick = sr::platform::monotonic_tick_ns();
+                return SR_OK;
+            }
+
+            if (s.restoring) {
+                s.cv.wait(lk, [&] { return !s.restoring || s.retired; });
+                if (s.retired) return SR_ERR_NOT_FOUND;
+                continue;
+            }
+
+            s.restoring = true;
+        }
+
+        const double t0 = sr::platform::now_ms();
+
+        {
