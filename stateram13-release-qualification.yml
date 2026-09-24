@@ -1,0 +1,89 @@
+name: StateRAM-13 release qualification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build and verify real backend
+        shell: bash
+        run: |
+          set -euxo pipefail
+          uname -a
+          free -h
+          swapon --show || true
+          chmod +x *.sh *.py
+          ./build_final.sh
+          ./userfaultfd_probe 2>&1 | tee userfaultfd_probe.log
+          grep -q "UFFDIO_API.*OK" userfaultfd_probe.log
+
+      - name: Same-runner 12 GiB RAW reference
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ./stateram13_final_bench \
+            --mode raw \
+            --logical-gb 12 \
+            --objects 24 \
+            --segment-kb 256 \
+            --raw-target-mb 3000 \
+            --shadow-depth 0 \
+            --profile normal \
+            --seed 12012 \
+            --steps 2000 \
+            --csv stateram13_raw_12g_reference.csv \
+            2>&1 | tee stateram13_raw_12g_reference.log
+
+      - name: Real 4-to-12 qualification matrix
+        shell: bash
+        run: |
+          set -euxo pipefail
+          for profile in normal bursty high-switch low-locality; do
+            for seed in 12012 27183 77123; do
+              name="qual_${profile}_${seed}"
+              sudo ./run_in_cgroup.py --memory 4G --swap 0 -- \
+                ./stateram13_final_bench \
+                  --mode stateram \
+                  --logical-gb 12 \
+                  --objects 24 \
+                  --segment-kb 256 \
+                  --raw-target-mb 3000 \
+                  --shadow-depth 32 \
+                  --profile "$profile" \
+                  --seed "$seed" \
+                  --steps 2000 \
+                  --csv "${name}.csv" \
+                2>&1 | tee "${name}.log"
+            done
+          done
+
+      - name: Release gate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 qualification.py | tee stateram13_release_gate.log
+
+      - name: Upload all evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stateram13-release-qualification
+          if-no-files-found: warn
+          path: |
+            qual_*.csv
+            qual_*.log
+            stateram13_raw_12g_reference.csv
+            stateram13_raw_12g_reference.log
+            stateram13_release_qualification.json
+            stateram13_release_gate.log
+            userfaultfd_probe.log
