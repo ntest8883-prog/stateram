@@ -1,4 +1,4 @@
-name: Build StateRAM Phase 11 workspace switching
+name: Build and Defender-scan StateRAM Phase 11
 
 on:
   workflow_dispatch:
@@ -7,15 +7,15 @@ permissions:
   contents: read
 
 jobs:
-  phase11:
+  verify:
     runs-on: windows-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build Phase 11 SDK and workspace harness
+      - name: Build Phase 11
         shell: powershell
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -29,25 +29,88 @@ jobs:
           cmd /c "`"$devcmd`" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /O2 /EHsc /W4 phase11_workspace.cpp /link Psapi.lib Advapi32.lib /out:StateRAM_Workspace_SafeTest.exe"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Disposable runner smoke test of NEW re-dormancy lifecycle
+      - name: Run Phase 11 cloud smoke first
         shell: powershell
         run: |
           .\StateRAM_Workspace_SafeTest.exe --cloud-smoke
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Gate cloud smoke
+      - name: Find Microsoft Defender command-line scanner
+        id: defender
         shell: powershell
         run: |
-          $r = Get-Content .\phase11_cloud_smoke.json -Raw | ConvertFrom-Json
-          $r | ConvertTo-Json -Depth 8
-          if (-not $r.pass) { throw "WINDOWS_STATERAM_PHASE11_CLOUD_GATE=FAIL" }
-          Write-Host "WINDOWS_STATERAM_PHASE11_CLOUD_GATE=PASS"
+          $platformRoot = Join-Path $env:ProgramData "Microsoft\Windows Defender\Platform"
+          $mp = $null
+
+          if (Test-Path $platformRoot) {
+            $latest = Get-ChildItem $platformRoot -Directory |
+              Sort-Object Name -Descending |
+              Select-Object -First 1
+
+            if ($latest) {
+              $candidate = Join-Path $latest.FullName "MpCmdRun.exe"
+              if (Test-Path $candidate) { $mp = $candidate }
+            }
+          }
+
+          if (-not $mp) {
+            $candidate = Join-Path $env:ProgramFiles "Windows Defender\MpCmdRun.exe"
+            if (Test-Path $candidate) { $mp = $candidate }
+          }
+
+          if (-not $mp) {
+            throw "Microsoft Defender MpCmdRun.exe is unavailable. Failing closed; no local executable artifact will be published."
+          }
+
+          "mp=$mp" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Using Defender scanner: $mp"
+
+      - name: Microsoft Defender custom scan
+        shell: powershell
+        run: |
+          $mp = '${{ steps.defender.outputs.mp }}'
+
+          & $mp -Scan -ScanType 3 -File "$PWD\StateRAM_Workspace_SafeTest.exe"
+          $exeCode = $LASTEXITCODE
+
+          & $mp -Scan -ScanType 3 -File "$PWD\stateram_sdk.dll"
+          $dllCode = $LASTEXITCODE
+
+          @"
+          Microsoft Defender verification
+          =================================
+          Scanner: $mp
+          StateRAM_Workspace_SafeTest.exe exit code: $exeCode
+          stateram_sdk.dll exit code: $dllCode
+          "@ | Set-Content -Encoding UTF8 .\DEFENDER_SCAN_REPORT.txt
+
+          if ($exeCode -ne 0 -or $dllCode -ne 0) {
+            throw "Microsoft Defender scan did not return clean success for both binaries. Failing closed."
+          }
+
+          Write-Host "MICROSOFT_DEFENDER_SCAN=PASS"
+
+      - name: Create SHA-256 manifest
+        shell: powershell
+        run: |
+          $exeHash = (Get-FileHash .\StateRAM_Workspace_SafeTest.exe -Algorithm SHA256).Hash.ToLower()
+          $dllHash = (Get-FileHash .\stateram_sdk.dll -Algorithm SHA256).Hash.ToLower()
+
+          @"
+          SHA256  StateRAM_Workspace_SafeTest.exe  $exeHash
+          SHA256  stateram_sdk.dll                 $dllHash
+          "@ | Set-Content -Encoding ASCII .\SHA256SUMS.txt
+
+          Get-Content .\SHA256SUMS.txt
 
       - name: Assemble guarded local package
         shell: powershell
         run: |
-          New-Item -ItemType Directory -Force -Path .\StateRAM_Phase11_Local | Out-Null
-          Copy-Item .\StateRAM_Workspace_SafeTest.exe .\StateRAM_Phase11_Local\
-          Copy-Item .\stateram_sdk.dll .\StateRAM_Phase11_Local\
+          New-Item -ItemType Directory -Force -Path .\StateRAM_Phase11_Verified | Out-Null
+          Copy-Item .\StateRAM_Workspace_SafeTest.exe .\StateRAM_Phase11_Verified\
+          Copy-Item .\stateram_sdk.dll .\StateRAM_Phase11_Verified\
+          Copy-Item .\DEFENDER_SCAN_REPORT.txt .\StateRAM_Phase11_Verified\
+          Copy-Item .\SHA256SUMS.txt .\StateRAM_Phase11_Verified\
 
           @'
           @echo off
@@ -64,55 +127,33 @@ jobs:
           echo   stateram_phase11_guard_result.json
           echo.
           pause
-          '@ | Set-Content -Encoding ASCII .\StateRAM_Phase11_Local\RUN_PHASE11_SAFE.cmd
+          '@ | Set-Content -Encoding ASCII .\StateRAM_Phase11_Verified\RUN_PHASE11_SAFE.cmd
 
           @'
-          StateRAM Phase 11 - Realistic Isolated Workspace Switching
+          This package was built on GitHub Actions and was only published if:
+            1. Phase 11 cloud smoke passed.
+            2. Microsoft Defender MpCmdRun custom scans returned success for
+               both StateRAM_Workspace_SafeTest.exe and stateram_sdk.dll.
+            3. SHA-256 hashes were recorded.
 
-          This remains isolated. It does NOT modify Chrome, VS Code, Windows,
-          or any other application's memory.
+          IMPORTANT:
+          - This does not make the executable digitally signed.
+          - Browser reputation systems can still warn on a new unsigned binary.
+          - Do not disable browser or Windows security protections globally.
+          - Do not run as Administrator.
+          '@ | Set-Content -Encoding UTF8 .\StateRAM_Phase11_Verified\README_VERIFIED.txt
 
-          It simulates:
-            - 6 workspaces
-            - 24 MiB state per workspace
-            - 2 MiB immediately resumable core per workspace
-            - document/code/history/cache-like state
-            - 18 repeated workspace switches
-            - small foreground edits between switches
-
-          The new Phase 11 mechanism keeps a compact capsule for short-lived
-          foreground workspaces and re-arms Windows write tracking after each
-          full restoration. That lets a workspace return to dormant form
-          without rebuilding its entire baseline every time.
-
-          Safety:
-            - normal user only; no Administrator
-            - 320 MiB hard child commit cap
-            - 35% hard CPU cap
-            - BELOW_NORMAL priority
-            - watchdog every 250 ms
-            - abort at >=88% memory load
-            - abort below 640 MiB available RAM
-            - refuses to start below 1024 MiB available RAM or above 80% load
-            - 120 second maximum runtime
-            - no driver, registry, pagefile, boot, or install changes
-            - JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-
-          A watchdog abort means the guard protected the machine.
-
-          Send these files after the run:
-            stateram_phase11_local_result.json
-            stateram_phase11_guard_result.json
-          '@ | Set-Content -Encoding UTF8 .\StateRAM_Phase11_Local\README_FIRST.txt
-
-      - name: Upload cloud evidence
+      - name: Upload verification evidence
         uses: actions/upload-artifact@v4
         with:
-          name: StateRAM-Phase11-Cloud-Smoke
-          path: phase11_cloud_smoke.json
+          name: StateRAM-Phase11-Verification-Evidence
+          path: |
+            DEFENDER_SCAN_REPORT.txt
+            SHA256SUMS.txt
+            phase11_cloud_smoke.json
 
-      - name: Upload ready-to-run guarded local package
+      - name: Upload Defender-gated local package
         uses: actions/upload-artifact@v4
         with:
-          name: StateRAM-Phase11-Local-Safe-Test
-          path: StateRAM_Phase11_Local
+          name: StateRAM-Phase11-Defender-Verified-Local-Test
+          path: StateRAM_Phase11_Verified
