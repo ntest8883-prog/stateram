@@ -1,0 +1,273 @@
+    bool run_correctness() {
+        const size_t cycles = cloud_ ? 72 : 240;
+        std::array<size_t, WORKSPACES> seq{};
+        patches_.clear();
+
+        for (size_t step = 0; step < cycles; ++step) {
+            const size_t widx = (step * 5 + step / 7) % WORKSPACES;
+            auto& w = ws_[widx];
+            const size_t local = seq[widx]++;
+
+            hint_switch(widx);
+
+            const uint64_t doc_off =
+                2ull * MB + static_cast<uint64_t>(local) * 64ull * KB;
+            const uint64_t hist_off =
+                1ull * MB + static_cast<uint64_t>(local) * 64ull * KB;
+
+            if (!write_patch(w.document, doc_off, step, 0x31u)) return false;
+            if (!write_patch(w.history, hist_off, step, 0x73u)) return false;
+
+            const uint64_t idx_off =
+                ((17ull + step * 11ull) % 120ull) * MB;
+            if (!read_and_verify(
+                    w.index_object,
+                    w.backing[2],
+                    idx_off,
+                    256 * KB)) return false;
+
+            const uint64_t preview_off =
+                ((31ull + step * 13ull) % 184ull) * MB;
+            if (!read_and_verify(
+                    w.preview,
+                    w.backing[3],
+                    preview_off,
+                    256 * KB)) return false;
+
+            if ((step % 12) == 11) {
+                (void)sr_trim(ctx_, 96ull * MB);
+                if (!verify_recent_patches(32)) return false;
+            }
+        }
+
+        (void)sr_trim(ctx_, 64ull * MB);
+        if (!verify_recent_patches(patches_.size())) return false;
+
+        correctness_pass_ = true;
+        return true;
+    }
+
+    bool run_capacity() {
+        size_t coverage_samples = 0;
+
+        for (size_t wi = 0; wi < WORKSPACES; ++wi) {
+            auto& w = ws_[wi];
+            hint_switch(wi);
+
+            struct Target {
+                SRObjectId id;
+                const BackingInfo* backing;
+                uint64_t size;
+                uint64_t safe_start;
+            };
+
+            const std::array<Target, 5> targets{{
+                {w.document, &w.backing[0], 64 * MB, 16 * MB},
+                {w.history, &w.backing[1], 64 * MB, 16 * MB},
+                {w.index_object, &w.backing[2], 128 * MB, 16 * MB},
+                {w.preview, &w.backing[3], 192 * MB, 16 * MB},
+                {w.asset, &w.backing[4], 192 * MB, 16 * MB}
+            }};
+
+            for (const auto& t : targets) {
+                for (uint64_t off = t.safe_start;
+                     off + 64 * KB <= t.size;
+                     off += 32 * MB) {
+                    if (!read_and_verify(
+                            t.id,
+                            *t.backing,
+                            off,
+                            64 * KB)) {
+                        return false;
+                    }
+
+                    ++coverage_samples;
+                    if ((coverage_samples % 24) == 0) {
+                        (void)sr_trim(ctx_, 128ull * MB);
+                    }
+                }
+            }
+        }
+
+        const int trim_rc = sr_trim(ctx_, 128ull * MB);
+
+        SRStats s{};
+        if (sr_get_stats(ctx_, &s) != SR_OK) return false;
+
+        capacity_coverage_samples_ = coverage_samples;
+        capacity_raw_after_trim_ = s.raw_resident_bytes;
+        capacity_overlay_bytes_ = s.overlay_bytes;
+        capacity_promotions_ = s.promotions;
+        capacity_evictions_ = s.streaming_evictions;
+
+        capacity_pass_ =
+            trim_rc == SR_OK &&
+            s.logical_bytes == 3840ull * MB &&
+            s.raw_resident_bytes <= 160ull * MB &&
+            coverage_samples >= 100 &&
+            s.promotions > 0 &&
+            s.streaming_evictions > 0;
+
+        return capacity_pass_;
+    }
+
+    bool run_experience() {
+        const size_t interactions = cloud_ ? 72 : 180;
+        timings_ = {};
+        csv_.open(
+            cloud_
+                ? "stateram_4to8_cloud_interactions.csv"
+                : "stateram_4to8_interactions.csv",
+            std::ios::binary);
+
+        if (!csv_) return false;
+
+        csv_
+            << "index,workspace,switch_ms,edit_ms,search_ms,preview_ms,asset_ms,"
+            << "raw_mb,overlay_kb,memory_load,available_mb\n";
+
+        for (size_t i = 0; i < interactions; ++i) {
+            const size_t widx = (i * 5 + 1) % WORKSPACES;
+            auto& w = ws_[widx];
+
+            const double sw0 = qpc_ms();
+            hint_switch(widx);
+            SRLease doc = nullptr;
+            if (sr_acquire(
+                    ctx_,
+                    w.document,
+                    0,
+                    64 * KB,
+                    SR_ACCESS_READ,
+                    SR_LATENCY_INTERACTIVE,
+                    &doc) != SR_OK) {
+                return false;
+            }
+            volatile uint64_t sink = sample_bytes(
+                static_cast<const uint8_t*>(sr_lease_data(doc)),
+                64 * KB);
+            (void)sink;
+            if (sr_release(doc) != SR_OK) return false;
+            const double switch_ms = qpc_ms() - sw0;
+            timings_.switch_ms.push_back(switch_ms);
+
+            const uint64_t edit_off =
+                8ull * MB +
+                static_cast<uint64_t>((i * 17) % 512) * PAGE;
+
+            const double ed0 = qpc_ms();
+            SRLease edit = nullptr;
+            if (sr_acquire(
+                    ctx_,
+                    w.document,
+                    edit_off,
+                    PAGE,
+                    SR_ACCESS_WRITE,
+                    SR_LATENCY_INTERACTIVE,
+                    &edit) != SR_OK) {
+                return false;
+            }
+            auto* ep = static_cast<uint8_t*>(sr_lease_data(edit));
+            for (size_t k = 0; k < PAGE; ++k) {
+                ep[k] = static_cast<uint8_t>(
+                    mix64(i * 0x100000ull + widx * 0x1000ull + k));
+            }
+            if (sr_release(edit) != SR_OK) return false;
+            const double edit_ms = qpc_ms() - ed0;
+            timings_.edit_ms.push_back(edit_ms);
+
+            const uint64_t search_off =
+                ((23ull + i * 19ull) % 124ull) * MB;
+            const double se0 = qpc_ms();
+            if (!read_and_verify(
+                    w.index_object,
+                    w.backing[2],
+                    search_off,
+                    1 * MB)) return false;
+            const double search_ms = qpc_ms() - se0;
+            timings_.search_ms.push_back(search_ms);
+
+            double preview_ms = 0.0;
+            if ((i % 2) == 0) {
+                const uint64_t p_off =
+                    ((41ull + i * 23ull) % 188ull) * MB;
+                const double p0 = qpc_ms();
+                if (!read_and_verify(
+                        w.preview,
+                        w.backing[3],
+                        p_off,
+                        1 * MB)) return false;
+                preview_ms = qpc_ms() - p0;
+                timings_.preview_ms.push_back(preview_ms);
+            }
+
+            double asset_ms = 0.0;
+            if ((i % 4) == 0) {
+                const uint64_t a_off =
+                    ((59ull + i * 29ull) % 188ull) * MB;
+                const double a0 = qpc_ms();
+                if (!read_and_verify(
+                        w.asset,
+                        w.backing[4],
+                        a_off,
+                        1 * MB)) return false;
+                asset_ms = qpc_ms() - a0;
+                timings_.asset_ms.push_back(asset_ms);
+            }
+
+            const size_t predicted = (widx + 1) % WORKSPACES;
+            SRObjectId next[] = {
+                ws_[predicted].document,
+                ws_[predicted].index_object
+            };
+            sr_hint_next(ctx_, next, 2);
+
+            SRStats s{};
+            sr_get_stats(ctx_, &s);
+
+            csv_
+                << i << ","
+                << widx << ","
+                << std::fixed << std::setprecision(3)
+                << switch_ms << ","
+                << edit_ms << ","
+                << search_ms << ","
+                << preview_ms << ","
+                << asset_ms << ","
+                << (s.raw_resident_bytes / static_cast<double>(MB)) << ","
+                << (s.overlay_bytes / static_cast<double>(KB)) << ","
+                << s.memory_load_percent << ","
+                << (s.available_physical_bytes / static_cast<double>(MB))
+                << "\n";
+
+            if ((i % 20) == 19) {
+                (void)sr_trim(ctx_, 256ull * MB);
+            }
+        }
+
+        csv_.close();
+
+        const double switch_p95 = percentile(timings_.switch_ms, 0.95);
+        const double edit_p95 = percentile(timings_.edit_ms, 0.95);
+        const double search_p95 = percentile(timings_.search_ms, 0.95);
+        const double preview_p95 = percentile(timings_.preview_ms, 0.95);
+        const double asset_p95 = percentile(timings_.asset_ms, 0.95);
+
+        const double overall_max = std::max({
+            max_value(timings_.switch_ms),
+            max_value(timings_.edit_ms),
+            max_value(timings_.search_ms),
+            max_value(timings_.preview_ms),
+            max_value(timings_.asset_ms)
+        });
+
+        experience_pass_ =
+            switch_p95 < 50.0 &&
+            edit_p95 < 50.0 &&
+            search_p95 < 150.0 &&
+            preview_p95 < 150.0 &&
+            asset_p95 < 150.0 &&
+            overall_max < 500.0;
+
+        return experience_pass_;
+    }
