@@ -1,4 +1,4 @@
-name: Build StateRAM Phase 13 rare-stall catcher
+name: Build StateRAM Phase 14 foreground-aware governor
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 jobs:
-  phase13:
+  phase14:
     runs-on: windows-latest
     timeout-minutes: 15
 
@@ -15,7 +15,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build unchanged Phase 11 SDK and Phase 13 catcher
+      - name: Build Phase 14 SDK and validation harness
         shell: powershell
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -26,23 +26,23 @@ jobs:
           cmd /c "`"$devcmd`" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /O2 /EHsc /W4 /LD stateram_sdk.cpp /link Cabinet.lib /out:stateram_sdk.dll"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          cmd /c "`"$devcmd`" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /O2 /EHsc /W4 phase13_tailcatch.cpp /link Psapi.lib Advapi32.lib /out:StateRAM_Phase13_Rare_Stall_Catcher.exe"
+          cmd /c "`"$devcmd`" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /O2 /EHsc /W4 phase14_governor.cpp /link Psapi.lib Advapi32.lib /out:StateRAM_Phase14_Foreground_Aware.exe"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Disposable cloud telemetry smoke
+      - name: Disposable cloud validation
         shell: powershell
         run: |
-          .\StateRAM_Phase13_Rare_Stall_Catcher.exe --cloud-smoke
+          .\StateRAM_Phase14_Foreground_Aware.exe --cloud-smoke
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Gate cloud smoke
+      - name: Gate cloud validation
         shell: powershell
         run: |
-          $r = Get-Content .\phase13_cloud_result.json -Raw | ConvertFrom-Json
+          $r = Get-Content .\phase14_cloud_result.json -Raw | ConvertFrom-Json
           $r | ConvertTo-Json -Depth 8
-          if (-not $r.diagnostic_pass) { throw "WINDOWS_STATERAM_PHASE13_CLOUD_GATE=FAIL" }
-          if (-not (Test-Path .\phase13_cloud_switches.csv)) { throw "missing Phase 13 switch CSV" }
-          Write-Host "WINDOWS_STATERAM_PHASE13_CLOUD_GATE=PASS"
+          if (-not $r.pass) { throw "WINDOWS_STATERAM_PHASE14_CLOUD_GATE=FAIL" }
+          if (-not (Test-Path .\phase14_cloud_switches.csv)) { throw "missing Phase 14 switch CSV" }
+          Write-Host "WINDOWS_STATERAM_PHASE14_CLOUD_GATE=PASS"
 
       - name: Find Microsoft Defender scanner
         id: defender
@@ -78,7 +78,7 @@ jobs:
         run: |
           $mp = '${{ steps.defender.outputs.mp }}'
 
-          & $mp -Scan -ScanType 3 -File "$PWD\StateRAM_Phase13_Rare_Stall_Catcher.exe"
+          & $mp -Scan -ScanType 3 -File "$PWD\StateRAM_Phase14_Foreground_Aware.exe"
           $exeCode = $LASTEXITCODE
 
           & $mp -Scan -ScanType 3 -File "$PWD\stateram_sdk.dll"
@@ -87,7 +87,7 @@ jobs:
           @"
           Microsoft Defender verification
           =================================
-          StateRAM_Phase13_Rare_Stall_Catcher.exe exit code: $exeCode
+          StateRAM_Phase14_Foreground_Aware.exe exit code: $exeCode
           stateram_sdk.dll exit code: $dllCode
           "@ | Set-Content -Encoding UTF8 .\DEFENDER_SCAN_REPORT.txt
 
@@ -100,95 +100,93 @@ jobs:
       - name: Create SHA-256 manifest
         shell: powershell
         run: |
-          $exeHash = (Get-FileHash .\StateRAM_Phase13_Rare_Stall_Catcher.exe -Algorithm SHA256).Hash.ToLower()
+          $exeHash = (Get-FileHash .\StateRAM_Phase14_Foreground_Aware.exe -Algorithm SHA256).Hash.ToLower()
           $dllHash = (Get-FileHash .\stateram_sdk.dll -Algorithm SHA256).Hash.ToLower()
 
           @"
-          SHA256  StateRAM_Phase13_Rare_Stall_Catcher.exe  $exeHash
-          SHA256  stateram_sdk.dll                         $dllHash
+          SHA256  StateRAM_Phase14_Foreground_Aware.exe  $exeHash
+          SHA256  stateram_sdk.dll                       $dllHash
           "@ | Set-Content -Encoding ASCII .\SHA256SUMS.txt
 
           Get-Content .\SHA256SUMS.txt
 
-      - name: Assemble guarded local catcher
+      - name: Assemble guarded local package
         shell: powershell
         run: |
-          New-Item -ItemType Directory -Force -Path .\StateRAM_Phase13_Local | Out-Null
+          New-Item -ItemType Directory -Force -Path .\StateRAM_Phase14_Local | Out-Null
 
-          Copy-Item .\StateRAM_Phase13_Rare_Stall_Catcher.exe .\StateRAM_Phase13_Local\
-          Copy-Item .\stateram_sdk.dll .\StateRAM_Phase13_Local\
-          Copy-Item .\DEFENDER_SCAN_REPORT.txt .\StateRAM_Phase13_Local\
-          Copy-Item .\SHA256SUMS.txt .\StateRAM_Phase13_Local\
+          Copy-Item .\StateRAM_Phase14_Foreground_Aware.exe .\StateRAM_Phase14_Local\
+          Copy-Item .\stateram_sdk.dll .\StateRAM_Phase14_Local\
+          Copy-Item .\DEFENDER_SCAN_REPORT.txt .\StateRAM_Phase14_Local\
+          Copy-Item .\SHA256SUMS.txt .\StateRAM_Phase14_Local\
 
           @'
           @echo off
           cd /d "%~dp0"
-          echo StateRAM Phase 13 - rare-stall catcher
+          echo StateRAM Phase 14 - foreground-aware CPU governor
           echo.
           echo IMPORTANT: run normally. Do NOT choose "Run as administrator".
           echo Save your current work before starting.
           echo.
-          StateRAM_Phase13_Rare_Stall_Catcher.exe
+          StateRAM_Phase14_Foreground_Aware.exe
           echo.
-          echo Send ChatGPT these FOUR files:
-          echo   stateram_phase13_tailcatch_result.json
-          echo   stateram_phase13_switches.csv
-          echo   stateram_phase13_process_trace.csv
-          echo   stateram_phase13_guard_result.json
+          echo Send ChatGPT these THREE files:
+          echo   stateram_phase14_result.json
+          echo   stateram_phase14_switches.csv
+          echo   stateram_phase14_guard_result.json
           echo.
           pause
-          '@ | Set-Content -Encoding ASCII .\StateRAM_Phase13_Local\RUN_PHASE13_SAFE.cmd
+          '@ | Set-Content -Encoding ASCII .\StateRAM_Phase14_Local\RUN_PHASE14_SAFE.cmd
 
           @'
-          StateRAM Phase 13 - Rare-Stall Catcher
+          StateRAM Phase 14 - Foreground-Aware CPU Governor
 
-          This is one focused experiment. It DOES NOT alter the Phase 11 engine.
+          Why:
+          Phase 13 captured a ~249 ms visible stall while foreground-thread and
+          whole-process CPU-cycle usage stayed almost identical to a normal
+          ~5.6 ms switch. The process-cycle trace flatlined during most of the
+          stall. This strongly implicated the whole-process hard CPU quota.
 
-          Local behavior:
-            - same 6 x 24 MiB workspaces
-            - same 2 MiB resume core
-            - same 35% hard child CPU cap
-            - same 320 MiB hard child commit cap
-            - repeats switching for at most 96 switches
-            - stops after the FIRST switch >= 50 ms
-            - exits normally if no rare tail appears
+          Architectural change:
+            OLD:
+              35% hard CPU cap applies to ALL StateRAM threads
+            NEW:
+              foreground core-resume path can burst briefly at normal priority
+              baseline/deep workers explicitly enter Windows background mode
+              deep restoration yields after each 512 KiB
+              memory pressure makes deep restoration yield more
+              launcher watches sustained CPU behavior and aborts on abuse
 
-          High-resolution evidence:
-            - QueryPerformanceCounter wall timing
-            - QueryThreadCycleTime raw cycle deltas
-            - QueryProcessCycleTime raw cycle deltas
-            - process PageFaultCount before/after each switch
-            - private/working-set size
-            - GetSystemTimes busy percentage across each switch
-            - SDK finalization/decommit/core-restore timing
-            - launcher-side child trace about every 10 ms
-
-          IMPORTANT:
-          CPU cycle counts are used ONLY as relative deltas versus normal
-          switches in the same run. They are not converted to milliseconds.
-
-          Safety:
-            - no Administrator
-            - no driver/injection
-            - no registry/pagefile/boot changes
-            - refuse start below 1024 MiB available RAM
+          Hard protections that remain:
+            - 320 MiB process-commit cap
+            - one isolated child
+            - kill-on-job-close
+            - start only with >=1024 MiB available RAM
             - abort below 640 MiB available RAM
             - abort at >=88% memory load
-            - 120 second hard timeout
+            - sustained-CPU fail-safe watchdog
+            - 120 second timeout
+            - no driver/injection/registry/pagefile/boot changes
 
-          Send all four generated result files to ChatGPT.
-          '@ | Set-Content -Encoding UTF8 .\StateRAM_Phase13_Local\README_FIRST.txt
+          Validation:
+            - 96 repeated workspace switches
+            - 50 ms visible-tail threshold
+            - exact state-integrity check after each switch
+            - deep/background metrics recorded
+
+          Send the three generated result files to ChatGPT.
+          '@ | Set-Content -Encoding UTF8 .\StateRAM_Phase14_Local\README_FIRST.txt
 
       - name: Upload cloud evidence
         uses: actions/upload-artifact@v4
         with:
-          name: StateRAM-Phase13-Cloud-Diagnostic
+          name: StateRAM-Phase14-Cloud-Validation
           path: |
-            phase13_cloud_result.json
-            phase13_cloud_switches.csv
+            phase14_cloud_result.json
+            phase14_cloud_switches.csv
 
-      - name: Upload Defender-gated local catcher
+      - name: Upload Defender-gated local package
         uses: actions/upload-artifact@v4
         with:
-          name: StateRAM-Phase13-Local-Rare-Stall-Catcher
-          path: StateRAM_Phase13_Local
+          name: StateRAM-Phase14-Local-Foreground-Aware
+          path: StateRAM_Phase14_Local
