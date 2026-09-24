@@ -2,6 +2,9 @@ name: StateRAM Core v0.1 Windows integration
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - core-v01-4to8-integration
 
 permissions:
   contents: read
