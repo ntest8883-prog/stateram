@@ -1,4 +1,4 @@
-name: StateRAM decisive 4-to-12 proof v3 FULL FILE
+name: StateRAM-13 final performance candidate
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 jobs:
-  decisive:
+  final:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
@@ -23,350 +23,65 @@ jobs:
           free -h
           swapon --show || true
           chmod +x *.sh *.py
-          ./build.sh
+          ./build_final.sh
           ./userfaultfd_probe 2>&1 | tee userfaultfd_probe.log
           grep -q "UFFDIO_API.*OK" userfaultfd_probe.log
 
-      - name: Create deterministic full-coverage benchmark
+      - name: Same-runner 12 GiB RAW reference
         shell: bash
         run: |
           set -euxo pipefail
-          cp stateram12_real_bench.c stateram12_decisive.c
+          ./stateram13_final_bench \
+            --mode raw \
+            --logical-gb 12 \
+            --objects 24 \
+            --segment-kb 256 \
+            --raw-target-mb 3000 \
+            --shadow-depth 0 \
+            --profile normal \
+            --steps 2000 \
+            --csv stateram13_raw_12g_reference.csv \
+            2>&1 | tee stateram13_raw_12g_reference.log
+          python3 analyze.py stateram13_raw_12g_reference.csv \
+            | tee stateram13_raw_12g_reference_analysis.json
 
-          python3 - <<'PY'
-          from pathlib import Path
-
-          p=Path("stateram12_decisive.c")
-          s=p.read_text()
-
-          s=s.replace(
-              "static size_t tracked_raw_bytes=0;",
-              "static size_t tracked_raw_bytes=0;\n"
-              "static uint64_t eviction_count=0, integrity_errors=0;\n"
-              "static unsigned char canary_mask[MAX_OBJECTS][1024];"
-          )
-
-          s=s.replace(
-              "    if(tracked_raw_bytes>=len) tracked_raw_bytes-=len;\n"
-              "    if(evict_ms) *evict_ms += (t1-t0);",
-              "    if(tracked_raw_bytes>=len) tracked_raw_bytes-=len;\n"
-              "    eviction_count++;\n"
-              "    if(evict_ms) *evict_ms += (t1-t0);"
-          )
-
-          start=s.index("static void touch_segment(")
-          end=s.index("\nstatic int init_objects", start)
-
-          new_touch=r'''static void touch_segment(int oi,uint64_t seg,int do_write) {
-              unsigned char *p=(unsigned char *)obj_data(oi);
-              size_t off=seg_offset(oi,seg);
-              size_t len=seg_len(oi,seg);
-              uint64_t pages=len/page_size;
-              volatile uint64_t sink=0;
-
-              /* Verify one recipe byte on every 4 KiB page. */
-              for(uint64_t pg=0;pg<pages;pg++) {
-                  size_t pos=off+(size_t)pg*page_size;
-                  unsigned char got=p[pos];
-                  unsigned char exp=recipe_byte(
-                      &objs[oi].ctx,(uint64_t)(pos/page_size),0);
-                  if(got!=exp) integrity_errors++;
-                  sink += got;
-              }
-
-              /* Verify 16 dirty canaries per segment after reconstruction. */
-              unsigned char mask=canary_mask[oi][seg];
-
-              for(int j=0;j<16 && pages;j++) {
-                  uint64_t pg=((uint64_t)j*131ULL)%pages;
-                  size_t pos=off+(size_t)pg*page_size+13;
-
-                  unsigned char base=recipe_byte(
-                      &objs[oi].ctx,
-                      (uint64_t)((off+(size_t)pg*page_size)/page_size),
-                      13
-                  );
-
-                  if(p[pos]!=(unsigned char)(base^mask))
-                      integrity_errors++;
-              }
-
-              if(do_write) {
-                  for(int j=0;j<16 && pages;j++) {
-                      uint64_t pg=((uint64_t)j*131ULL)%pages;
-                      size_t pos=off+(size_t)pg*page_size+13;
-                      p[pos]^=0x5a;
-                  }
-
-                  canary_mask[oi][seg]^=0x5a;
-              }
-
-              (void)sink;
-              objs[oi].last_used[seg]=tick_id++;
-          }
-          '''
-
-          s=s[:start]+new_touch+s[end:]
-
-          old='''        int switched=(step==0 || frand01()<switch_p);
-                  current=next_object(current,step,switched);
-
-                  if(switched) {
-                      cur_seg=0;
-                  } else {
-                      double r=frand01();
-                      if(r<seq_p) {
-                          if(cur_seg+1<objs[current].segments) cur_seg++;
-                      } else if(r<seq_p+near_p) {
-                          uint64_t jump=2+(xorshift64()%4);
-                          cur_seg=(cur_seg+jump<objs[current].segments) ?
-                              cur_seg+jump : objs[current].segments-1;
-                      } else {
-                          cur_seg=xorshift64()%objs[current].segments;
-                      }
-                  }
-          '''
-
-          new='''        /* Deterministic full-state sweep: every segment twice. */
-                  int switched=1;
-
-                  uint64_t per_obj=objs[0].segments;
-
-                  uint64_t g=(uint64_t)step %
-                      (per_obj*(uint64_t)cfg.objects);
-
-                  current=(int)(g/per_obj);
-                  cur_seg=g%per_obj;
-          '''
-
-          if old not in s:
-              raise SystemExit(
-                  "access-selection patch target not found"
-              )
-
-          s=s.replace(old,new)
-
-          s=s.replace(
-              "touch_segment(current,cur_seg,(step%13)==0);",
-              "touch_segment(current,cur_seg, "
-              "step < cfg.objects*(int)objs[0].segments);"
-          )
-
-          s=s.replace(
-              "double gap=profile_gap();",
-              "double gap=0.0;"
-          )
-
-          s=s.replace(
-              '        if(strcmp(cfg.mode,"stateram")==0) {\n'
-              '            /*\n'
-              '             * Current-object execution shadowing.',
-              '        if(0 && strcmp(cfg.mode,"stateram")==0) {\n'
-              '            /*\n'
-              '             * Current-object execution shadowing.'
-          )
-
-          old_end=(
-              "    destroy_objects();\n"
-              "    return 0;\n"
-              "}\n"
-          )
-
-          new_end=(
-              '    fprintf(stderr,'
-              '"decisive_evictions=%" PRIu64 '
-              '" integrity_errors=%" PRIu64 "\\n", '
-              'eviction_count, integrity_errors);\n'
-              '    int decisive_ok=('
-              'integrity_errors==0 && eviction_count>1500);\n'
-              '    destroy_objects();\n'
-              '    return decisive_ok ? 0 : 10;\n'
-              '}\n'
-          )
-
-          pos=s.rfind(old_end)
-
-          if pos < 0:
-              raise SystemExit(
-                  "final patch target not found"
-              )
-
-          s=s[:pos]+new_end+s[pos+len(old_end):]
-
-          p.write_text(s)
-          PY
-
-          cc -O2 -Wall -Wextra -pthread \
-            stateram12_decisive.c \
-            stateram9.c \
-            -o stateram12_decisive
-
-      - name: Run decisive 12 GiB under hard 4 GiB limit
+      - name: Final 4 to 12 StateRAM-13 run
         shell: bash
         run: |
           set -euxo pipefail
-
-          sudo ./run_in_cgroup.py \
-            --memory 4G \
-            --swap 0 \
-            -- \
-            ./stateram12_decisive \
+          sudo ./run_in_cgroup.py --memory 4G --swap 0 -- \
+            ./stateram13_final_bench \
               --mode stateram \
               --logical-gb 12 \
               --objects 24 \
-              --segment-mb 8 \
+              --segment-kb 256 \
               --raw-target-mb 3000 \
-              --shadow-depth 0 \
+              --shadow-depth 32 \
               --profile normal \
-              --steps 3072 \
-              --csv decisive_4to12.csv \
-            2>&1 | tee decisive_4to12.log
+              --steps 2000 \
+              --csv stateram13_final_4to12.csv \
+            2>&1 | tee stateram13_final_4to12.log
+          python3 analyze.py stateram13_final_4to12.csv \
+            | tee stateram13_final_4to12_analysis.json
 
-      - name: Verify full coverage and hard-limit result
+      - name: Final candidate comparison
         shell: bash
         run: |
           set -euxo pipefail
+          python3 final_compare.py \
+            stateram13_raw_12g_reference.csv \
+            stateram13_final_4to12.csv \
+            | tee stateram13_final_gate.log
 
-          python3 - <<'PY'
-          import csv
-          import json
-          import re
-
-          rows=list(
-              csv.DictReader(
-                  open("decisive_4to12.csv")
-              )
-          )
-
-          visits={}
-          peak_rss=0.0
-          peak_raw=0.0
-          missing=0
-          writes=0
-
-          for r in rows:
-              key=(
-                  int(r["object"]),
-                  int(r["segment"])
-              )
-
-              visits[key]=visits.get(key,0)+1
-
-              peak_rss=max(
-                  peak_rss,
-                  float(r["rss_mb"])
-              )
-
-              peak_raw=max(
-                  peak_raw,
-                  float(r["tracked_raw_mb"])
-              )
-
-              missing+=int(r["missing_faults"])
-              writes+=int(r["write_faults"])
-
-          log=open(
-              "decisive_4to12.log"
-          ).read()
-
-          m=re.search(
-              r"decisive_evictions=(\d+) "
-              r"integrity_errors=(\d+)",
-              log
-          )
-
-          if not m:
-              raise SystemExit(
-                  "decisive counters missing from log"
-              )
-
-          evictions=int(m.group(1))
-          integrity_errors=int(m.group(2))
-
-          counts=list(visits.values())
-
-          result={
-              "interactions":len(rows),
-
-              "unique_segments":len(visits),
-
-              "expected_segments":1536,
-
-              "min_visits_per_segment":
-                  min(counts),
-
-              "max_visits_per_segment":
-                  max(counts),
-
-              "coverage_pct":
-                  100.0*len(visits)/1536.0,
-
-              "evictions":
-                  evictions,
-
-              "integrity_errors":
-                  integrity_errors,
-
-              "missing_faults":
-                  missing,
-
-              "write_faults":
-                  writes,
-
-              "peak_rss_mb":
-                  peak_rss,
-
-              "peak_tracked_raw_mb":
-                  peak_raw,
-          }
-
-          result["pass"]=(
-              len(rows)==3072
-              and len(visits)==1536
-              and min(counts)==2
-              and max(counts)==2
-              and evictions>1500
-              and integrity_errors==0
-              and peak_rss<4096
-              and peak_raw<=3000.5
-          )
-
-          print(
-              json.dumps(
-                  result,
-                  indent=2
-              )
-          )
-
-          open(
-              "decisive_result.json",
-              "w"
-          ).write(
-              json.dumps(
-                  result,
-                  indent=2
-              )
-              +"\n"
-          )
-
-          if not result["pass"]:
-              raise SystemExit(
-                  "DECISIVE 4-to-12 CHECK FAILED"
-              )
-
-          print(
-              "\nDECISIVE_4_TO_12=PASS"
-          )
-          PY
-
-      - name: Upload decisive results
+      - name: Upload final results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stateram-decisive-4to12-results
+          name: stateram13-final-results
           if-no-files-found: warn
           path: |
-            decisive_4to12.csv
-            decisive_4to12.log
-            decisive_result.json
+            stateram13_*.csv
+            stateram13_*.log
+            stateram13_*_analysis.json
+            stateram13_final_comparison.json
             userfaultfd_probe.log
