@@ -179,6 +179,15 @@ struct Region {
 
     HANDLE low_mem = nullptr;
     HANDLE deep_thread = nullptr;
+    HANDLE baseline_thread = nullptr;
+
+    std::atomic<int> baseline_done{0};
+    std::atomic<int> baseline_ok{0};
+    std::atomic<int> baseline_cancel{0};
+    std::atomic<uint32_t> baseline_progress_permille{0};
+
+    uint32_t baseline_units_per_slice = 2;
+    uint32_t baseline_sleep_ms = 3;
 
     std::atomic<int> deep_done{0};
     std::atomic<int> deep_ok{0};
@@ -419,8 +428,297 @@ static DWORD WINAPI deep_thread_proc(
     return ok ? 0 : 1;
 }
 
+
+static uint64_t filetime_u64(
+    const FILETIME& ft
+) {
+    ULARGE_INTEGER u{};
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    return u.QuadPart;
+}
+
+struct CpuSampler {
+    uint64_t idle = 0;
+    uint64_t kernel = 0;
+    uint64_t user = 0;
+    bool valid = false;
+
+    double sample_percent() {
+        FILETIME fi{}, fk{}, fu{};
+
+        if (!GetSystemTimes(
+                &fi,
+                &fk,
+                &fu)) {
+            return 0.0;
+        }
+
+        uint64_t ni = filetime_u64(fi);
+        uint64_t nk = filetime_u64(fk);
+        uint64_t nu = filetime_u64(fu);
+
+        if (!valid) {
+            idle = ni;
+            kernel = nk;
+            user = nu;
+            valid = true;
+            return 0.0;
+        }
+
+        uint64_t di = ni - idle;
+        uint64_t dk = nk - kernel;
+        uint64_t du = nu - user;
+
+        idle = ni;
+        kernel = nk;
+        user = nu;
+
+        uint64_t total = dk + du;
+
+        if (total == 0 || di > total) {
+            return 0.0;
+        }
+
+        return 100.0 *
+               static_cast<double>(
+                   total - di) /
+               static_cast<double>(
+                   total);
+    }
+};
+
+static bool memory_pressure_high(
+    Region* r
+) {
+    BOOL low = FALSE;
+
+    if (r->low_mem &&
+        QueryMemoryResourceNotification(
+            r->low_mem,
+            &low) &&
+        low) {
+        r->metrics.low_memory_signal = 1;
+        return true;
+    }
+
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+
+    if (GlobalMemoryStatusEx(&ms)) {
+        constexpr uint64_t MIN_AVAILABLE =
+            512ull * 1024ull * 1024ull;
+
+        if (ms.dwMemoryLoad >= 90 ||
+            ms.ullAvailPhys <
+                MIN_AVAILABLE) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void clear_partial_baseline(
+    Region* r
+) {
+    r->pack.reset();
+
+    std::fill(
+        r->refs.begin(),
+        r->refs.end(),
+        UnitRef{});
+
+    std::fill(
+        r->delta_offsets.begin(),
+        r->delta_offsets.end(),
+        NO_DELTA);
+
+    r->metrics.packed_used_bytes = 0;
+    r->metrics.packed_committed_bytes = 0;
+    r->metrics.baseline_payload_bytes = 0;
+}
+
+static DWORD WINAPI baseline_thread_proc(
+    LPVOID arg
+) {
+    Region* r =
+        static_cast<Region*>(arg);
+
+    bool background_ok =
+        SetThreadPriority(
+            GetCurrentThread(),
+            THREAD_MODE_BACKGROUND_BEGIN) != FALSE;
+
+    if (background_ok) {
+        r->metrics.background_mode_entered = 1;
+    }
+
+    CpuSampler cpu;
+    cpu.sample_percent();
+
+    double wall_t0 = now_ms();
+    double work_ms = 0.0;
+
+    bool failed = false;
+    bool pressure_abort = false;
+    size_t u = 0;
+
+    try {
+        std::vector<uint8_t> scratch;
+        scratch.reserve(UNIT_BYTES);
+
+        while (u < r->units) {
+            if (r->baseline_cancel.load(
+                    std::memory_order_acquire) != 0) {
+                break;
+            }
+
+            if (memory_pressure_high(r)) {
+                pressure_abort = true;
+                break;
+            }
+
+            size_t end =
+                std::min(
+                    r->units,
+                    u +
+                    static_cast<size_t>(
+                        std::max<uint32_t>(
+                            1,
+                            r->baseline_units_per_slice)));
+
+            double work_t0 = now_ms();
+
+            for (; u < end; ++u) {
+                if (!compress_append(
+                        r,
+                        r->arena +
+                            u * UNIT_BYTES,
+                        scratch,
+                        r->refs[u])) {
+                    failed = true;
+                    break;
+                }
+
+                r->baseline_progress_permille.store(
+                    static_cast<uint32_t>(
+                        ((u + 1) * 1000ull) /
+                        r->units),
+                    std::memory_order_release);
+            }
+
+            work_ms +=
+                now_ms() - work_t0;
+
+            r->metrics.baseline_slices += 1;
+
+            if (failed) {
+                break;
+            }
+
+            double cpu_pct =
+                cpu.sample_percent();
+
+            DWORD sleep_ms =
+                r->baseline_sleep_ms;
+
+            if (cpu_pct >= 55.0) {
+                sleep_ms =
+                    std::max<DWORD>(
+                        sleep_ms,
+                        10);
+
+                r->metrics.baseline_cpu_backoffs += 1;
+            }
+
+            if (sleep_ms > 0 &&
+                u < r->units) {
+                Sleep(sleep_ms);
+            }
+        }
+    } catch (...) {
+        failed = true;
+    }
+
+    r->metrics.baseline_wall_ms =
+        now_ms() - wall_t0;
+
+    r->metrics.baseline_ms =
+        r->metrics.baseline_wall_ms;
+
+    r->metrics.baseline_work_ms =
+        work_ms;
+
+    bool explicit_cancel =
+        r->baseline_cancel.load(
+            std::memory_order_acquire) != 0;
+
+    bool completed =
+        !failed &&
+        !pressure_abort &&
+        !explicit_cancel &&
+        u == r->units;
+
+    if (completed) {
+        r->metrics.baseline_payload_bytes =
+            r->pack->used();
+
+        r->metrics.packed_used_bytes =
+            r->pack->used();
+
+        r->metrics.packed_committed_bytes =
+            r->pack->committed();
+
+        r->metrics.baseline_epochs += 1;
+
+        r->baseline_progress_permille.store(
+            1000,
+            std::memory_order_release);
+
+        r->baseline_ok.store(
+            1,
+            std::memory_order_release);
+
+        r->state.store(
+            SR_ACTIVE_BASELINE,
+            std::memory_order_release);
+    } else {
+        if (pressure_abort) {
+            r->metrics.baseline_pressure_aborts += 1;
+        } else if (explicit_cancel) {
+            r->metrics.baseline_cancellations += 1;
+        }
+
+        clear_partial_baseline(r);
+
+        r->baseline_ok.store(
+            0,
+            std::memory_order_release);
+
+        r->state.store(
+            SR_ACTIVE_NO_CAPSULE,
+            std::memory_order_release);
+    }
+
+    if (background_ok) {
+        SetThreadPriority(
+            GetCurrentThread(),
+            THREAD_MODE_BACKGROUND_END);
+    }
+
+    sync_metric_state(r);
+
+    r->baseline_done.store(
+        1,
+        std::memory_order_release);
+
+    return completed ? 0 : 1;
+}
+
+
 SR_API uint32_t sr_api_version() {
-    return 0x00080001u;
+    return 0x00090001u;
 }
 
 SR_API SRHandle sr_create(
@@ -529,8 +827,10 @@ SR_API void* sr_data(
         : nullptr;
 }
 
-SR_API int sr_checkpoint_baseline(
-    SRHandle handle
+SR_API int sr_begin_background_baseline(
+    SRHandle handle,
+    uint32_t units_per_slice,
+    uint32_t base_sleep_ms
 ) {
     Region* r =
         static_cast<Region*>(
@@ -540,11 +840,13 @@ SR_API int sr_checkpoint_baseline(
         return 0;
     }
 
-    if (r->deep_thread) {
+    if (r->deep_thread ||
+        r->baseline_thread) {
         return 0;
     }
 
-    if (r->state.load() !=
+    if (r->state.load(
+            std::memory_order_acquire) !=
             SR_ACTIVE_NO_CAPSULE) {
         return 0;
     }
@@ -565,57 +867,194 @@ SR_API int sr_checkpoint_baseline(
             r->refs.end(),
             UnitRef{});
 
-        std::vector<uint8_t> scratch;
-        scratch.reserve(
-            UNIT_BYTES);
-
-        double t0 =
-            now_ms();
-
-        for (size_t u = 0;
-             u < r->units;
-             ++u) {
-            if (!compress_append(
-                    r,
-                    r->arena +
-                        u * UNIT_BYTES,
-                    scratch,
-                    r->refs[u])) {
-                return 0;
-            }
-        }
-
-        r->metrics.baseline_ms =
-            now_ms() - t0;
-
-        r->metrics.baseline_payload_bytes =
-            r->pack->used();
-
-        r->metrics.packed_used_bytes =
-            r->pack->used();
-
-        r->metrics.packed_committed_bytes =
-            r->pack->committed();
-
-        r->metrics.baseline_epochs += 1;
-
         if (ResetWriteWatch(
                 r->arena,
                 r->bytes) != 0) {
+            clear_partial_baseline(r);
             return 0;
         }
 
+        r->baseline_units_per_slice =
+            std::max<uint32_t>(
+                1,
+                units_per_slice);
+
+        r->baseline_sleep_ms =
+            base_sleep_ms;
+
+        r->baseline_done.store(0);
+        r->baseline_ok.store(0);
+        r->baseline_cancel.store(0);
+        r->baseline_progress_permille.store(0);
+
+        r->metrics.baseline_attempts += 1;
+        r->metrics.baseline_wall_ms = 0.0;
+        r->metrics.baseline_work_ms = 0.0;
+        r->metrics.baseline_slices = 0;
+        r->metrics.baseline_cpu_backoffs = 0;
+        r->metrics.background_mode_entered = 0;
+
         r->state.store(
-            SR_ACTIVE_BASELINE,
+            SR_BASELINE_BUILDING,
             std::memory_order_release);
 
         sync_metric_state(r);
 
+        r->baseline_thread =
+            CreateThread(
+                nullptr,
+                0,
+                baseline_thread_proc,
+                r,
+                0,
+                nullptr);
+
+        if (!r->baseline_thread) {
+            clear_partial_baseline(r);
+
+            r->state.store(
+                SR_ACTIVE_NO_CAPSULE,
+                std::memory_order_release);
+
+            sync_metric_state(r);
+
+            return 0;
+        }
+
         return 1;
 
     } catch (...) {
+        clear_partial_baseline(r);
+
+        r->state.store(
+            SR_ACTIVE_NO_CAPSULE,
+            std::memory_order_release);
+
+        sync_metric_state(r);
+
         return 0;
     }
+}
+
+SR_API int sr_baseline_done(
+    SRHandle handle
+) {
+    Region* r =
+        static_cast<Region*>(
+            handle);
+
+    if (!r) {
+        return -1;
+    }
+
+    return r->baseline_done.load(
+        std::memory_order_acquire);
+}
+
+SR_API uint32_t sr_baseline_progress_permille(
+    SRHandle handle
+) {
+    Region* r =
+        static_cast<Region*>(
+            handle);
+
+    if (!r) {
+        return 0;
+    }
+
+    return r->baseline_progress_permille.load(
+        std::memory_order_acquire);
+}
+
+SR_API int sr_wait_baseline(
+    SRHandle handle,
+    uint32_t timeout_ms
+) {
+    Region* r =
+        static_cast<Region*>(
+            handle);
+
+    if (!r || !r->baseline_thread) {
+        return 0;
+    }
+
+    DWORD w =
+        WaitForSingleObject(
+            r->baseline_thread,
+            timeout_ms);
+
+    if (w != WAIT_OBJECT_0) {
+        return 0;
+    }
+
+    CloseHandle(
+        r->baseline_thread);
+
+    r->baseline_thread = nullptr;
+
+    return r->baseline_ok.load(
+        std::memory_order_acquire);
+}
+
+SR_API int sr_cancel_background_baseline(
+    SRHandle handle
+) {
+    Region* r =
+        static_cast<Region*>(
+            handle);
+
+    if (!r || !r->baseline_thread) {
+        return 0;
+    }
+
+    r->baseline_cancel.store(
+        1,
+        std::memory_order_release);
+
+    DWORD w =
+        WaitForSingleObject(
+            r->baseline_thread,
+            30000);
+
+    if (w != WAIT_OBJECT_0) {
+        return 0;
+    }
+
+    CloseHandle(
+        r->baseline_thread);
+
+    r->baseline_thread = nullptr;
+
+    return r->state.load(
+        std::memory_order_acquire) ==
+        SR_ACTIVE_NO_CAPSULE;
+}
+
+SR_API int sr_checkpoint_baseline(
+    SRHandle handle
+) {
+    Region* r =
+        static_cast<Region*>(
+            handle);
+
+    if (!r) {
+        return 0;
+    }
+
+    if (!sr_begin_background_baseline(
+            handle,
+            static_cast<uint32_t>(
+                std::min<size_t>(
+                    r->units,
+                    std::numeric_limits<
+                        uint32_t>::max())),
+            0)) {
+        return 0;
+    }
+
+    return sr_wait_baseline(
+        handle,
+        30000);
 }
 
 SR_API int sr_enter_dormant(
@@ -631,7 +1070,8 @@ SR_API int sr_enter_dormant(
         return 0;
     }
 
-    if (r->deep_thread) {
+    if (r->deep_thread ||
+        r->baseline_thread) {
         return 0;
     }
 
@@ -916,7 +1356,8 @@ SR_API int sr_release_capsule(
             handle);
 
     if (!r ||
-        r->deep_thread) {
+        r->deep_thread ||
+        r->baseline_thread) {
         return 0;
     }
 
@@ -988,6 +1429,21 @@ SR_API void sr_destroy(
             handle);
 
     if (!r) return;
+
+    if (r->baseline_thread) {
+        r->baseline_cancel.store(
+            1,
+            std::memory_order_release);
+
+        WaitForSingleObject(
+            r->baseline_thread,
+            INFINITE);
+
+        CloseHandle(
+            r->baseline_thread);
+
+        r->baseline_thread = nullptr;
+    }
 
     if (r->deep_thread) {
         WaitForSingleObject(
