@@ -1,4 +1,4 @@
-name: Build and Defender-scan StateRAM Phase 11
+name: Build StateRAM Phase 12 tail diagnosis
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 jobs:
-  verify:
+  phase12:
     runs-on: windows-latest
     timeout-minutes: 15
 
@@ -15,7 +15,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build Phase 11
+      - name: Build validated Phase 11 SDK and Phase 12 diagnostic
         shell: powershell
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -26,16 +26,25 @@ jobs:
           cmd /c "`"$devcmd`" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /O2 /EHsc /W4 /LD stateram_sdk.cpp /link Cabinet.lib /out:stateram_sdk.dll"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          cmd /c "`"$devcmd`" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /O2 /EHsc /W4 phase11_workspace.cpp /link Psapi.lib Advapi32.lib /out:StateRAM_Workspace_SafeTest.exe"
+          cmd /c "`"$devcmd`" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /O2 /EHsc /W4 phase12_tail.cpp /link Psapi.lib Advapi32.lib /out:StateRAM_Phase12_Tail_Diagnostic.exe"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Run Phase 11 cloud smoke first
+      - name: Disposable cloud telemetry smoke test
         shell: powershell
         run: |
-          .\StateRAM_Workspace_SafeTest.exe --cloud-smoke
+          .\StateRAM_Phase12_Tail_Diagnostic.exe --cloud-smoke
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Find Microsoft Defender command-line scanner
+      - name: Gate diagnostic telemetry
+        shell: powershell
+        run: |
+          $r = Get-Content .\phase12_cloud_result.json -Raw | ConvertFrom-Json
+          $r | ConvertTo-Json -Depth 8
+          if (-not $r.diagnostic_pass) { throw "WINDOWS_STATERAM_PHASE12_CLOUD_GATE=FAIL" }
+          if (-not (Test-Path .\phase12_cloud_switches.csv)) { throw "missing switch telemetry CSV" }
+          Write-Host "WINDOWS_STATERAM_PHASE12_CLOUD_GATE=PASS"
+
+      - name: Find Microsoft Defender scanner
         id: defender
         shell: powershell
         run: |
@@ -59,18 +68,17 @@ jobs:
           }
 
           if (-not $mp) {
-            throw "Microsoft Defender MpCmdRun.exe is unavailable. Failing closed; no local executable artifact will be published."
+            throw "Microsoft Defender scanner unavailable. Failing closed."
           }
 
           "mp=$mp" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          Write-Host "Using Defender scanner: $mp"
 
-      - name: Microsoft Defender custom scan
+      - name: Defender scan both binaries
         shell: powershell
         run: |
           $mp = '${{ steps.defender.outputs.mp }}'
 
-          & $mp -Scan -ScanType 3 -File "$PWD\StateRAM_Workspace_SafeTest.exe"
+          & $mp -Scan -ScanType 3 -File "$PWD\StateRAM_Phase12_Tail_Diagnostic.exe"
           $exeCode = $LASTEXITCODE
 
           & $mp -Scan -ScanType 3 -File "$PWD\stateram_sdk.dll"
@@ -79,13 +87,12 @@ jobs:
           @"
           Microsoft Defender verification
           =================================
-          Scanner: $mp
-          StateRAM_Workspace_SafeTest.exe exit code: $exeCode
+          StateRAM_Phase12_Tail_Diagnostic.exe exit code: $exeCode
           stateram_sdk.dll exit code: $dllCode
           "@ | Set-Content -Encoding UTF8 .\DEFENDER_SCAN_REPORT.txt
 
           if ($exeCode -ne 0 -or $dllCode -ne 0) {
-            throw "Microsoft Defender scan did not return clean success for both binaries. Failing closed."
+            throw "Defender scan did not return clean success. Failing closed."
           }
 
           Write-Host "MICROSOFT_DEFENDER_SCAN=PASS"
@@ -93,67 +100,96 @@ jobs:
       - name: Create SHA-256 manifest
         shell: powershell
         run: |
-          $exeHash = (Get-FileHash .\StateRAM_Workspace_SafeTest.exe -Algorithm SHA256).Hash.ToLower()
+          $exeHash = (Get-FileHash .\StateRAM_Phase12_Tail_Diagnostic.exe -Algorithm SHA256).Hash.ToLower()
           $dllHash = (Get-FileHash .\stateram_sdk.dll -Algorithm SHA256).Hash.ToLower()
 
           @"
-          SHA256  StateRAM_Workspace_SafeTest.exe  $exeHash
-          SHA256  stateram_sdk.dll                 $dllHash
+          SHA256  StateRAM_Phase12_Tail_Diagnostic.exe  $exeHash
+          SHA256  stateram_sdk.dll                      $dllHash
           "@ | Set-Content -Encoding ASCII .\SHA256SUMS.txt
 
           Get-Content .\SHA256SUMS.txt
 
-      - name: Assemble guarded local package
+      - name: Assemble guarded local diagnostic package
         shell: powershell
         run: |
-          New-Item -ItemType Directory -Force -Path .\StateRAM_Phase11_Verified | Out-Null
-          Copy-Item .\StateRAM_Workspace_SafeTest.exe .\StateRAM_Phase11_Verified\
-          Copy-Item .\stateram_sdk.dll .\StateRAM_Phase11_Verified\
-          Copy-Item .\DEFENDER_SCAN_REPORT.txt .\StateRAM_Phase11_Verified\
-          Copy-Item .\SHA256SUMS.txt .\StateRAM_Phase11_Verified\
+          New-Item -ItemType Directory -Force -Path .\StateRAM_Phase12_Local | Out-Null
+
+          Copy-Item .\StateRAM_Phase12_Tail_Diagnostic.exe .\StateRAM_Phase12_Local\
+          Copy-Item .\stateram_sdk.dll .\StateRAM_Phase12_Local\
+          Copy-Item .\DEFENDER_SCAN_REPORT.txt .\StateRAM_Phase12_Local\
+          Copy-Item .\SHA256SUMS.txt .\StateRAM_Phase12_Local\
 
           @'
           @echo off
           cd /d "%~dp0"
-          echo StateRAM Phase 11 - realistic isolated workspace switching
+          echo StateRAM Phase 12 - narrow tail-latency diagnosis
           echo.
           echo IMPORTANT: run normally. Do NOT choose "Run as administrator".
           echo Save your current work before starting.
           echo.
-          StateRAM_Workspace_SafeTest.exe
+          StateRAM_Phase12_Tail_Diagnostic.exe
           echo.
-          echo Send ChatGPT:
-          echo   stateram_phase11_local_result.json
-          echo   stateram_phase11_guard_result.json
+          echo Send ChatGPT these THREE files:
+          echo   stateram_phase12_tail_result.json
+          echo   stateram_phase12_switches.csv
+          echo   stateram_phase12_guard_result.json
           echo.
           pause
-          '@ | Set-Content -Encoding ASCII .\StateRAM_Phase11_Verified\RUN_PHASE11_SAFE.cmd
+          '@ | Set-Content -Encoding ASCII .\StateRAM_Phase12_Local\RUN_PHASE12_SAFE.cmd
 
           @'
-          This package was built on GitHub Actions and was only published if:
-            1. Phase 11 cloud smoke passed.
-            2. Microsoft Defender MpCmdRun custom scans returned success for
-               both StateRAM_Workspace_SafeTest.exe and stateram_sdk.dll.
-            3. SHA-256 hashes were recorded.
+          StateRAM Phase 12 - Tail-Latency Diagnosis
 
-          IMPORTANT:
-          - This does not make the executable digitally signed.
-          - Browser reputation systems can still warn on a new unsigned binary.
-          - Do not disable browser or Windows security protections globally.
-          - Do not run as Administrator.
-          '@ | Set-Content -Encoding UTF8 .\StateRAM_Phase11_Verified\README_VERIFIED.txt
+          This is NOT another capacity test.
 
-      - name: Upload verification evidence
+          It keeps the already validated Phase 11 mechanism and records every
+          switch in detail so one rare long stall can be localized.
+
+          For every switch it records:
+            - total wall time
+            - current-thread CPU time
+            - inferred non-running/blocking time
+            - outgoing dirty finalization time
+            - outgoing VirtualFree/MEM_DECOMMIT time
+            - dirty-page count
+            - compact capsule size
+            - incoming resume-core wall time
+            - incoming SDK core-reconstruction time
+            - deep-restore wall time
+            - Windows memory load / available RAM
+
+          Important interpretation:
+          "THREAD_NOT_RUNNING_OR_BLOCKED" means wall time greatly exceeded
+          current-thread CPU time. That can include scheduling, the Phase 11
+          safety Job Object CPU cap, or blocking inside an OS call. It is NOT
+          automatically proof of one specific cause.
+
+          Safety envelope is unchanged from Phase 11:
+            - no Administrator
+            - 320 MiB hard child commit cap
+            - 35% hard CPU cap
+            - BELOW_NORMAL priority
+            - abort >=88% memory load
+            - abort below 640 MiB available RAM
+            - refuse start below 1024 MiB available RAM
+            - 120 second timeout
+            - no drivers/injection/registry/pagefile/boot changes
+
+          A long tail is NOT a failed diagnostic. The diagnostic passes when
+          telemetry is complete and state integrity remains correct.
+          '@ | Set-Content -Encoding UTF8 .\StateRAM_Phase12_Local\README_FIRST.txt
+
+      - name: Upload cloud diagnostic evidence
         uses: actions/upload-artifact@v4
         with:
-          name: StateRAM-Phase11-Verification-Evidence
+          name: StateRAM-Phase12-Cloud-Diagnostic
           path: |
-            DEFENDER_SCAN_REPORT.txt
-            SHA256SUMS.txt
-            phase11_cloud_smoke.json
+            phase12_cloud_result.json
+            phase12_cloud_switches.csv
 
-      - name: Upload Defender-gated local package
+      - name: Upload Defender-gated local diagnostic
         uses: actions/upload-artifact@v4
         with:
-          name: StateRAM-Phase11-Defender-Verified-Local-Test
-          path: StateRAM_Phase11_Verified
+          name: StateRAM-Phase12-Local-Tail-Diagnostic
+          path: StateRAM_Phase12_Local
