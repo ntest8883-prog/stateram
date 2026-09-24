@@ -1,0 +1,236 @@
+name: StateRAM Core v0.1 bounded 4-to-8 evaluation package
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - core-v01-4to8-evaluation
+
+permissions:
+  contents: read
+
+jobs:
+  validate-evaluation-package:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout evaluation branch
+        uses: actions/checkout@v4
+
+      - name: Reconstruct generated source files
+        shell: powershell
+        run: |
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+
+          $coreParts = @(
+            ".\core-v01\src\stateram_core.part1",
+            ".\core-v01\src\stateram_core.part2",
+            ".\core-v01\src\stateram_core.part3",
+            ".\core-v01\src\stateram_core.part4",
+            ".\core-v01\src\stateram_core.part5",
+            ".\core-v01\src\stateram_core.part6",
+            ".\core-v01\src\stateram_core.part7"
+          )
+
+          $wbParts = @(
+            ".\core-v01\workbench\workbench_win32.part1",
+            ".\core-v01\workbench\workbench_win32.part2",
+            ".\core-v01\workbench\workbench_win32.part3a",
+            ".\core-v01\workbench\workbench_win32.part3b"
+          )
+
+          $evalParts = @(
+            ".\core-v01\evaluation\evaluator.part1",
+            ".\core-v01\evaluation\evaluator.part2",
+            ".\core-v01\evaluation\evaluator.part3",
+            ".\core-v01\evaluation\evaluator.part4"
+          )
+
+          foreach ($f in ($coreParts + $wbParts + $evalParts)) {
+            if (-not (Test-Path $f)) { throw "Missing source part: $f" }
+          }
+
+          $core = ($coreParts | ForEach-Object { Get-Content $_ -Raw }) -join ""
+          [IO.File]::WriteAllText("$PWD\core-v01\src\stateram_core.cpp", $core, $utf8)
+
+          $wb = ($wbParts | ForEach-Object { Get-Content $_ -Raw }) -join ""
+          [IO.File]::WriteAllText("$PWD\core-v01\workbench\workbench_win32.cpp", $wb, $utf8)
+
+          $ev = ($evalParts | ForEach-Object { Get-Content $_ -Raw }) -join ""
+          [IO.File]::WriteAllText("$PWD\core-v01\evaluation\evaluator_win32.cpp", $ev, $utf8)
+
+          Write-Host "EVALUATION_SOURCE_RECONSTRUCTION=PASS"
+
+      - name: Configure x64 Release
+        shell: powershell
+        run: |
+          cmake -S .\core-v01 -B .\core-v01\build -A x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build Core and bounded evaluator
+        shell: powershell
+        run: |
+          cmake --build .\core-v01\build --config Release --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Frozen Core self-check
+        shell: powershell
+        run: |
+          Push-Location .\core-v01
+          .\build\Release\stateram_core_selfcheck.exe
+          $code = $LASTEXITCODE
+          Pop-Location
+          if ($code -ne 0) { exit $code }
+          Write-Host "STATERAM_CORE_V01_SELF_CHECK_WINDOWS=PASS"
+
+      - name: Cloud validate A-B-C evaluator
+        shell: powershell
+        run: |
+          Push-Location .\core-v01
+          .\build\Release\StateRAM_4to8_Evaluator.exe --cloud-validate
+          $code = $LASTEXITCODE
+
+          if ($code -ne 0) {
+            Pop-Location
+            exit $code
+          }
+
+          if (-not (Test-Path .\stateram_4to8_cloud_evaluation.json)) {
+            Pop-Location
+            throw "Evaluator did not produce cloud evaluation JSON"
+          }
+
+          $r = Get-Content .\stateram_4to8_cloud_evaluation.json -Raw | ConvertFrom-Json
+          $r | ConvertTo-Json -Depth 8
+
+          if (-not $r.overall_pass) { throw "Cloud A/B/C evaluator gate failed" }
+          if ($r.logical_application_mb -ne 3840) { throw "Expected exactly 3840 MiB logical state" }
+          if (-not $r.correctness_pass) { throw "A correctness did not pass" }
+          if (-not $r.capacity_pass) { throw "B capacity did not pass" }
+          if (-not $r.experience_pass) { throw "C experience did not pass" }
+          if ($r.capacity_raw_after_trim_mb -gt 160) { throw "Capacity raw trim gate exceeded" }
+          if ($r.capacity_promotions -le 0 -or $r.capacity_streaming_evictions -le 0) {
+            throw "Promotion and eviction were not both exercised"
+          }
+
+          Copy-Item .\stateram_4to8_cloud_evaluation.json ..\stateram_4to8_cloud_evaluation.json
+          Copy-Item .\stateram_4to8_cloud_interactions.csv ..\stateram_4to8_cloud_interactions.csv
+          Pop-Location
+
+          Write-Host "STATERAM_CORE_V01_4TO8_CLOUD_VALIDATION=PASS"
+
+      - name: Find Microsoft Defender scanner
+        id: defender
+        shell: powershell
+        run: |
+          $platformRoot = Join-Path $env:ProgramData "Microsoft\Windows Defender\Platform"
+          $mp = $null
+
+          if (Test-Path $platformRoot) {
+            $latest = Get-ChildItem $platformRoot -Directory |
+              Sort-Object Name -Descending |
+              Select-Object -First 1
+            if ($latest) {
+              $candidate = Join-Path $latest.FullName "MpCmdRun.exe"
+              if (Test-Path $candidate) { $mp = $candidate }
+            }
+          }
+
+          if (-not $mp) {
+            $candidate = Join-Path $env:ProgramFiles "Windows Defender\MpCmdRun.exe"
+            if (Test-Path $candidate) { $mp = $candidate }
+          }
+
+          if (-not $mp) { throw "Microsoft Defender scanner unavailable" }
+          "mp=$mp" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Defender scan evaluator package
+        shell: powershell
+        run: |
+          $mp = '${{ steps.defender.outputs.mp }}'
+          $scanDir = Join-Path $PWD "defender-evaluation-scan"
+          New-Item -ItemType Directory -Force -Path $scanDir | Out-Null
+
+          $files = @(
+            ".\core-v01\build\Release\stateram_core.dll",
+            ".\core-v01\build\Release\StateRAM_4to8_Evaluator.exe",
+            ".\core-v01\build\Release\StateRAM_4to8_Evaluator_Safe.exe"
+          )
+
+          foreach ($f in $files) {
+            if (-not (Test-Path $f)) { throw "Missing evaluation binary: $f" }
+            Copy-Item $f $scanDir
+          }
+
+          & $mp -Scan -ScanType 3 -File $scanDir
+          $code = $LASTEXITCODE
+
+          @(
+            "ScanTarget=$scanDir"
+            "MpCmdRunExitCode=$code"
+          ) | Set-Content -Encoding UTF8 .\STATERAM_4TO8_DEFENDER_SCAN.txt
+
+          if ($code -ne 0) {
+            throw "Defender evaluator scan failed with exit code $code"
+          }
+
+          Write-Host "STATERAM_4TO8_DEFENDER_SCAN=PASS"
+
+      - name: Assemble one guarded evaluation package
+        shell: powershell
+        run: |
+          $dst = ".\StateRAM-Core-v0.1-4to8-Evaluation"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+
+          Copy-Item .\core-v01\build\Release\stateram_core.dll $dst\
+          Copy-Item .\core-v01\build\Release\StateRAM_4to8_Evaluator.exe $dst\
+          Copy-Item .\core-v01\build\Release\StateRAM_4to8_Evaluator_Safe.exe $dst\
+          Copy-Item .\core-v01\evaluation\README_EVALUATION.md $dst\
+          Copy-Item .\STATERAM_4TO8_DEFENDER_SCAN.txt $dst\
+
+          $files = @(
+            "$dst\stateram_core.dll",
+            "$dst\StateRAM_4to8_Evaluator.exe",
+            "$dst\StateRAM_4to8_Evaluator_Safe.exe"
+          )
+
+          $lines = foreach ($f in $files) {
+            $h = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower()
+            "SHA256  $([IO.Path]::GetFileName($f))  $h"
+          }
+
+          $lines | Set-Content -Encoding ASCII "$dst\SHA256SUMS.txt"
+
+          @'
+          @echo off
+          cd /d "%~dp0"
+          echo StateRAM Core v0.1 - bounded 4-to-8 evaluation
+          echo.
+          echo Run normally. DO NOT use "Run as administrator".
+          echo Save any important work before starting.
+          echo.
+          StateRAM_4to8_Evaluator_Safe.exe
+          echo.
+          echo When complete, send ChatGPT:
+          echo   stateram_4to8_evaluation.json
+          echo   stateram_4to8_interactions.csv
+          echo   stateram_4to8_guard.json
+          echo.
+          pause
+          '@ | Set-Content -Encoding ASCII "$dst\RUN_4TO8_EVALUATION_SAFE.cmd"
+
+      - name: Upload cloud validation evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: StateRAM-Core-v0.1-4to8-Cloud-Validation
+          path: |
+            stateram_4to8_cloud_evaluation.json
+            stateram_4to8_cloud_interactions.csv
+            STATERAM_4TO8_DEFENDER_SCAN.txt
+
+      - name: Upload one guarded evaluation package
+        uses: actions/upload-artifact@v4
+        with:
+          name: StateRAM-Core-v0.1-4to8-Evaluation
+          path: StateRAM-Core-v0.1-4to8-Evaluation
