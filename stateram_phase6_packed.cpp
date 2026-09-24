@@ -657,26 +657,29 @@ static bool compress_to_pack(
         return false;
     }
 
-    if (needed < raw.size()) {
-        compressed_scratch.resize(needed);
+    // `needed` is the destination capacity required for a successful
+    // compression call; it is not the actual compressed output length.
+    // Always perform compression first, then compare the returned `got`.
+    compressed_scratch.resize(needed);
 
-        SIZE_T got = 0;
+    SIZE_T got = 0;
 
-        if (!Compress(
-                compressor,
-                raw.data(),
-                raw.size(),
-                compressed_scratch.data(),
-                compressed_scratch.size(),
-                &got)) {
-            return false;
-        }
+    if (!Compress(
+            compressor,
+            raw.data(),
+            raw.size(),
+            compressed_scratch.data(),
+            compressed_scratch.size(),
+            &got)) {
+        return false;
+    }
 
-        if (got == 0 ||
-            got > std::numeric_limits<uint32_t>::max()) {
-            return false;
-        }
+    if (got == 0 ||
+        got > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
 
+    if (got < raw.size()) {
         ref.offset =
             pack.append(
                 compressed_scratch.data(),
