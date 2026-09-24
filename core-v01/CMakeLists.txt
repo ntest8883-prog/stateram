@@ -37,4 +37,12 @@ if (WIN32)
     add_executable(stateram_workbench_safe workbench/workbench_launcher.cpp)
     set_target_properties(stateram_workbench_safe PROPERTIES OUTPUT_NAME "StateRAM_Workbench_Safe")
     target_link_libraries(stateram_workbench_safe PRIVATE user32 advapi32)
+
+    add_executable(stateram_4to8_evaluator evaluation/evaluator_win32.cpp)
+    set_target_properties(stateram_4to8_evaluator PROPERTIES OUTPUT_NAME "StateRAM_4to8_Evaluator")
+    target_link_libraries(stateram_4to8_evaluator PRIVATE stateram_core Psapi)
+
+    add_executable(stateram_4to8_evaluator_safe evaluation/evaluator_launcher.cpp)
+    set_target_properties(stateram_4to8_evaluator_safe PROPERTIES OUTPUT_NAME "StateRAM_4to8_Evaluator_Safe")
+    target_link_libraries(stateram_4to8_evaluator_safe PRIVATE user32 advapi32)
 endif()
