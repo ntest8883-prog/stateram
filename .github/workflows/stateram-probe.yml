@@ -26,7 +26,7 @@ jobs:
           cmd /c "`"$devcmd`" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /O2 /EHsc /W4 /LD stateram_sdk.cpp /link Cabinet.lib /out:stateram_sdk.dll"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          cmd /c "`"$devcmd`" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /O2 /EHsc /W4 phase10_local.cpp /link Psapi.lib /out:StateRAM_Local_SafeTest.exe"
+          cmd /c "`"$devcmd`" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /O2 /EHsc /W4 phase10_local.cpp /link Psapi.lib Advapi32.lib /out:StateRAM_Local_SafeTest.exe"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Assemble local package
