@@ -1,5 +1,6 @@
 #define _WIN32_WINNT 0x0602
 #define PSAPI_VERSION 1
+#define NOMINMAX
 #include <windows.h>
 #include <psapi.h>
 
