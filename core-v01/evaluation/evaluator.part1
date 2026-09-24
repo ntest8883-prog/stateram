@@ -1,0 +1,241 @@
+#ifdef _WIN32
+#define _WIN32_WINNT 0x0602
+#define NOMINMAX
+#include <windows.h>
+#include <psapi.h>
+
+#include "stateram_core.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <numeric>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#pragma comment(lib, "Psapi.lib")
+
+static constexpr uint64_t KB = 1024ull;
+static constexpr uint64_t MB = 1024ull * 1024ull;
+static constexpr size_t WORKSPACES = 6;
+static constexpr size_t PAGE = 4096;
+
+struct BackingInfo {
+    uint64_t seed = 0;
+    uint32_t kind = 0;
+};
+
+struct Workspace {
+    std::array<BackingInfo, 5> backing{};
+    SRObjectId document = 0;
+    SRObjectId history = 0;
+    SRObjectId index_object = 0;
+    SRObjectId preview = 0;
+    SRObjectId asset = 0;
+};
+
+struct Patch {
+    SRObjectId object_id = 0;
+    uint64_t offset = 0;
+    std::array<uint8_t, PAGE> bytes{};
+};
+
+struct ProcMetrics {
+    uint64_t working_set = 0;
+    uint64_t private_bytes = 0;
+    uint64_t pagefile_usage = 0;
+    uint64_t read_bytes = 0;
+    uint64_t write_bytes = 0;
+};
+
+struct TimingSet {
+    std::vector<double> switch_ms;
+    std::vector<double> edit_ms;
+    std::vector<double> search_ms;
+    std::vector<double> preview_ms;
+    std::vector<double> asset_ms;
+};
+
+static uint64_t mix64(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+
+static int generate_backing(
+    SRObjectId,
+    uint64_t offset,
+    uint64_t length,
+    void* destination,
+    void* user
+) {
+    auto* info = static_cast<BackingInfo*>(user);
+    auto* out = static_cast<uint8_t*>(destination);
+    if (!info || !out) return 0;
+
+    if (info->kind == 0) {
+        static const char text[] =
+            "StateRAM 4-to-8 evaluation document. Foreground edits, history, "
+            "indexes, previews and file-backed assets remain exact while cold. ";
+        constexpr size_t n = sizeof(text) - 1;
+
+        for (uint64_t i = 0; i < length; ++i) {
+            const uint64_t absolute = offset + i;
+            if ((absolute % 83) == 82) {
+                out[i] = '\n';
+            } else {
+                const uint64_t phase = mix64(info->seed ^ (absolute / PAGE));
+                out[i] = static_cast<uint8_t>(
+                    text[(absolute + (phase & 31ull)) % n]);
+            }
+        }
+        return 1;
+    }
+
+    for (uint64_t i = 0; i < length; ++i) {
+        const uint64_t absolute = offset + i;
+        const uint64_t x = mix64(info->seed ^ (absolute / 64));
+        out[i] = static_cast<uint8_t>(
+            x >> ((absolute & 7ull) * 8));
+    }
+    return 1;
+}
+
+static double qpc_ms() {
+    static LARGE_INTEGER freq = [] {
+        LARGE_INTEGER x{};
+        QueryPerformanceFrequency(&x);
+        return x;
+    }();
+
+    LARGE_INTEGER q{};
+    QueryPerformanceCounter(&q);
+    return 1000.0 * static_cast<double>(q.QuadPart) /
+        static_cast<double>(freq.QuadPart);
+}
+
+static double percentile(std::vector<double> v, double p) {
+    if (v.empty()) return 0.0;
+    std::sort(v.begin(), v.end());
+    const size_t i = static_cast<size_t>(
+        std::floor(p * static_cast<double>(v.size() - 1)));
+    return v[i];
+}
+
+static double max_value(const std::vector<double>& v) {
+    return v.empty() ? 0.0 : *std::max_element(v.begin(), v.end());
+}
+
+static ProcMetrics process_metrics() {
+    ProcMetrics out{};
+
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    if (GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
+            sizeof(pmc))) {
+        out.working_set = pmc.WorkingSetSize;
+        out.private_bytes = pmc.PrivateUsage;
+        out.pagefile_usage = pmc.PagefileUsage;
+    }
+
+    IO_COUNTERS io{};
+    if (GetProcessIoCounters(GetCurrentProcess(), &io)) {
+        out.read_bytes = io.ReadTransferCount;
+        out.write_bytes = io.WriteTransferCount;
+    }
+
+    return out;
+}
+
+static bool verify_backing_bytes(
+    const BackingInfo& info,
+    uint64_t offset,
+    const uint8_t* data,
+    size_t bytes
+) {
+    std::vector<uint8_t> expected(bytes);
+    BackingInfo copy = info;
+    if (!generate_backing(
+            0,
+            offset,
+            static_cast<uint64_t>(bytes),
+            expected.data(),
+            &copy)) {
+        return false;
+    }
+    return std::memcmp(expected.data(), data, bytes) == 0;
+}
+
+class Evaluation {
+public:
+    explicit Evaluation(bool cloud)
+        : cloud_(cloud) {}
+
+    ~Evaluation() {
+        if (ctx_) sr_context_destroy(ctx_);
+    }
+
+    bool initialize() {
+        SRContextConfig cfg{};
+        cfg.target_raw_bytes = 512ull * MB;
+        cfg.hard_raw_bytes = 896ull * MB;
+        cfg.foreground_burst_bytes = 64ull * MB;
+        cfg.comfortable_available_bytes = 1024ull * MB;
+        cfg.emergency_available_bytes = 640ull * MB;
+        cfg.background_period_ms = 20;
+        cfg.prewarm_segments_per_hint = 4;
+        cfg.overlay_consolidate_pages = 32;
+
+        if (sr_context_create(&cfg, &ctx_) != SR_OK) {
+            return false;
+        }
+
+        for (size_t i = 0; i < WORKSPACES; ++i) {
+            auto& w = ws_[i];
+
+            for (size_t j = 0; j < w.backing.size(); ++j) {
+                w.backing[j].seed =
+                    0x4A180000ull +
+                    static_cast<uint64_t>(i) * 0x10000ull +
+                    static_cast<uint64_t>(j) * 0x101ull;
+                w.backing[j].kind = j == 0 ? 0u : 1u;
+            }
+
+            if (!reg(w.document, "document", 64 * MB, 1 * MB,
+                     SR_SEM_USER_DOCUMENT, SR_BACKING_RECIPE,
+                     SR_OBJECT_PROTECT_CRITICAL_PREFIX,
+                     &w.backing[0], true)) return false;
+
+            if (!reg(w.history, "history", 64 * MB, 512 * KB,
+                     SR_SEM_HISTORY, SR_BACKING_RECIPE,
+                     0, &w.backing[1], true)) return false;
+
+            if (!reg(w.index_object, "search-index", 128 * MB, 1 * MB,
+                     SR_SEM_DERIVED_INDEX, SR_BACKING_RECIPE,
+                     0, &w.backing[2], true)) return false;
+
+            if (!reg(w.preview, "preview-cache", 192 * MB, 512 * KB,
+                     SR_SEM_CACHE, SR_BACKING_DISCARDABLE_RECIPE,
+                     0, &w.backing[3], true)) return false;
+
+            if (!reg(w.asset, "file-backed-asset", 192 * MB, 512 * KB,
+                     SR_SEM_FILE_BACKED_ASSET, SR_BACKING_FILE,
+                     0, &w.backing[4], false)) return false;
+        }
+
+        return true;
+    }
+
+    uint64_t logical_bytes() const {
+        SRStats s{};
+        sr_get_stats(ctx_, &s);
+        return s.logical_bytes;
+    }

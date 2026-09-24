@@ -1,0 +1,80 @@
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                0, 0, 0, 0, hwnd,
+                reinterpret_cast<HMENU>(IDC_PREVIEW_BUTTON), GetModuleHandle(nullptr), nullptr);
+
+            CreateWindowExA(0, "BUTTON", "Save edit",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                0, 0, 0, 0, hwnd,
+                reinterpret_cast<HMENU>(IDC_SAVE_BUTTON), GetModuleHandle(nullptr), nullptr);
+
+            g_doc = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL |
+                ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_WANTRETURN,
+                0, 0, 0, 0, hwnd,
+                reinterpret_cast<HMENU>(IDC_DOC), GetModuleHandle(nullptr), nullptr);
+            SendMessageA(g_doc, EM_SETLIMITTEXT, static_cast<WPARAM>(VISIBLE_DOCUMENT_BYTES - 1), 0);
+
+            g_status = CreateWindowExA(0, "STATIC", "StateRAM starting...",
+                WS_CHILD | WS_VISIBLE,
+                0, 0, 0, 0, hwnd,
+                reinterpret_cast<HMENU>(IDC_STATUS), GetModuleHandle(nullptr), nullptr);
+
+            SetTimer(hwnd, TIMER_STATS, 1000, nullptr);
+            load_current_document();
+            refresh_stats();
+            return 0;
+        }
+
+        case WM_SIZE:
+            layout(hwnd);
+            return 0;
+
+        case WM_COMMAND: {
+            const int id = LOWORD(wparam);
+            if (id >= IDC_WS_BASE && id < IDC_WS_BASE + WORKSPACES) {
+                save_current_document();
+                const int next = id - IDC_WS_BASE;
+                if (g_model->switch_workspace(next)) {
+                    load_current_document();
+                    refresh_stats();
+                }
+                return 0;
+            }
+
+            if (id == IDC_SAVE_BUTTON) {
+                save_current_document();
+                refresh_stats();
+                return 0;
+            }
+
+            if (id == IDC_SEARCH_BUTTON) {
+                set_status(g_model->run_search(edit_text(g_search)));
+                return 0;
+            }
+
+            if (id == IDC_PREVIEW_BUTTON) {
+                set_status(g_model->open_preview());
+                return 0;
+            }
+            break;
+        }
+
+        case WM_TIMER:
+            if (wparam == TIMER_STATS) refresh_stats();
+            return 0;
+
+        case WM_CLOSE:
+            save_current_document();
+            DestroyWindow(hwnd);
+            return 0;
+
+        case WM_DESTROY:
+            KillTimer(hwnd, TIMER_STATS);
+            PostQuitMessage(0);
+            return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wparam, lparam);
+}
+
+static int headless_smoke() {
+    WorkbenchModel model;

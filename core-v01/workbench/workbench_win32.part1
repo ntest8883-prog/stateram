@@ -1,0 +1,217 @@
+#ifdef _WIN32
+#define _WIN32_WINNT 0x0602
+#define NOMINMAX
+#include <windows.h>
+
+#include "stateram_core.h"
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <vector>
+
+static constexpr uint64_t MB = 1024ull * 1024ull;
+static constexpr int WORKSPACES = 6;
+static constexpr uint64_t VISIBLE_DOCUMENT_BYTES = 64ull * 1024ull;
+
+static constexpr int IDC_DOC = 1001;
+static constexpr int IDC_SEARCH = 1002;
+static constexpr int IDC_SEARCH_BUTTON = 1003;
+static constexpr int IDC_PREVIEW_BUTTON = 1004;
+static constexpr int IDC_SAVE_BUTTON = 1005;
+static constexpr int IDC_STATUS = 1006;
+static constexpr int IDC_WS_BASE = 1100;
+static constexpr int TIMER_STATS = 2001;
+
+struct BackingInfo {
+    uint64_t seed = 0;
+    uint32_t kind = 0;
+};
+
+static uint64_t mix64(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+
+static int generate_backing(
+    SRObjectId,
+    uint64_t offset,
+    uint64_t length,
+    void* destination,
+    void* user
+) {
+    auto* info = static_cast<BackingInfo*>(user);
+    auto* out = static_cast<uint8_t*>(destination);
+    if (!info || !out) return 0;
+
+    if (info->kind == 0) {
+        static const char text[] =
+            "StateRAM Workbench document: editable foreground text, semantic state, "
+            "searchable history, indexes, previews, and cold workspace data. ";
+        constexpr size_t text_n = sizeof(text) - 1;
+
+        for (uint64_t i = 0; i < length; ++i) {
+            const uint64_t absolute = offset + i;
+            if ((absolute % 79) == 78) {
+                out[i] = '\n';
+            } else {
+                const uint64_t phase = mix64(info->seed ^ (absolute / 4096));
+                out[i] = static_cast<uint8_t>(text[(absolute + (phase & 31)) % text_n]);
+            }
+        }
+        return 1;
+    }
+
+    for (uint64_t i = 0; i < length; ++i) {
+        const uint64_t absolute = offset + i;
+        const uint64_t x = mix64(info->seed ^ (absolute / 64));
+        out[i] = static_cast<uint8_t>(x >> ((absolute & 7) * 8));
+    }
+    return 1;
+}
+
+struct Workspace {
+    int index = 0;
+    std::array<BackingInfo, 5> backing{};
+    SRObjectId document = 0;
+    SRObjectId history = 0;
+    SRObjectId index_object = 0;
+    SRObjectId preview = 0;
+    SRObjectId asset = 0;
+};
+
+class WorkbenchModel {
+public:
+    ~WorkbenchModel() {
+        shutdown();
+    }
+
+    bool initialize() {
+        if (ctx_) return true;
+
+        SRContextConfig cfg{};
+        cfg.target_raw_bytes = 768ull * MB;
+        cfg.hard_raw_bytes = 960ull * MB;
+        cfg.foreground_burst_bytes = 64ull * MB;
+        cfg.comfortable_available_bytes = 1024ull * MB;
+        cfg.emergency_available_bytes = 640ull * MB;
+        cfg.background_period_ms = 25;
+        cfg.prewarm_segments_per_hint = 8;
+        cfg.overlay_consolidate_pages = 32;
+
+        if (sr_context_create(&cfg, &ctx_) != SR_OK) return false;
+
+        for (int i = 0; i < WORKSPACES; ++i) {
+            auto& w = workspaces_[i];
+            w.index = i;
+            for (size_t j = 0; j < w.backing.size(); ++j) {
+                w.backing[j].seed = 0xA17E0000ull + static_cast<uint64_t>(i) * 0x1000ull + j * 0x101ull;
+                w.backing[j].kind = static_cast<uint32_t>(j == 0 ? 0 : 1);
+            }
+
+            if (!register_object(w.document, "document", 64 * MB, 1 * MB,
+                                 SR_SEM_USER_DOCUMENT, SR_BACKING_RECIPE,
+                                 SR_OBJECT_PROTECT_CRITICAL_PREFIX,
+                                 &w.backing[0], true)) return false;
+
+            if (!register_object(w.history, "history", 64 * MB, 512 * 1024,
+                                 SR_SEM_HISTORY, SR_BACKING_RECIPE,
+                                 0, &w.backing[1], true)) return false;
+
+            if (!register_object(w.index_object, "search-index", 128 * MB, 1 * MB,
+                                 SR_SEM_DERIVED_INDEX, SR_BACKING_RECIPE,
+                                 0, &w.backing[2], true)) return false;
+
+            if (!register_object(w.preview, "preview-cache", 192 * MB, 512 * 1024,
+                                 SR_SEM_CACHE, SR_BACKING_DISCARDABLE_RECIPE,
+                                 0, &w.backing[3], true)) return false;
+
+            if (!register_object(w.asset, "source-asset", 192 * MB, 512 * 1024,
+                                 SR_SEM_FILE_BACKED_ASSET, SR_BACKING_FILE,
+                                 0, &w.backing[4], false)) return false;
+        }
+
+        current_ = 0;
+        sr_hint_hot(ctx_, workspaces_[0].document);
+        return true;
+    }
+
+    void shutdown() {
+        if (ctx_) {
+            sr_context_destroy(ctx_);
+            ctx_ = nullptr;
+        }
+    }
+
+    int current_workspace() const { return current_; }
+
+    bool switch_workspace(int next) {
+        if (!ctx_ || next < 0 || next >= WORKSPACES) return false;
+        if (next == current_) return true;
+
+        hint_workspace_cold(current_);
+        current_ = next;
+        hint_workspace_hot(current_);
+
+        const int predicted = (current_ + 1) % WORKSPACES;
+        SRObjectId hints[] = {
+            workspaces_[predicted].document,
+            workspaces_[predicted].index_object
+        };
+        sr_hint_next(ctx_, hints, 2);
+        return true;
+    }
+
+    std::string load_visible_document() {
+        auto& w = workspaces_[current_];
+        SRLease lease = nullptr;
+        if (sr_acquire(ctx_, w.document, 0, VISIBLE_DOCUMENT_BYTES,
+                       SR_ACCESS_READ, SR_LATENCY_INTERACTIVE, &lease) != SR_OK) {
+            return {};
+        }
+
+        auto* p = static_cast<const char*>(sr_lease_data(lease));
+        std::string text(p, p + VISIBLE_DOCUMENT_BYTES);
+        sr_release(lease);
+
+        for (char& c : text) {
+            if (c == '\0') c = ' ';
+            if (static_cast<unsigned char>(c) < 9) c = ' ';
+        }
+        while (!text.empty() && (text.back() == ' ' || text.back() == '\0')) text.pop_back();
+        return text;
+    }
+
+    bool save_visible_document(const std::string& text) {
+        auto& w = workspaces_[current_];
+        SRLease lease = nullptr;
+        if (sr_acquire(ctx_, w.document, 0, VISIBLE_DOCUMENT_BYTES,
+                       SR_ACCESS_WRITE, SR_LATENCY_INTERACTIVE, &lease) != SR_OK) {
+            return false;
+        }
+
+        auto* p = static_cast<uint8_t*>(sr_lease_data(lease));
+        std::memset(p, ' ', static_cast<size_t>(VISIBLE_DOCUMENT_BYTES));
+        const size_t n = std::min<size_t>(text.size(), static_cast<size_t>(VISIBLE_DOCUMENT_BYTES));
+        std::memcpy(p, text.data(), n);
+        if (sr_release(lease) != SR_OK) return false;
+
+        const uint64_t gen = sr_object_generation(ctx_, w.document);
+        const uint64_t history_off = (gen * 4096ull) % (64ull * MB - 4096ull);
+        SRLease h = nullptr;
+        if (sr_acquire(ctx_, w.history, history_off, 4096,
+                       SR_ACCESS_WRITE, SR_LATENCY_NORMAL, &h) == SR_OK) {
+            auto* hp = static_cast<uint8_t*>(sr_lease_data(h));
+            std::memset(hp, 0, 4096);
+            std::snprintf(reinterpret_cast<char*>(hp), 4096,
+                          "workspace=%d document_generation=%llu text_bytes=%zu",
+                          current_, static_cast<unsigned long long>(gen), n);
+            sr_release(h);

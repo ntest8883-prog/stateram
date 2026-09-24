@@ -1,0 +1,249 @@
+name: StateRAM Core v0.1 Windows integration
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - core-v01-4to8-integration
+
+permissions:
+  contents: read
+
+jobs:
+  integrate-core-v01:
+    runs-on: windows-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout integration branch
+        uses: actions/checkout@v4
+
+      - name: Reconstruct integrated source files
+        shell: powershell
+        run: |
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+
+          $coreParts = @(
+            ".\core-v01\src\stateram_core.part1",
+            ".\core-v01\src\stateram_core.part2",
+            ".\core-v01\src\stateram_core.part3",
+            ".\core-v01\src\stateram_core.part4",
+            ".\core-v01\src\stateram_core.part5",
+            ".\core-v01\src\stateram_core.part6",
+            ".\core-v01\src\stateram_core.part7"
+          )
+
+          $wbParts = @(
+            ".\core-v01\workbench\workbench_win32.part1",
+            ".\core-v01\workbench\workbench_win32.part2",
+            ".\core-v01\workbench\workbench_win32.part3a",
+            ".\core-v01\workbench\workbench_win32.part3b"
+          )
+
+          foreach ($f in ($coreParts + $wbParts)) {
+            if (-not (Test-Path $f)) { throw "Missing source part: $f" }
+          }
+
+          $core = ($coreParts | ForEach-Object { Get-Content $_ -Raw }) -join ""
+          [IO.File]::WriteAllText("$PWD\core-v01\src\stateram_core.cpp", $core, $utf8)
+
+          $wb = ($wbParts | ForEach-Object { Get-Content $_ -Raw }) -join ""
+          [IO.File]::WriteAllText("$PWD\core-v01\workbench\workbench_win32.cpp", $wb, $utf8)
+
+          $required = @(
+            ".\core-v01\CMakeLists.txt",
+            ".\core-v01\include\stateram_core.h",
+            ".\core-v01\src\platform.h",
+            ".\core-v01\src\platform.cpp",
+            ".\core-v01\src\stateram_core.cpp",
+            ".\core-v01\examples\core_selfcheck.cpp",
+            ".\core-v01\workbench\workbench_win32.cpp",
+            ".\core-v01\workbench\workbench_launcher.cpp"
+          )
+
+          foreach ($f in $required) {
+            if (-not (Test-Path $f)) { throw "Missing required source: $f" }
+          }
+
+          Write-Host "CORE_V01_SOURCE_RECONSTRUCTION=PASS"
+
+      - name: Configure x64 Release
+        shell: powershell
+        run: |
+          cmake -S .\core-v01 -B .\core-v01\build -A x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build integrated Core and Workbench
+        shell: powershell
+        run: |
+          cmake --build .\core-v01\build --config Release --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Integrated Core self-check
+        shell: powershell
+        run: |
+          Push-Location .\core-v01
+          .\build\Release\stateram_core_selfcheck.exe
+          $code = $LASTEXITCODE
+          Pop-Location
+          if ($code -ne 0) { exit $code }
+          Write-Host "STATERAM_CORE_V01_SELF_CHECK_WINDOWS=PASS"
+
+      - name: Workbench headless integration smoke
+        shell: powershell
+        run: |
+          Push-Location .\core-v01
+          .\build\Release\StateRAM_Workbench.exe --headless-smoke
+          $code = $LASTEXITCODE
+
+          if ($code -ne 0) {
+            Pop-Location
+            exit $code
+          }
+
+          if (-not (Test-Path .\core_v01_workbench_smoke.json)) {
+            Pop-Location
+            throw "Workbench did not produce core_v01_workbench_smoke.json"
+          }
+
+          $r = Get-Content .\core_v01_workbench_smoke.json -Raw | ConvertFrom-Json
+          $r | ConvertTo-Json -Depth 8
+
+          if (-not $r.pass) {
+            Pop-Location
+            throw "WORKBENCH_HEADLESS_SMOKE=FAIL"
+          }
+          if ($r.logical_mb -ne 3840) {
+            Pop-Location
+            throw "Expected 3840 MiB logical Workbench state"
+          }
+          if ($r.raw_resident_mb -gt 96) {
+            Pop-Location
+            throw "Raw residency exceeded 96 MiB after explicit integration trim"
+          }
+          if ($r.promotions -le 0 -or $r.streaming_evictions -le 0) {
+            Pop-Location
+            throw "Promotion/streaming eviction paths were not both exercised"
+          }
+
+          Pop-Location
+
+          Write-Host "STATERAM_CORE_V01_WINDOWS_INTEGRATION=PASS"
+
+      - name: Find Microsoft Defender scanner
+        id: defender
+        shell: powershell
+        run: |
+          $platformRoot = Join-Path $env:ProgramData "Microsoft\Windows Defender\Platform"
+          $mp = $null
+
+          if (Test-Path $platformRoot) {
+            $latest = Get-ChildItem $platformRoot -Directory |
+              Sort-Object Name -Descending |
+              Select-Object -First 1
+            if ($latest) {
+              $candidate = Join-Path $latest.FullName "MpCmdRun.exe"
+              if (Test-Path $candidate) { $mp = $candidate }
+            }
+          }
+
+          if (-not $mp) {
+            $candidate = Join-Path $env:ProgramFiles "Windows Defender\MpCmdRun.exe"
+            if (Test-Path $candidate) { $mp = $candidate }
+          }
+
+          if (-not $mp) { throw "Microsoft Defender scanner unavailable" }
+          "mp=$mp" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Microsoft Defender scan
+        shell: powershell
+        run: |
+          $mp = '${{ steps.defender.outputs.mp }}'
+          $files = @(
+            ".\core-v01\build\Release\stateram_core.dll",
+            ".\core-v01\build\Release\StateRAM_Workbench.exe",
+            ".\core-v01\build\Release\StateRAM_Workbench_Safe.exe",
+            ".\core-v01\build\Release\stateram_core_selfcheck.exe"
+          )
+
+          $scanDir = Join-Path $PWD "defender-scan-targets"
+          New-Item -ItemType Directory -Force -Path $scanDir | Out-Null
+
+          foreach ($f in $files) {
+            if (-not (Test-Path $f)) { throw "Expected binary missing: $f" }
+            Copy-Item $f $scanDir
+          }
+
+          $status = Get-MpComputerStatus
+          @(
+            "AntivirusEnabled=$($status.AntivirusEnabled)"
+            "AMServiceEnabled=$($status.AMServiceEnabled)"
+            "RealTimeProtectionEnabled=$($status.RealTimeProtectionEnabled)"
+            "AntivirusSignatureVersion=$($status.AntivirusSignatureVersion)"
+            "ScanTarget=$scanDir"
+          ) | Set-Content -Encoding UTF8 .\CORE_V01_DEFENDER_SCAN.txt
+
+          & $mp -Scan -ScanType 3 -File $scanDir
+          $code = $LASTEXITCODE
+          "MpCmdRunExitCode=$code" | Add-Content .\CORE_V01_DEFENDER_SCAN.txt
+
+          if ($code -ne 0) {
+            $mpLog = Join-Path $env:TEMP "MpCmdRun.log"
+            if (Test-Path $mpLog) {
+              "---- MpCmdRun.log ----" | Add-Content .\CORE_V01_DEFENDER_SCAN.txt
+              Get-Content $mpLog | Add-Content .\CORE_V01_DEFENDER_SCAN.txt
+            }
+            throw "Microsoft Defender custom directory scan failed with exit code $code"
+          }
+
+          Write-Host "MICROSOFT_DEFENDER_SCAN=PASS"
+
+      - name: SHA-256 manifest and candidate package
+        shell: powershell
+        run: |
+          $files = @(
+            ".\core-v01\build\Release\stateram_core.dll",
+            ".\core-v01\build\Release\StateRAM_Workbench.exe",
+            ".\core-v01\build\Release\StateRAM_Workbench_Safe.exe",
+            ".\core-v01\build\Release\stateram_core_selfcheck.exe"
+          )
+
+          $lines = foreach ($f in $files) {
+            $h = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower()
+            "SHA256  $([IO.Path]::GetFileName($f))  $h"
+          }
+          $lines | Set-Content -Encoding ASCII .\CORE_V01_SHA256SUMS.txt
+
+          $dst = ".\StateRAM-Core-v0.1-Windows-Candidate"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+
+          Copy-Item .\core-v01\build\Release\stateram_core.dll $dst\
+          Copy-Item .\core-v01\build\Release\StateRAM_Workbench.exe $dst\
+          Copy-Item .\core-v01\build\Release\StateRAM_Workbench_Safe.exe $dst\
+          Copy-Item .\CORE_V01_DEFENDER_SCAN.txt $dst\
+          Copy-Item .\CORE_V01_SHA256SUMS.txt $dst\
+          Copy-Item .\core-v01\core_v01_workbench_smoke.json $dst\
+
+          @'
+          StateRAM Core v0.1 Windows integration candidate
+
+          Only StateRAM_Workbench_Safe.exe is intended for a later guarded PC run.
+          Passing this workflow proves the integrated Windows implementation
+          builds and passes its integration checkpoint. It does NOT by itself
+          prove the final 4->8 experience claim.
+          '@ | Set-Content -Encoding UTF8 $dst\README_FIRST.txt
+
+      - name: Upload integration evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: StateRAM-Core-v0.1-Integration-Evidence
+          path: |
+            core-v01/core_v01_workbench_smoke.json
+            CORE_V01_DEFENDER_SCAN.txt
+            CORE_V01_SHA256SUMS.txt
+
+      - name: Upload Windows candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: StateRAM-Core-v0.1-Windows-Candidate
+          path: StateRAM-Core-v0.1-Windows-Candidate

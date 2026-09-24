@@ -1,0 +1,217 @@
+#include "stateram_core.h"
+#include "platform.h"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <condition_variable>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace {
+
+static constexpr size_t SEGMENT_BYTES = 256u * 1024u;
+static constexpr size_t PAGE_BYTES = 4096u;
+static constexpr size_t PAGES_PER_SEGMENT = SEGMENT_BYTES / PAGE_BYTES;
+static_assert(PAGES_PER_SEGMENT == 64, "overlay bitmap assumes 64 pages");
+
+static size_t round_up(size_t x, size_t a) {
+    if (x == 0) return 0;
+    return (x + a - 1) / a * a;
+}
+
+static uint64_t fnv1a64(const uint8_t* p, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) {
+        h ^= p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+enum class BaseKind : uint8_t {
+    NONE = 0,
+    COMPRESSED = 1,
+    RECIPE = 2,
+    FILE_REF = 3,
+    DISCARDABLE = 4
+};
+
+struct OverlayPage {
+    std::array<uint8_t, PAGE_BYTES> bytes{};
+};
+
+struct Segment {
+    mutable std::mutex mu;
+    std::condition_variable cv;
+
+    bool raw_committed = false;
+    bool restoring = false;
+    bool retired = false;
+
+    uint32_t pin_count = 0;
+    uint64_t generation = 0;
+    uint64_t base_generation = 0;
+
+    BaseKind base_kind = BaseKind::NONE;
+    sr::platform::Blob base_blob;
+
+    uint64_t overlay_bitmap = 0;
+    std::array<std::unique_ptr<OverlayPage>, PAGES_PER_SEGMENT> overlay{};
+
+    uint64_t authoritative_hash = 0;
+    bool hash_valid = false;
+
+    uint64_t last_access_tick = 0;
+    double measured_restore_ms = 0.0;
+    double measured_encode_ms = 0.0;
+
+    uint64_t promotion_count = 0;
+    uint64_t eviction_count = 0;
+};
+
+struct Object {
+    SRObjectId id = 0;
+    std::string name;
+    uint64_t logical_size = 0;
+    uint64_t reserved_size = 0;
+    uint64_t critical_prefix_bytes = 0;
+    uint32_t semantic_class = SR_SEM_CACHE;
+    uint32_t backing_kind = SR_BACKING_NONE;
+    uint32_t flags = 0;
+
+    SRRebuildCallback rebuild = nullptr;
+    SRBackingReadCallback backing_read = nullptr;
+    void* user = nullptr;
+
+    uint8_t* arena = nullptr;
+    std::vector<std::unique_ptr<Segment>> segments;
+
+    std::atomic<uint64_t> generation{0};
+    std::atomic<uint64_t> raw_resident_bytes{0};
+    std::atomic<uint64_t> compressed_bytes{0};
+    std::atomic<uint64_t> overlay_bytes{0};
+    std::atomic<uint64_t> acquire_count{0};
+    std::atomic<uint64_t> promotion_count{0};
+    std::atomic<uint64_t> eviction_count{0};
+
+    std::atomic<int> cold_hint{0};
+    std::atomic<int> hot_hint{0};
+    std::atomic<uint32_t> explicit_next_score{0};
+    std::atomic<int> retired{0};
+
+    ~Object() {
+        if (arena) {
+            sr::platform::release_address_space(
+                arena,
+                static_cast<size_t>(reserved_size));
+            arena = nullptr;
+        }
+    }
+
+    size_t segment_count() const {
+        return segments.size();
+    }
+
+    size_t segment_actual_bytes(size_t index) const {
+        const uint64_t off = static_cast<uint64_t>(index) * SEGMENT_BYTES;
+        if (off >= logical_size) return 0;
+        return static_cast<size_t>(
+            std::min<uint64_t>(SEGMENT_BYTES, logical_size - off));
+    }
+
+    uint64_t segment_offset(size_t index) const {
+        return static_cast<uint64_t>(index) * SEGMENT_BYTES;
+    }
+};
+
+struct Context;
+
+struct LeaseSegment {
+    size_t index = 0;
+};
+
+struct Lease {
+    Context* ctx = nullptr;
+    std::shared_ptr<Object> object;
+    uint64_t offset = 0;
+    uint64_t length = 0;
+    uint32_t mode = SR_ACCESS_READ;
+    uint32_t latency_class = SR_LATENCY_NORMAL;
+    std::vector<LeaseSegment> segments;
+    bool released = false;
+};
+
+struct Context {
+    SRContextConfig cfg{};
+
+    std::mutex objects_mu;
+    std::unordered_map<SRObjectId, std::shared_ptr<Object>> objects;
+    std::atomic<SRObjectId> next_id{1};
+
+    std::atomic<uint64_t> logical_bytes{0};
+    std::atomic<uint64_t> raw_resident_bytes{0};
+    std::atomic<uint64_t> compressed_bytes{0};
+    std::atomic<uint64_t> overlay_bytes{0};
+    std::atomic<uint64_t> pinned_bytes{0};
+
+    std::mutex capacity_mu;
+    std::atomic<uint64_t> raw_inflight_bytes{0};
+
+    std::atomic<uint64_t> promotions{0};
+    std::atomic<uint64_t> promotion_failures{0};
+    std::atomic<uint64_t> streaming_evictions{0};
+    std::atomic<uint64_t> eviction_aborts_generation_changed{0};
+    std::atomic<uint64_t> write_generations{0};
+    std::atomic<uint64_t> foreground_acquires{0};
+    std::atomic<uint64_t> background_prewarms{0};
+    std::atomic<uint64_t> background_compaction_passes{0};
+    std::atomic<uint64_t> background_pressure_passes{0};
+
+    std::mutex metric_mu;
+    double last_promotion_ms = 0.0;
+    double max_promotion_ms = 0.0;
+    double last_compaction_ms = 0.0;
+
+    std::mutex predictor_mu;
+    SRObjectId last_accessed_object = 0;
+    std::unordered_map<SRObjectId, std::unordered_map<SRObjectId, uint64_t>> transitions;
+
+    std::mutex bg_mu;
+    std::condition_variable bg_cv;
+    std::thread bg_thread;
+    bool stop = false;
+    bool wake = false;
+
+    uint32_t pressure_level() const {
+        const auto mi = sr::platform::memory_info();
+        const uint64_t raw = raw_resident_bytes.load(std::memory_order_relaxed);
+
+        if (mi.available_physical != 0 &&
+            mi.available_physical <= cfg.emergency_available_bytes) {
+            return 3;
+        }
+        if (mi.available_physical != 0 &&
+            mi.available_physical <= cfg.comfortable_available_bytes) {
+            return 2;
+        }
+        if (raw > cfg.target_raw_bytes) {
+            return 1;
+        }
+        return 0;
+    }
+};
+
+static SRContextConfig normalized_config(const SRContextConfig* in) {
+    SRContextConfig c{};
+    if (in) c = *in;

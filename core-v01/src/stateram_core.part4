@@ -1,0 +1,218 @@
+        generation = s.generation;
+        uint8_t* addr = obj->arena + seg_index * SEGMENT_BYTES;
+        raw.assign(addr, addr + actual);
+    }
+
+    const double t0 = sr::platform::now_ms();
+    sr::platform::Blob blob;
+    if (!sr::platform::compress_fast(raw.data(), raw.size(), blob)) return false;
+    const double elapsed = sr::platform::now_ms() - t0;
+
+    if (!blob.compressed && blob.bytes.size() + 4096 >= SEGMENT_BYTES) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lk(s.mu);
+    if (!s.raw_committed || s.pin_count != 0 || s.restoring || s.retired || s.generation != generation) {
+        ctx->eviction_aborts_generation_changed.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    uint8_t* addr = obj->arena + seg_index * SEGMENT_BYTES;
+    if (!sr::platform::decommit_pages(addr, SEGMENT_BYTES)) return false;
+
+    const uint64_t old_payload = s.base_blob.bytes.size();
+    if (old_payload) {
+        ctx->compressed_bytes.fetch_sub(old_payload, std::memory_order_relaxed);
+        obj->compressed_bytes.fetch_sub(old_payload, std::memory_order_relaxed);
+    }
+
+    const size_t old_overlay_pages = overlay_page_count(s.overlay_bitmap);
+    const uint64_t old_overlay_bytes = old_overlay_pages * PAGE_BYTES;
+    if (old_overlay_bytes) {
+        ctx->overlay_bytes.fetch_sub(old_overlay_bytes, std::memory_order_relaxed);
+        obj->overlay_bytes.fetch_sub(old_overlay_bytes, std::memory_order_relaxed);
+    }
+
+    for (auto& p : s.overlay) p.reset();
+    s.overlay_bitmap = 0;
+
+    s.base_kind = BaseKind::COMPRESSED;
+    s.base_blob = std::move(blob);
+    s.base_generation = generation;
+    s.measured_encode_ms = elapsed;
+    s.authoritative_hash = fnv1a64(raw.data(), raw.size());
+    s.hash_valid = true;
+
+    const uint64_t new_payload = s.base_blob.bytes.size();
+    ctx->compressed_bytes.fetch_add(new_payload, std::memory_order_relaxed);
+    obj->compressed_bytes.fetch_add(new_payload, std::memory_order_relaxed);
+
+    s.raw_committed = false;
+    ++s.eviction_count;
+    obj->eviction_count.fetch_add(1, std::memory_order_relaxed);
+    ctx->streaming_evictions.fetch_add(1, std::memory_order_relaxed);
+    ctx->raw_resident_bytes.fetch_sub(SEGMENT_BYTES, std::memory_order_relaxed);
+    obj->raw_resident_bytes.fetch_sub(SEGMENT_BYTES, std::memory_order_relaxed);
+    return true;
+}
+
+static bool compact_one(Context* ctx, const Candidate& c) {
+    if (!c.obj) return false;
+
+    const double t0 = sr::platform::now_ms();
+
+    bool ok = direct_decommit_with_existing_base(
+        ctx,
+        c.obj,
+        c.seg_index,
+        ctx->cfg.overlay_consolidate_pages);
+
+    if (!ok) {
+        ok = consolidate_and_decommit(ctx, c.obj, c.seg_index);
+    }
+
+    if (ok) set_metric_compaction(ctx, sr::platform::now_ms() - t0);
+    return ok;
+}
+
+static bool compact_to(Context* ctx, uint64_t target, uint32_t pressure) {
+    if (!ctx) return false;
+
+    ctx->background_compaction_passes.fetch_add(1, std::memory_order_relaxed);
+    if (pressure >= 2) {
+        ctx->background_pressure_passes.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    size_t no_progress = 0;
+    while (ctx->raw_resident_bytes.load(std::memory_order_acquire) > target) {
+        Candidate c = choose_eviction_candidate(ctx, pressure);
+        if (!c.obj) break;
+
+        if (!compact_one(ctx, c)) {
+            ++no_progress;
+            if (no_progress > 16) break;
+        } else {
+            no_progress = 0;
+        }
+    }
+
+    return ctx->raw_resident_bytes.load(std::memory_order_acquire) <= target;
+}
+
+static std::shared_ptr<Object> choose_prewarm_object(Context* ctx) {
+    auto objects = snapshot_objects(ctx);
+    std::shared_ptr<Object> best;
+    uint64_t best_score = 0;
+
+    for (auto& obj : objects) {
+        uint64_t score = obj->explicit_next_score.load(std::memory_order_relaxed);
+        if (obj->hot_hint.load(std::memory_order_relaxed)) score += 1000000;
+        if (score > best_score) {
+            best_score = score;
+            best = obj;
+        }
+    }
+
+    if (best) return best;
+
+    std::lock_guard<std::mutex> g(ctx->predictor_mu);
+    auto it = ctx->transitions.find(ctx->last_accessed_object);
+    if (it == ctx->transitions.end()) return {};
+
+    SRObjectId best_id = 0;
+    uint64_t count = 0;
+    for (const auto& kv : it->second) {
+        if (kv.second > count) {
+            best_id = kv.first;
+            count = kv.second;
+        }
+    }
+    if (best_id == 0) return {};
+
+    for (auto& obj : objects) {
+        if (obj->id == best_id) return obj;
+    }
+    return {};
+}
+
+static void prewarm(Context* ctx) {
+    if (!ctx) return;
+    const auto mi = sr::platform::memory_info();
+    if (mi.available_physical != 0 &&
+        mi.available_physical <= ctx->cfg.comfortable_available_bytes) {
+        return;
+    }
+
+    if (ctx->raw_resident_bytes.load(std::memory_order_acquire) >=
+        (ctx->cfg.target_raw_bytes * 8) / 10) {
+        return;
+    }
+
+    auto obj = choose_prewarm_object(ctx);
+    if (!obj) return;
+
+    const size_t max_segments = std::min<size_t>(
+        obj->segment_count(),
+        ctx->cfg.prewarm_segments_per_hint);
+
+    for (size_t i = 0; i < max_segments; ++i) {
+        if (ctx->raw_resident_bytes.load(std::memory_order_acquire) + SEGMENT_BYTES >
+            ctx->cfg.target_raw_bytes) {
+            break;
+        }
+
+        int rc = materialize_and_pin(ctx, obj, i, false, SR_LATENCY_BACKGROUND);
+        if (rc == SR_OK) {
+            ctx->background_prewarms.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            break;
+        }
+
+        sr::platform::cooperative_yield(1);
+    }
+
+    uint32_t score = obj->explicit_next_score.load(std::memory_order_relaxed);
+    if (score > 0) obj->explicit_next_score.store(score / 2, std::memory_order_relaxed);
+}
+
+static void background_main(Context* ctx) {
+    sr::platform::begin_background_mode();
+
+    while (true) {
+        {
+            std::unique_lock<std::mutex> lk(ctx->bg_mu);
+            ctx->bg_cv.wait_for(
+                lk,
+                std::chrono::milliseconds(ctx->cfg.background_period_ms),
+                [&] { return ctx->stop || ctx->wake; });
+
+            if (ctx->stop) break;
+            ctx->wake = false;
+        }
+
+        const uint64_t raw = ctx->raw_resident_bytes.load(std::memory_order_acquire);
+        const uint32_t pressure = ctx->pressure_level();
+
+        if (pressure == 3) {
+            (void)compact_to(ctx, ctx->cfg.target_raw_bytes / 2, 3);
+        } else if (pressure == 2) {
+            (void)compact_to(ctx, (ctx->cfg.target_raw_bytes * 3) / 4, 2);
+        } else if (raw > ctx->cfg.target_raw_bytes) {
+            (void)compact_to(ctx, ctx->cfg.target_raw_bytes, 1);
+        } else {
+            prewarm(ctx);
+        }
+
+        sr::platform::cooperative_yield(1);
+    }
+
+    sr::platform::end_background_mode();
+}
+
+static void wake_background(Context* ctx) {
+    if (!ctx) return;
+    {
+        std::lock_guard<std::mutex> g(ctx->bg_mu);
+        ctx->wake = true;
+    }

@@ -1,0 +1,290 @@
+    bool write_report() {
+        SRStats s{};
+        if (sr_get_stats(ctx_, &s) != SR_OK) return false;
+
+        const ProcMetrics proc = process_metrics();
+
+        const bool logical_ok =
+            s.logical_bytes == 3840ull * MB;
+
+        const bool overall =
+            logical_ok &&
+            correctness_pass_ &&
+            capacity_pass_ &&
+            experience_pass_;
+
+        const char* name =
+            cloud_
+                ? "stateram_4to8_cloud_evaluation.json"
+                : "stateram_4to8_evaluation.json";
+
+        std::ofstream out(name, std::ios::binary);
+        if (!out) return false;
+
+        out
+            << "{\n"
+            << "  \"target\": \"StateRAM Core v0.1 4-to-8\",\n"
+            << "  \"mode\": \"" << (cloud_ ? "cloud-validation" : "guarded-local") << "\",\n"
+            << "  \"logical_application_mb\": " << (s.logical_bytes / MB) << ",\n"
+            << "  \"correctness_pass\": " << (correctness_pass_ ? "true" : "false") << ",\n"
+            << "  \"correctness_patches_verified\": " << patches_.size() << ",\n"
+            << "  \"capacity_pass\": " << (capacity_pass_ ? "true" : "false") << ",\n"
+            << "  \"capacity_coverage_samples\": " << capacity_coverage_samples_ << ",\n"
+            << "  \"capacity_raw_before_forced_trim_mb\": "
+            << std::fixed << std::setprecision(3)
+            << (capacity_raw_before_trim_ / static_cast<double>(MB)) << ",\n"
+            << "  \"capacity_raw_after_trim_mb\": "
+            << (capacity_raw_after_trim_ / static_cast<double>(MB)) << ",\n"
+            << "  \"capacity_overlay_kb\": "
+            << (capacity_overlay_bytes_ / static_cast<double>(KB)) << ",\n"
+            << "  \"capacity_promotions\": " << capacity_promotions_ << ",\n"
+            << "  \"capacity_streaming_evictions\": " << capacity_evictions_ << ",\n"
+            << "  \"experience_pass\": " << (experience_pass_ ? "true" : "false") << ",\n"
+            << "  \"switch_p50_ms\": " << percentile(timings_.switch_ms, 0.50) << ",\n"
+            << "  \"switch_p95_ms\": " << percentile(timings_.switch_ms, 0.95) << ",\n"
+            << "  \"switch_p99_ms\": " << percentile(timings_.switch_ms, 0.99) << ",\n"
+            << "  \"switch_max_ms\": " << max_value(timings_.switch_ms) << ",\n"
+            << "  \"edit_p95_ms\": " << percentile(timings_.edit_ms, 0.95) << ",\n"
+            << "  \"edit_max_ms\": " << max_value(timings_.edit_ms) << ",\n"
+            << "  \"search_p95_ms\": " << percentile(timings_.search_ms, 0.95) << ",\n"
+            << "  \"search_p99_ms\": " << percentile(timings_.search_ms, 0.99) << ",\n"
+            << "  \"search_max_ms\": " << max_value(timings_.search_ms) << ",\n"
+            << "  \"preview_p95_ms\": " << percentile(timings_.preview_ms, 0.95) << ",\n"
+            << "  \"preview_max_ms\": " << max_value(timings_.preview_ms) << ",\n"
+            << "  \"asset_p95_ms\": " << percentile(timings_.asset_ms, 0.95) << ",\n"
+            << "  \"asset_max_ms\": " << max_value(timings_.asset_ms) << ",\n"
+            << "  \"final_raw_mb\": " << (s.raw_resident_bytes / static_cast<double>(MB)) << ",\n"
+            << "  \"final_compressed_mb\": " << (s.compressed_bytes / static_cast<double>(MB)) << ",\n"
+            << "  \"final_overlay_kb\": " << (s.overlay_bytes / static_cast<double>(KB)) << ",\n"
+            << "  \"final_promotions\": " << s.promotions << ",\n"
+            << "  \"final_streaming_evictions\": " << s.streaming_evictions << ",\n"
+            << "  \"promotion_failures\": " << s.promotion_failures << ",\n"
+            << "  \"process_working_set_mb\": " << (proc.working_set / static_cast<double>(MB)) << ",\n"
+            << "  \"process_private_mb\": " << (proc.private_bytes / static_cast<double>(MB)) << ",\n"
+            << "  \"process_pagefile_usage_mb\": " << (proc.pagefile_usage / static_cast<double>(MB)) << ",\n"
+            << "  \"process_read_transfer_mb\": " << (proc.read_bytes / static_cast<double>(MB)) << ",\n"
+            << "  \"process_write_transfer_mb\": " << (proc.write_bytes / static_cast<double>(MB)) << ",\n"
+            << "  \"raw_control_full_3840mb_executed_locally\": false,\n"
+            << "  \"raw_control_reason\": \"A full raw-resident 3.75 GiB control is intentionally not materialized on the 4 GiB target because the safety envelope forbids making the PC itself the experiment.\",\n"
+            << "  \"overall_pass\": " << (overall ? "true" : "false") << "\n"
+            << "}\n";
+
+        std::cout
+            << "STATE RAM CORE V0.1 4-TO-8 EVALUATION\n"
+            << "logical_application_mb=" << (s.logical_bytes / MB) << "\n"
+            << "A_correctness=" << (correctness_pass_ ? "PASS" : "FAIL") << "\n"
+            << "B_capacity=" << (capacity_pass_ ? "PASS" : "FAIL") << "\n"
+            << "C_experience=" << (experience_pass_ ? "PASS" : "FAIL") << "\n"
+            << "switch_p95_ms=" << percentile(timings_.switch_ms, 0.95) << "\n"
+            << "search_p95_ms=" << percentile(timings_.search_ms, 0.95) << "\n"
+            << "preview_p95_ms=" << percentile(timings_.preview_ms, 0.95) << "\n"
+            << "overall=" << (overall ? "PASS" : "FAIL") << "\n";
+
+        overall_pass_ = overall;
+        return true;
+    }
+
+    bool overall_pass() const {
+        return overall_pass_;
+    }
+
+private:
+    bool cloud_ = false;
+    SRContext ctx_ = nullptr;
+    std::array<Workspace, WORKSPACES> ws_{};
+    size_t current_ = 0;
+
+    std::vector<Patch> patches_;
+    TimingSet timings_;
+    std::ofstream csv_;
+
+    bool correctness_pass_ = false;
+    bool capacity_pass_ = false;
+    bool experience_pass_ = false;
+    bool overall_pass_ = false;
+
+    size_t capacity_coverage_samples_ = 0;
+    uint64_t capacity_raw_before_trim_ = 0;
+    uint64_t capacity_raw_after_trim_ = 0;
+    uint64_t capacity_overlay_bytes_ = 0;
+    uint64_t capacity_promotions_ = 0;
+    uint64_t capacity_evictions_ = 0;
+
+    bool reg(
+        SRObjectId& out,
+        const char* name,
+        uint64_t size,
+        uint64_t critical,
+        uint32_t semantic,
+        uint32_t backing_kind,
+        uint32_t flags,
+        BackingInfo* backing,
+        bool recipe
+    ) {
+        SRObjectDescriptor d{};
+        d.name = name;
+        d.logical_size = size;
+        d.critical_prefix_bytes = critical;
+        d.semantic_class = semantic;
+        d.backing_kind = backing_kind;
+        d.flags = flags;
+        d.user = backing;
+        if (recipe) d.rebuild = generate_backing;
+        else d.backing_read = generate_backing;
+
+        return sr_register_object(
+            ctx_,
+            &d,
+            nullptr,
+            0,
+            &out) == SR_OK;
+    }
+
+    void hint_switch(size_t next) {
+        if (next >= WORKSPACES) return;
+
+        auto& old = ws_[current_];
+        sr_hint_cold(ctx_, old.document);
+        sr_hint_cold(ctx_, old.history);
+        sr_hint_cold(ctx_, old.index_object);
+        sr_hint_cold(ctx_, old.preview);
+        sr_hint_cold(ctx_, old.asset);
+
+        current_ = next;
+        auto& cur = ws_[current_];
+        sr_hint_hot(ctx_, cur.document);
+        sr_hint_hot(ctx_, cur.index_object);
+    }
+
+    static uint64_t sample_bytes(
+        const uint8_t* p,
+        size_t bytes
+    ) {
+        uint64_t sum = 0;
+        for (size_t i = 0; i < bytes; i += PAGE) {
+            sum = sum * 1315423911ull + p[i];
+        }
+        if (bytes) sum ^= p[bytes - 1];
+        return sum;
+    }
+
+    bool read_and_verify(
+        SRObjectId id,
+        const BackingInfo& backing,
+        uint64_t offset,
+        uint64_t length
+    ) {
+        SRLease lease = nullptr;
+        if (sr_acquire(
+                ctx_,
+                id,
+                offset,
+                length,
+                SR_ACCESS_READ,
+                SR_LATENCY_INTERACTIVE,
+                &lease) != SR_OK) {
+            return false;
+        }
+
+        auto* p = static_cast<const uint8_t*>(
+            sr_lease_data(lease));
+
+        const bool ok =
+            p &&
+            verify_backing_bytes(
+                backing,
+                offset,
+                p,
+                static_cast<size_t>(length));
+
+        const int release_rc = sr_release(lease);
+        return ok && release_rc == SR_OK;
+    }
+
+    bool write_patch(
+        SRObjectId id,
+        uint64_t offset,
+        size_t step,
+        uint8_t salt
+    ) {
+        SRLease lease = nullptr;
+        if (sr_acquire(
+                ctx_,
+                id,
+                offset,
+                PAGE,
+                SR_ACCESS_WRITE,
+                SR_LATENCY_INTERACTIVE,
+                &lease) != SR_OK) {
+            return false;
+        }
+
+        auto* p = static_cast<uint8_t*>(
+            sr_lease_data(lease));
+        if (!p) {
+            sr_release(lease);
+            return false;
+        }
+
+        Patch patch{};
+        patch.object_id = id;
+        patch.offset = offset;
+
+        for (size_t i = 0; i < PAGE; ++i) {
+            patch.bytes[i] = static_cast<uint8_t>(
+                mix64(
+                    static_cast<uint64_t>(step) * 0x1000003ull +
+                    static_cast<uint64_t>(i) * 17ull +
+                    salt));
+        }
+
+        std::memcpy(p, patch.bytes.data(), PAGE);
+
+        if (sr_release(lease) != SR_OK) {
+            return false;
+        }
+
+        patches_.push_back(std::move(patch));
+        return true;
+    }
+
+    bool verify_recent_patches(size_t count) {
+        const size_t n = patches_.size();
+        const size_t begin =
+            count >= n ? 0 : n - count;
+
+        for (size_t i = begin; i < n; ++i) {
+            const auto& patch = patches_[i];
+            SRLease lease = nullptr;
+
+            if (sr_acquire(
+                    ctx_,
+                    patch.object_id,
+                    patch.offset,
+                    PAGE,
+                    SR_ACCESS_READ,
+                    SR_LATENCY_INTERACTIVE,
+                    &lease) != SR_OK) {
+                return false;
+            }
+
+            const auto* p = static_cast<const uint8_t*>(
+                sr_lease_data(lease));
+
+            const bool ok =
+                p &&
+                std::memcmp(
+                    p,
+                    patch.bytes.data(),
+                    PAGE) == 0;
+
+            const int release_rc = sr_release(lease);
+
+            if (!ok || release_rc != SR_OK) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+};

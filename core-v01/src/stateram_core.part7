@@ -1,0 +1,107 @@
+    return SR_OK;
+}
+
+SR_API int sr_trim(SRContext context, uint64_t target_raw_bytes) {
+    auto* ctx = static_cast<Context*>(context);
+    if (!ctx) return SR_ERR_INVALID;
+
+    const uint32_t pressure = std::max<uint32_t>(2, ctx->pressure_level());
+    const bool ok = compact_to(ctx, target_raw_bytes, pressure);
+    return ok ? SR_OK : SR_ERR_BUDGET;
+}
+
+SR_API int sr_get_stats(SRContext context, SRStats* out_stats) {
+    auto* ctx = static_cast<Context*>(context);
+    if (!ctx || !out_stats) return SR_ERR_INVALID;
+
+    SRStats s{};
+    {
+        std::lock_guard<std::mutex> g(ctx->objects_mu);
+        s.object_count = ctx->objects.size();
+    }
+
+    s.logical_bytes = ctx->logical_bytes.load(std::memory_order_relaxed);
+    s.raw_resident_bytes = ctx->raw_resident_bytes.load(std::memory_order_relaxed);
+    s.compressed_bytes = ctx->compressed_bytes.load(std::memory_order_relaxed);
+    s.overlay_bytes = ctx->overlay_bytes.load(std::memory_order_relaxed);
+    s.pinned_bytes = ctx->pinned_bytes.load(std::memory_order_relaxed);
+
+    s.promotions = ctx->promotions.load(std::memory_order_relaxed);
+    s.promotion_failures = ctx->promotion_failures.load(std::memory_order_relaxed);
+    s.streaming_evictions = ctx->streaming_evictions.load(std::memory_order_relaxed);
+    s.eviction_aborts_generation_changed =
+        ctx->eviction_aborts_generation_changed.load(std::memory_order_relaxed);
+    s.write_generations = ctx->write_generations.load(std::memory_order_relaxed);
+    s.foreground_acquires = ctx->foreground_acquires.load(std::memory_order_relaxed);
+    s.background_prewarms = ctx->background_prewarms.load(std::memory_order_relaxed);
+    s.background_compaction_passes =
+        ctx->background_compaction_passes.load(std::memory_order_relaxed);
+    s.background_pressure_passes =
+        ctx->background_pressure_passes.load(std::memory_order_relaxed);
+
+    const auto mi = sr::platform::memory_info();
+    s.available_physical_bytes = mi.available_physical;
+    s.memory_load_percent = mi.load_percent;
+    s.pressure_level = ctx->pressure_level();
+
+    {
+        std::lock_guard<std::mutex> g(ctx->metric_mu);
+        s.last_promotion_ms = ctx->last_promotion_ms;
+        s.max_promotion_ms = ctx->max_promotion_ms;
+        s.last_compaction_ms = ctx->last_compaction_ms;
+    }
+
+    *out_stats = s;
+    return SR_OK;
+}
+
+SR_API int sr_get_object_stats(
+    SRContext context,
+    SRObjectId object_id,
+    SRObjectStats* out_stats
+) {
+    auto* ctx = static_cast<Context*>(context);
+    if (!ctx || !out_stats) return SR_ERR_INVALID;
+    auto obj = find_object(ctx, object_id);
+    if (!obj) return SR_ERR_NOT_FOUND;
+
+    SRObjectStats s{};
+    s.object_id = obj->id;
+    s.logical_size = obj->logical_size;
+    s.raw_resident_bytes = obj->raw_resident_bytes.load(std::memory_order_relaxed);
+    s.compressed_bytes = obj->compressed_bytes.load(std::memory_order_relaxed);
+    s.overlay_bytes = obj->overlay_bytes.load(std::memory_order_relaxed);
+    s.generation = obj->generation.load(std::memory_order_relaxed);
+    s.acquire_count = obj->acquire_count.load(std::memory_order_relaxed);
+    s.promotion_count = obj->promotion_count.load(std::memory_order_relaxed);
+    s.eviction_count = obj->eviction_count.load(std::memory_order_relaxed);
+    s.semantic_class = obj->semantic_class;
+    s.cold_hint = static_cast<uint32_t>(obj->cold_hint.load(std::memory_order_relaxed));
+    *out_stats = s;
+    return SR_OK;
+}
+
+SR_API uint64_t sr_object_generation(SRContext context, SRObjectId object_id) {
+    auto* ctx = static_cast<Context*>(context);
+    auto obj = find_object(ctx, object_id);
+    if (!obj) return 0;
+    return obj->generation.load(std::memory_order_relaxed);
+}
+
+SR_API int sr_segment_representation(
+    SRContext context,
+    SRObjectId object_id,
+    uint64_t segment_index,
+    uint32_t* out_representation
+) {
+    auto* ctx = static_cast<Context*>(context);
+    if (!ctx || !out_representation) return SR_ERR_INVALID;
+    auto obj = find_object(ctx, object_id);
+    if (!obj) return SR_ERR_NOT_FOUND;
+    if (segment_index >= obj->segment_count()) return SR_ERR_INVALID;
+
+    Segment& s = *obj->segments[static_cast<size_t>(segment_index)];
+    std::lock_guard<std::mutex> lk(s.mu);
+    *out_representation = dominant_representation_locked(s);
+    return SR_OK;
+}

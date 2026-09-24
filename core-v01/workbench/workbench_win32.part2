@@ -1,0 +1,220 @@
+        }
+
+        return true;
+    }
+
+    std::string run_search(const std::string& query) {
+        auto& w = workspaces_[current_];
+        const uint64_t q = hash_string(query);
+        const uint64_t max_off = 128ull * MB - 1ull * MB;
+        const uint64_t offset = (q % (max_off / (1ull * MB))) * (1ull * MB);
+
+        const double t0 = now_ms();
+        SRLease lease = nullptr;
+        if (sr_acquire(ctx_, w.index_object, offset, 1 * MB,
+                       SR_ACCESS_READ, SR_LATENCY_INTERACTIVE, &lease) != SR_OK) {
+            return "search promotion failed";
+        }
+
+        auto* p = static_cast<const uint8_t*>(sr_lease_data(lease));
+        uint64_t checksum = 0;
+        for (size_t i = 0; i < 1 * MB; i += 4096) checksum = checksum * 131 + p[i];
+        sr_release(lease);
+        const double elapsed = now_ms() - t0;
+
+        std::ostringstream oss;
+        oss << "Search object promoted on demand: query='" << query
+            << "', checksum=" << checksum << ", " << elapsed << " ms";
+        return oss.str();
+    }
+
+    std::string open_preview() {
+        auto& w = workspaces_[current_];
+        const uint64_t offset = (64ull + static_cast<uint64_t>(current_) * 7ull) * MB;
+        const double t0 = now_ms();
+
+        SRLease lease = nullptr;
+        if (sr_acquire(ctx_, w.preview, offset, 1 * MB,
+                       SR_ACCESS_READ, SR_LATENCY_INTERACTIVE, &lease) != SR_OK) {
+            return "preview promotion failed";
+        }
+
+        auto* p = static_cast<const uint8_t*>(sr_lease_data(lease));
+        uint64_t checksum = 0;
+        for (size_t i = 0; i < 1 * MB; i += 8192) checksum += p[i];
+        sr_release(lease);
+
+        std::ostringstream oss;
+        oss << "Preview cache promoted: checksum=" << checksum
+            << ", " << (now_ms() - t0) << " ms";
+        return oss.str();
+    }
+
+    SRStats stats() const {
+        SRStats s{};
+        if (ctx_) sr_get_stats(ctx_, &s);
+        return s;
+    }
+
+    bool trim_to(uint64_t bytes) {
+        return ctx_ && sr_trim(ctx_, bytes) == SR_OK;
+    }
+
+private:
+    SRContext ctx_ = nullptr;
+    std::array<Workspace, WORKSPACES> workspaces_{};
+    int current_ = 0;
+
+    static double now_ms() {
+        LARGE_INTEGER f{}, q{};
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&q);
+        return 1000.0 * static_cast<double>(q.QuadPart) / static_cast<double>(f.QuadPart);
+    }
+
+    static uint64_t hash_string(const std::string& s) {
+        uint64_t h = 1469598103934665603ull;
+        for (unsigned char c : s) {
+            h ^= c;
+            h *= 1099511628211ull;
+        }
+        return h;
+    }
+
+    bool register_object(
+        SRObjectId& out_id,
+        const char* name,
+        uint64_t size,
+        uint64_t critical,
+        uint32_t semantic,
+        uint32_t backing,
+        uint32_t flags,
+        BackingInfo* info,
+        bool recipe
+    ) {
+        SRObjectDescriptor d{};
+        d.name = name;
+        d.logical_size = size;
+        d.critical_prefix_bytes = critical;
+        d.semantic_class = semantic;
+        d.backing_kind = backing;
+        d.flags = flags;
+        d.user = info;
+        if (recipe) d.rebuild = generate_backing;
+        else d.backing_read = generate_backing;
+        return sr_register_object(ctx_, &d, nullptr, 0, &out_id) == SR_OK;
+    }
+
+    void hint_workspace_cold(int i) {
+        auto& w = workspaces_[i];
+        sr_hint_cold(ctx_, w.document);
+        sr_hint_cold(ctx_, w.history);
+        sr_hint_cold(ctx_, w.index_object);
+        sr_hint_cold(ctx_, w.preview);
+        sr_hint_cold(ctx_, w.asset);
+    }
+
+    void hint_workspace_hot(int i) {
+        auto& w = workspaces_[i];
+        sr_hint_hot(ctx_, w.document);
+        sr_hint_hot(ctx_, w.index_object);
+    }
+};
+
+static WorkbenchModel* g_model = nullptr;
+static HWND g_doc = nullptr;
+static HWND g_search = nullptr;
+static HWND g_status = nullptr;
+
+static void set_status(const std::string& text) {
+    if (g_status) SetWindowTextA(g_status, text.c_str());
+}
+
+static std::string edit_text(HWND h) {
+    const int n = GetWindowTextLengthA(h);
+    std::string s(static_cast<size_t>(n) + 1, '\0');
+    if (n > 0) GetWindowTextA(h, s.data(), n + 1);
+    s.resize(static_cast<size_t>(n));
+    return s;
+}
+
+static void load_current_document() {
+    if (!g_model || !g_doc) return;
+    std::string text = g_model->load_visible_document();
+    SetWindowTextA(g_doc, text.c_str());
+}
+
+static void save_current_document() {
+    if (!g_model || !g_doc) return;
+    if (!g_model->save_visible_document(edit_text(g_doc))) {
+        set_status("Save failed");
+    }
+}
+
+static void refresh_stats() {
+    if (!g_model) return;
+    const SRStats s = g_model->stats();
+    std::ostringstream oss;
+    oss << "Workspace " << (g_model->current_workspace() + 1)
+        << " | logical=" << (s.logical_bytes / MB) << " MiB"
+        << " | raw=" << (s.raw_resident_bytes / MB) << " MiB"
+        << " | compressed=" << (s.compressed_bytes / MB) << " MiB"
+        << " | overlay=" << (s.overlay_bytes / 1024) << " KiB"
+        << " | pressure=" << s.pressure_level
+        << " | promotions=" << s.promotions;
+    set_status(oss.str());
+}
+
+static void layout(HWND hwnd) {
+    RECT r{};
+    GetClientRect(hwnd, &r);
+    const int width = r.right - r.left;
+    const int height = r.bottom - r.top;
+
+    const int top = 42;
+    const int bottom = 28;
+    const int search_h = 30;
+
+    for (int i = 0; i < WORKSPACES; ++i) {
+        HWND b = GetDlgItem(hwnd, IDC_WS_BASE + i);
+        if (b) MoveWindow(b, 8 + i * 86, 6, 80, 28, TRUE);
+    }
+
+    if (g_search) MoveWindow(g_search, 8, top, std::max(100, width - 310), search_h, TRUE);
+    HWND sb = GetDlgItem(hwnd, IDC_SEARCH_BUTTON);
+    HWND pb = GetDlgItem(hwnd, IDC_PREVIEW_BUTTON);
+    HWND sv = GetDlgItem(hwnd, IDC_SAVE_BUTTON);
+    if (sb) MoveWindow(sb, width - 294, top, 90, search_h, TRUE);
+    if (pb) MoveWindow(pb, width - 200, top, 90, search_h, TRUE);
+    if (sv) MoveWindow(sv, width - 106, top, 98, search_h, TRUE);
+
+    if (g_doc) MoveWindow(g_doc, 8, top + search_h + 6,
+                          width - 16,
+                          std::max(80, height - (top + search_h + 6) - bottom - 8), TRUE);
+    if (g_status) MoveWindow(g_status, 8, height - bottom, width - 16, 22, TRUE);
+}
+
+static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    switch (msg) {
+        case WM_CREATE: {
+            for (int i = 0; i < WORKSPACES; ++i) {
+                char title[32];
+                std::snprintf(title, sizeof(title), "Workspace %d", i + 1);
+                CreateWindowExA(0, "BUTTON", title,
+                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                    0, 0, 0, 0, hwnd,
+                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_WS_BASE + i)),
+                    GetModuleHandle(nullptr), nullptr);
+            }
+
+            g_search = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "StateRAM",
+                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+                0, 0, 0, 0, hwnd,
+                reinterpret_cast<HMENU>(IDC_SEARCH), GetModuleHandle(nullptr), nullptr);
+
+            CreateWindowExA(0, "BUTTON", "Search",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                0, 0, 0, 0, hwnd,
+                reinterpret_cast<HMENU>(IDC_SEARCH_BUTTON), GetModuleHandle(nullptr), nullptr);
+
+            CreateWindowExA(0, "BUTTON", "Preview",

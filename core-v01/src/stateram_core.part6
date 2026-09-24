@@ -1,0 +1,197 @@
+            ctx->objects.emplace(obj->id, obj);
+        }
+
+        ctx->logical_bytes.fetch_add(obj->logical_size, std::memory_order_relaxed);
+        *out_object_id = obj->id;
+        wake_background(ctx);
+        return SR_OK;
+    } catch (...) {
+        return SR_ERR_NOMEM;
+    }
+}
+
+SR_API int sr_unregister_object(SRContext context, SRObjectId object_id) {
+    auto* ctx = static_cast<Context*>(context);
+    if (!ctx || object_id == 0) return SR_ERR_INVALID;
+
+    std::shared_ptr<Object> obj;
+    {
+        std::lock_guard<std::mutex> g(ctx->objects_mu);
+        auto it = ctx->objects.find(object_id);
+        if (it == ctx->objects.end()) return SR_ERR_NOT_FOUND;
+        obj = it->second;
+
+        for (auto& sp : obj->segments) {
+            std::lock_guard<std::mutex> lk(sp->mu);
+            if (sp->pin_count != 0 || sp->restoring) return SR_ERR_BUSY;
+        }
+
+        obj->retired.store(1, std::memory_order_release);
+        ctx->objects.erase(it);
+    }
+
+    ctx->logical_bytes.fetch_sub(obj->logical_size, std::memory_order_relaxed);
+    ctx->raw_resident_bytes.fetch_sub(obj->raw_resident_bytes.load(), std::memory_order_relaxed);
+    ctx->compressed_bytes.fetch_sub(obj->compressed_bytes.load(), std::memory_order_relaxed);
+    ctx->overlay_bytes.fetch_sub(obj->overlay_bytes.load(), std::memory_order_relaxed);
+
+    for (auto& sp : obj->segments) {
+        std::lock_guard<std::mutex> lk(sp->mu);
+        sp->retired = true;
+        sp->cv.notify_all();
+    }
+
+    return SR_OK;
+}
+
+SR_API int sr_acquire(
+    SRContext context,
+    SRObjectId object_id,
+    uint64_t offset,
+    uint64_t length,
+    uint32_t access_mode,
+    uint32_t latency_class,
+    SRLease* out_lease
+) {
+    auto* ctx = static_cast<Context*>(context);
+    if (!ctx || !out_lease || length == 0 ||
+        (access_mode != SR_ACCESS_READ && access_mode != SR_ACCESS_WRITE) ||
+        latency_class > SR_LATENCY_BACKGROUND) {
+        return SR_ERR_INVALID;
+    }
+
+    *out_lease = nullptr;
+    auto obj = find_object(ctx, object_id);
+    if (!obj) return SR_ERR_NOT_FOUND;
+    if (offset >= obj->logical_size || length > obj->logical_size - offset) {
+        return SR_ERR_INVALID;
+    }
+
+    const size_t first = static_cast<size_t>(offset / SEGMENT_BYTES);
+    const size_t last = static_cast<size_t>((offset + length - 1) / SEGMENT_BYTES);
+
+    auto lease = std::make_unique<Lease>();
+    lease->ctx = ctx;
+    lease->object = obj;
+    lease->offset = offset;
+    lease->length = length;
+    lease->mode = access_mode;
+    lease->latency_class = latency_class;
+    lease->segments.reserve(last - first + 1);
+
+    for (size_t i = first; i <= last; ++i) {
+        int rc = materialize_and_pin(ctx, obj, i, true, latency_class);
+        if (rc != SR_OK) {
+            for (const auto& x : lease->segments) {
+                unpin_segment(ctx, obj, x.index);
+            }
+            return rc;
+        }
+        lease->segments.push_back({i});
+    }
+
+    obj->acquire_count.fetch_add(1, std::memory_order_relaxed);
+    ctx->foreground_acquires.fetch_add(1, std::memory_order_relaxed);
+    obj->cold_hint.store(0, std::memory_order_relaxed);
+    record_access(ctx, object_id);
+
+    *out_lease = lease.release();
+    return SR_OK;
+}
+
+SR_API void* sr_lease_data(SRLease lease) {
+    auto* l = static_cast<Lease*>(lease);
+    if (!l || l->released || !l->object) return nullptr;
+    return l->object->arena + l->offset;
+}
+
+SR_API uint64_t sr_lease_length(SRLease lease) {
+    auto* l = static_cast<Lease*>(lease);
+    if (!l || l->released) return 0;
+    return l->length;
+}
+
+SR_API int sr_mark_dirty(
+    SRLease lease,
+    uint64_t relative_offset,
+    uint64_t length
+) {
+    auto* l = static_cast<Lease*>(lease);
+    if (!l || l->released || l->mode != SR_ACCESS_WRITE || length == 0) {
+        return SR_ERR_INVALID;
+    }
+    if (relative_offset >= l->length || length > l->length - relative_offset) {
+        return SR_ERR_INVALID;
+    }
+
+    return SR_OK;
+}
+
+SR_API int sr_release(SRLease lease) {
+    auto* l = static_cast<Lease*>(lease);
+    if (!l || l->released || !l->ctx || !l->object) return SR_ERR_INVALID;
+
+    int result = SR_OK;
+
+    if (l->mode == SR_ACCESS_WRITE) {
+        for (const auto& x : l->segments) {
+            int rc = journal_write_segment(
+                l->ctx,
+                l->object,
+                x.index,
+                l->offset,
+                l->length);
+            if (rc != SR_OK && result == SR_OK) result = rc;
+        }
+
+        if (result == SR_OK) {
+            l->object->generation.fetch_add(1, std::memory_order_relaxed);
+            l->ctx->write_generations.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    for (const auto& x : l->segments) {
+        unpin_segment(l->ctx, l->object, x.index);
+    }
+
+    l->released = true;
+    wake_background(l->ctx);
+    delete l;
+    return result;
+}
+
+SR_API int sr_hint_cold(SRContext context, SRObjectId object_id) {
+    auto* ctx = static_cast<Context*>(context);
+    auto obj = find_object(ctx, object_id);
+    if (!obj) return SR_ERR_NOT_FOUND;
+    obj->cold_hint.store(1, std::memory_order_relaxed);
+    obj->hot_hint.store(0, std::memory_order_relaxed);
+    wake_background(ctx);
+    return SR_OK;
+}
+
+SR_API int sr_hint_hot(SRContext context, SRObjectId object_id) {
+    auto* ctx = static_cast<Context*>(context);
+    auto obj = find_object(ctx, object_id);
+    if (!obj) return SR_ERR_NOT_FOUND;
+    obj->hot_hint.store(1, std::memory_order_relaxed);
+    obj->cold_hint.store(0, std::memory_order_relaxed);
+    wake_background(ctx);
+    return SR_OK;
+}
+
+SR_API int sr_hint_next(
+    SRContext context,
+    const SRObjectId* object_ids,
+    size_t count
+) {
+    auto* ctx = static_cast<Context*>(context);
+    if (!ctx || (!object_ids && count != 0)) return SR_ERR_INVALID;
+
+    uint32_t score = static_cast<uint32_t>(std::min<size_t>(count, 1000));
+    for (size_t i = 0; i < count; ++i) {
+        auto obj = find_object(ctx, object_ids[i]);
+        if (!obj) continue;
+        obj->explicit_next_score.store(score--, std::memory_order_relaxed);
+    }
+    wake_background(ctx);
