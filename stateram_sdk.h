@@ -38,6 +38,7 @@ struct SRMetrics {
     uint64_t baseline_slices;
     uint64_t baseline_cpu_backoffs;
     uint64_t capsule_releases;
+    uint64_t capsule_rearms;
 
     double baseline_ms;
     double baseline_wall_ms;
@@ -80,6 +81,10 @@ SR_API int sr_wait_deep(SRHandle handle, uint32_t timeout_ms);
 
 /* Releases a prepared or obsolete capsule while the region is fully active. */
 SR_API int sr_release_capsule(SRHandle handle);
+
+/* Keep an existing restored capsule and begin tracking fresh writes so
+   the same state can be made dormant again without rebuilding baseline. */
+SR_API int sr_rearm_existing_capsule(SRHandle handle);
 
 SR_API int sr_get_metrics(SRHandle handle, SRMetrics* out);
 SR_API void sr_destroy(SRHandle handle);
