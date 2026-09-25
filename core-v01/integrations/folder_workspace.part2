@@ -277,6 +277,12 @@
         }
     }
 
+    SRStats stats() const {
+        SRStats s{};
+        if (ctx_) sr_get_stats(ctx_, &s);
+        return s;
+    }
+
     bool trim(uint64_t target = 64ull * MB) {
         const int rc =
             sr_trim(ctx_, target);
@@ -408,8 +414,7 @@ static int run_smoke(
     const bool trim_ok =
         ws.trim(32ull * MB);
 
-    SRStats unused{};
-    (void)unused;
+    const SRStats s = ws.stats();
 
     std::ofstream out(
         "stateram_v02_folder_smoke.json",
@@ -428,6 +433,18 @@ static int run_smoke(
         << ",\n"
         << "  \"matches\": "
         << results.size()
+        << ",\n"
+        << "  \"raw_mb_after_trim\": "
+        << (s.raw_resident_bytes / static_cast<double>(MB))
+        << ",\n"
+        << "  \"promotions\": "
+        << s.promotions
+        << ",\n"
+        << "  \"streaming_evictions\": "
+        << s.streaming_evictions
+        << ",\n"
+        << "  \"promotion_failures\": "
+        << s.promotion_failures
         << ",\n"
         << "  \"trim_pass\": "
         << (trim_ok ? "true" : "false")
