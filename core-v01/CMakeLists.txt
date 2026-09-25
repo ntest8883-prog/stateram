@@ -45,4 +45,20 @@ if (WIN32)
     add_executable(stateram_4to8_evaluator_safe evaluation/evaluator_launcher.cpp)
     set_target_properties(stateram_4to8_evaluator_safe PROPERTIES OUTPUT_NAME "StateRAM_4to8_Evaluator_Safe")
     target_link_libraries(stateram_4to8_evaluator_safe PRIVATE user32 advapi32)
+
+    add_library(stateram_runtime_client SHARED runtime/stateram_runtime_client.cpp)
+    target_include_directories(stateram_runtime_client
+        PUBLIC include runtime
+    )
+    target_compile_definitions(stateram_runtime_client PRIVATE STATERAM_RUNTIME_CLIENT_BUILD)
+    target_link_libraries(stateram_runtime_client PRIVATE stateram_core)
+
+    add_executable(stateram_runtime_host runtime/stateram_runtime_host.cpp)
+    set_target_properties(stateram_runtime_host PROPERTIES OUTPUT_NAME "StateRAM_Runtime_Host")
+    target_include_directories(stateram_runtime_host PRIVATE runtime)
+
+    add_executable(stateram_runtime_smoke runtime/runtime_smoke_client.cpp)
+    set_target_properties(stateram_runtime_smoke PROPERTIES OUTPUT_NAME "StateRAM_Runtime_SmokeClient")
+    target_include_directories(stateram_runtime_smoke PRIVATE include runtime)
+    target_link_libraries(stateram_runtime_smoke PRIVATE stateram_core stateram_runtime_client)
 endif()
