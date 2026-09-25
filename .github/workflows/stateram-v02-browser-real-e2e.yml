@@ -75,12 +75,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Write-Host "STATERAM_E2E_NATIVE_REGISTRATION=PASS"
 
-      - name: Install Puppeteer-matched real Chrome test harness
+      - name: Install Selenium BiDi real Chrome test harness
         shell: powershell
         run: |
-          npm install puppeteer@25.12.0 --no-save
+          python -m pip install selenium==4.49.0
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          node -e "const p=require('puppeteer'); console.log('puppeteer='+require('puppeteer/package.json').version); console.log('chrome='+p.executablePath())"
+          python -c "import selenium; print('selenium=' + selenium.__version__)"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Real Chrome end-to-end
@@ -91,7 +91,7 @@ jobs:
           $runtimeHost = Start-Process -FilePath ".\core-v01\build\Release\StateRAM_Runtime_Host.exe" -ArgumentList "--test-pressure=3" -WorkingDirectory $PWD -RedirectStandardOutput $runtimeLog -RedirectStandardError $runtimeErr -PassThru
           try {
             Start-Sleep -Milliseconds 800
-            node .\core-v01\bridges\browser\browser_real_e2e.mjs .\core-v01\bridges\browser\extension .\stateram_real_chrome_e2e.json
+            python .\core-v01\bridges\browser\browser_real_e2e_selenium.py .\core-v01\bridges\browser\extension .\stateram_real_chrome_e2e.json
             if ($LASTEXITCODE -ne 0) { throw "Real Chrome end-to-end failed with exit code $LASTEXITCODE" }
             $r = Get-Content .\stateram_real_chrome_e2e.json -Raw | ConvertFrom-Json
             if (-not $r.pass) { throw "E2E result did not pass" }
