@@ -11,6 +11,7 @@ on:
   pull_request:
     branches:
       - main
+      - h0-baseline
     paths:
       - "h0/**"
       - ".github/workflows/stateram-h0-build.yml"
