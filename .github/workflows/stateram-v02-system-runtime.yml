@@ -1,0 +1,218 @@
+name: StateRAM v0.2 system runtime
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - v0.2-system-runtime
+
+permissions:
+  contents: read
+
+jobs:
+  validate-system-runtime:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Reconstruct generated Core sources
+        shell: powershell
+        run: |
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+
+          $coreParts = @(
+            ".\core-v01\src\stateram_core.part1",
+            ".\core-v01\src\stateram_core.part2",
+            ".\core-v01\src\stateram_core.part3",
+            ".\core-v01\src\stateram_core.part4",
+            ".\core-v01\src\stateram_core.part5",
+            ".\core-v01\src\stateram_core.part6",
+            ".\core-v01\src\stateram_core.part7"
+          )
+
+          $wbParts = @(
+            ".\core-v01\workbench\workbench_win32.part1",
+            ".\core-v01\workbench\workbench_win32.part2",
+            ".\core-v01\workbench\workbench_win32.part3a",
+            ".\core-v01\workbench\workbench_win32.part3b"
+          )
+
+          $evalParts = @(
+            ".\core-v01\evaluation\evaluator.part1",
+            ".\core-v01\evaluation\evaluator.part2",
+            ".\core-v01\evaluation\evaluator.part3",
+            ".\core-v01\evaluation\evaluator.part4"
+          )
+
+          foreach ($f in ($coreParts + $wbParts + $evalParts)) {
+            if (-not (Test-Path $f)) { throw "Missing source part: $f" }
+          }
+
+          $core = ($coreParts | ForEach-Object { Get-Content $_ -Raw }) -join ""
+          [IO.File]::WriteAllText("$PWD\core-v01\src\stateram_core.cpp", $core, $utf8)
+
+          $wb = ($wbParts | ForEach-Object { Get-Content $_ -Raw }) -join ""
+          [IO.File]::WriteAllText("$PWD\core-v01\workbench\workbench_win32.cpp", $wb, $utf8)
+
+          $ev = ($evalParts | ForEach-Object { Get-Content $_ -Raw }) -join ""
+          [IO.File]::WriteAllText("$PWD\core-v01\evaluation\evaluator_win32.cpp", $ev, $utf8)
+
+          Write-Host "V02_RUNTIME_SOURCE_RECONSTRUCTION=PASS"
+
+      - name: Configure x64 Release
+        shell: powershell
+        run: |
+          cmake -S .\core-v01 -B .\core-v01\build -A x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build Core and runtime
+        shell: powershell
+        run: |
+          cmake --build .\core-v01\build --config Release --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Frozen Core self-check
+        shell: powershell
+        run: |
+          Push-Location .\core-v01
+          .\build\Release\stateram_core_selfcheck.exe
+          $code = $LASTEXITCODE
+          Pop-Location
+          if ($code -ne 0) { exit $code }
+          Write-Host "STATERAM_CORE_V01_SELF_CHECK_WINDOWS=PASS"
+
+      - name: Multi-client runtime coordination
+        shell: powershell
+        run: |
+          Push-Location .\core-v01
+          $host = Start-Process -FilePath ".\build\Release\StateRAM_Runtime_Host.exe" -WorkingDirectory $PWD -RedirectStandardOutput ".\runtime_host.log" -RedirectStandardError ".\runtime_host_error.log" -PassThru
+          Start-Sleep -Milliseconds 800
+          $bg = Start-Process -FilePath ".\build\Release\StateRAM_Runtime_SmokeClient.exe" -ArgumentList "--name","background","--loops","30" -WorkingDirectory $PWD -PassThru
+          Start-Sleep -Milliseconds 800
+          $fg = Start-Process -FilePath ".\build\Release\StateRAM_Runtime_SmokeClient.exe" -ArgumentList "--name","foreground","--interactive","--loops","20" -WorkingDirectory $PWD -PassThru
+
+          $fg.WaitForExit()
+          $bg.WaitForExit()
+
+          $fgCode = $fg.ExitCode
+          $bgCode = $bg.ExitCode
+
+          if (-not $host.HasExited) {
+            Stop-Process -Id $host.Id -Force
+            $host.WaitForExit()
+          }
+
+          if ($fgCode -ne 0) { throw "Foreground runtime client failed: $fgCode" }
+          if ($bgCode -ne 0) { throw "Background runtime client failed: $bgCode" }
+
+          $foreground = Get-Content .\runtime_smoke_foreground.json -Raw | ConvertFrom-Json
+          $background = Get-Content .\runtime_smoke_background.json -Raw | ConvertFrom-Json
+
+          Write-Host "FOREGROUND_POLICY:"
+          $foreground | ConvertTo-Json -Depth 5
+          Write-Host "BACKGROUND_POLICY:"
+          $background | ConvertTo-Json -Depth 5
+
+          if ($foreground.max_connected_clients -lt 2) { throw "Foreground client never observed multi-client coordination" }
+          if ($background.max_connected_clients -lt 2) { throw "Background client never observed multi-client coordination" }
+          if ($foreground.foreground_seen -ne 1) { throw "Interactive client did not receive foreground policy" }
+          if ($background.min_target_mb -ge $foreground.min_target_mb) { throw "Background client was not assigned a smaller raw target" }
+          if ($background.min_raw_mb -ge $background.max_raw_mb) { throw "Background StateRAM raw state was not reclaimed" }
+
+          Copy-Item .\runtime_smoke_foreground.json ..\runtime_smoke_foreground.json
+          Copy-Item .\runtime_smoke_background.json ..\runtime_smoke_background.json
+          Copy-Item .\runtime_host.log ..\runtime_host.log
+          Pop-Location
+
+          Write-Host "STATERAM_V02_SYSTEM_RUNTIME_COORDINATION=PASS"
+
+      - name: Find Microsoft Defender scanner
+        id: defender
+        shell: powershell
+        run: |
+          $platformRoot = Join-Path $env:ProgramData "Microsoft\Windows Defender\Platform"
+          $mp = $null
+          if (Test-Path $platformRoot) {
+            $latest = Get-ChildItem $platformRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1
+            if ($latest) {
+              $candidate = Join-Path $latest.FullName "MpCmdRun.exe"
+              if (Test-Path $candidate) { $mp = $candidate }
+            }
+          }
+          if (-not $mp) {
+            $candidate = Join-Path $env:ProgramFiles "Windows Defender\MpCmdRun.exe"
+            if (Test-Path $candidate) { $mp = $candidate }
+          }
+          if (-not $mp) { throw "Microsoft Defender scanner unavailable" }
+          "mp=$mp" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Defender scan runtime binaries
+        shell: powershell
+        run: |
+          $mp = '${{ steps.defender.outputs.mp }}'
+          $scanDir = Join-Path $PWD "defender-runtime-scan"
+          New-Item -ItemType Directory -Force -Path $scanDir | Out-Null
+
+          $files = @(
+            ".\core-v01\build\Release\stateram_core.dll",
+            ".\core-v01\build\Release\stateram_runtime_client.dll",
+            ".\core-v01\build\Release\StateRAM_Runtime_Host.exe",
+            ".\core-v01\build\Release\StateRAM_Runtime_SmokeClient.exe"
+          )
+
+          foreach ($f in $files) {
+            if (-not (Test-Path $f)) { throw "Missing runtime binary: $f" }
+            Copy-Item $f $scanDir
+          }
+
+          & $mp -Scan -ScanType 3 -File $scanDir
+          $code = $LASTEXITCODE
+          @(
+            "ScanTarget=$scanDir"
+            "MpCmdRunExitCode=$code"
+          ) | Set-Content -Encoding UTF8 .\STATERAM_V02_RUNTIME_DEFENDER_SCAN.txt
+
+          if ($code -ne 0) { throw "Defender runtime scan failed with exit code $code" }
+          Write-Host "STATERAM_V02_RUNTIME_DEFENDER_SCAN=PASS"
+
+      - name: Assemble runtime developer package
+        shell: powershell
+        run: |
+          $dst = ".\StateRAM-v0.2-System-Runtime"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          Copy-Item .\core-v01\build\Release\stateram_core.dll $dst\
+          Copy-Item .\core-v01\build\Release\stateram_runtime_client.dll $dst\
+          Copy-Item .\core-v01\build\Release\StateRAM_Runtime_Host.exe $dst\
+          Copy-Item .\core-v01\runtime\stateram_runtime_client.h $dst\
+          Copy-Item .\core-v01\runtime\README_RUNTIME.md $dst\
+          Copy-Item .\STATERAM_V02_RUNTIME_DEFENDER_SCAN.txt $dst\
+          Copy-Item .\runtime_smoke_foreground.json $dst\
+          Copy-Item .\runtime_smoke_background.json $dst\
+
+          @'
+          StateRAM Runtime Host v0.2 is infrastructure for StateRAM-enabled applications.
+
+          Running this host by itself does NOT make ordinary Windows applications faster yet.
+          It coordinates memory budgets between applications/adapters that use the StateRAM runtime client API.
+
+          Do not install it as a service yet. The current package is a validated developer/runtime checkpoint.
+          '@ | Set-Content -Encoding UTF8 "$dst\README_FIRST.txt"
+
+      - name: Upload runtime evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: StateRAM-v0.2-System-Runtime-Evidence
+          path: |
+            runtime_smoke_foreground.json
+            runtime_smoke_background.json
+            runtime_host.log
+            STATERAM_V02_RUNTIME_DEFENDER_SCAN.txt
+
+      - name: Upload runtime developer package
+        uses: actions/upload-artifact@v4
+        with:
+          name: StateRAM-v0.2-System-Runtime
+          path: StateRAM-v0.2-System-Runtime
