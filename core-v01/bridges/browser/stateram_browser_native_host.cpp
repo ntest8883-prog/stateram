@@ -96,7 +96,7 @@ static bool parse_uint64(
     uint64_t& value
 ) {
     const std::string needle =
-        std::string(""") + key + """;
+        std::string("\"") + key + "\"";
 
     size_t p = json.find(needle);
     if (p == std::string::npos) return false;
@@ -262,35 +262,35 @@ static std::string response_json(
 ) {
     std::string out = "{";
 
-    out += ""ok":";
+    out += "\"ok\":";
     out += ok ? "true" : "false";
 
-    out += ","reason":"";
+    out += ",\"reason\":\"";
     out += reason ? reason : "";
-    out += """;
+    out += "\"";
 
     if (runtime) {
-        out += ","pressure":";
+        out += ",\"pressure\":";
         out += std::to_string(runtime->pressure_level);
 
-        out += ","availableMb":";
+        out += ",\"availableMb\":";
         out += std::to_string(
             runtime->system_available_bytes / MB);
 
-        out += ","memoryLoad":";
+        out += ",\"memoryLoad\":";
         out += std::to_string(
             runtime->memory_load_percent);
     } else {
-        out += ","pressure":0";
-        out += ","availableMb":0";
-        out += ","memoryLoad":0";
+        out += ",\"pressure\":0";
+        out += ",\"availableMb\":0";
+        out += ",\"memoryLoad\":0";
     }
 
     if (browser) {
-        out += ","discard":";
+        out += ",\"discard\":";
         out += std::to_string(browser->discard);
 
-        out += ","minimumIdleSeconds":";
+        out += ",\"minimumIdleSeconds\":";
         if (browser->minimum_idle_seconds ==
             std::numeric_limits<uint64_t>::max()) {
             out += "4294967295";
@@ -299,8 +299,8 @@ static std::string response_json(
                 browser->minimum_idle_seconds);
         }
     } else {
-        out += ","discard":0";
-        out += ","minimumIdleSeconds":4294967295";
+        out += ",\"discard\":0";
+        out += ",\"minimumIdleSeconds\":4294967295";
     }
 
     out += "}";
