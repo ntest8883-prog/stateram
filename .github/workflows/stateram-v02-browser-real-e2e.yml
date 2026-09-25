@@ -75,13 +75,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Write-Host "STATERAM_E2E_NATIVE_REGISTRATION=PASS"
 
-      - name: Install Puppeteer test harness
+      - name: Install Puppeteer-matched real Chrome test harness
         shell: powershell
         run: |
-          $env:PUPPETEER_SKIP_DOWNLOAD = "true"
-          npm install puppeteer@25.12.0 --no-save --ignore-scripts
+          npm install puppeteer@25.12.0 --no-save
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          node -e "console.log(require('puppeteer/package.json').version)"
+          node -e "const p=require('puppeteer'); console.log('puppeteer='+require('puppeteer/package.json').version); console.log('chrome='+p.executablePath())"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Real Chrome end-to-end
