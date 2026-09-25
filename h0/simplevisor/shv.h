@@ -192,5 +192,4 @@ extern UINT64 ShvH1BackingPagePhysicalAddress;
 extern volatile long ShvH1RemapCount;
 extern volatile long ShvH1WriteTrapCount;
 extern volatile long ShvH1DetachedFrameVerifiedCount;
-extern volatile long ShvH1Phase;
 
