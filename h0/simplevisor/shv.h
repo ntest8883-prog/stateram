@@ -188,5 +188,9 @@ extern volatile UINT64 ShvH0LastGuestPhysicalAddress;
 extern volatile UINT64 ShvH0LastExitQualification;
 extern UINT64 ShvH1TestPageVirtualAddress;
 extern UINT64 ShvH1BackingPageVirtualAddress;
-extern volatile long ShvH1RestoreCount;
+extern UINT64 ShvH1BackingPagePhysicalAddress;
+extern volatile long ShvH1RemapCount;
+extern volatile long ShvH1WriteTrapCount;
+extern volatile long ShvH1DetachedFrameVerifiedCount;
+extern volatile long ShvH1Phase;
 
