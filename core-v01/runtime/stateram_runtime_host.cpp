@@ -19,6 +19,12 @@
 static constexpr uint64_t MB = 1024ull * 1024ull;
 static constexpr uint64_t EMERGENCY_RESERVE = 640ull * MB;
 
+/*
+ * Test-only pressure override used by disposable CI browser validation.
+ * Normal runs leave this at -1 and always use real Windows memory pressure.
+ */
+static int g_test_pressure_override = -1;
+
 struct ClientState {
     uint32_t pid = 0;
     uint32_t flags = 0;
@@ -112,6 +118,11 @@ static SystemState system_state() {
     uint64_t headroom_budget = 0;
     if (ms.ullAvailPhys > EMERGENCY_RESERVE) {
         headroom_budget = ms.ullAvailPhys - EMERGENCY_RESERVE;
+    }
+
+    if (g_test_pressure_override >= 0) {
+        out.pressure = static_cast<uint32_t>(
+            std::clamp(g_test_pressure_override, 0, 3));
     }
 
     switch (out.pressure) {
@@ -316,10 +327,42 @@ static HANDLE create_pipe() {
         nullptr);
 }
 
-int wmain() {
+int wmain(int argc, wchar_t** argv) {
+    for (int i = 1; i < argc; ++i) {
+        const std::wstring arg = argv[i] ? argv[i] : L"";
+
+        const std::wstring prefix = L"--test-pressure=";
+        if (arg.rfind(prefix, 0) == 0) {
+            const std::wstring value = arg.substr(prefix.size());
+            if (value.size() != 1 ||
+                value[0] < L'0' ||
+                value[0] > L'3') {
+                std::wcerr
+                    << L"Invalid --test-pressure value; expected 0..3\n";
+                return 3;
+            }
+
+            g_test_pressure_override =
+                static_cast<int>(value[0] - L'0');
+        } else {
+            std::wcerr
+                << L"Unknown argument: " << arg << L"\n";
+            return 3;
+        }
+    }
+
     std::wcout
         << L"StateRAM Runtime Host v0.2\n"
-        << L"Per-user coordination runtime. No driver. No injection.\n"
+        << L"Per-user coordination runtime. No driver. No injection.\n";
+
+    if (g_test_pressure_override >= 0) {
+        std::wcout
+            << L"TEST_ONLY_PRESSURE_OVERRIDE="
+            << g_test_pressure_override
+            << L"\n";
+    }
+
+    std::wcout
         << L"Waiting for StateRAM-enabled applications...\n";
 
     HostState host;
