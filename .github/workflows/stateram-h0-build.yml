@@ -6,6 +6,7 @@ on:
       - h0-baseline
       - h0-ept-trap
       - h1-restore
+      - h1-ept-remap
     paths:
       - "h0/**"
       - ".github/workflows/stateram-h0-build.yml"
@@ -14,6 +15,7 @@ on:
       - main
       - h0-baseline
       - h0-ept-trap
+      - h1-restore
     paths:
       - "h0/**"
       - ".github/workflows/stateram-h0-build.yml"
@@ -84,7 +86,7 @@ jobs:
       - name: Upload unsigned H0 baseline
         uses: actions/upload-artifact@v4
         with:
-          name: StateRAM-H1A-restore-unsigned
+          name: StateRAM-H1B-ept-remap-unsigned
           path: |
             h0/simplevisor/x64/NT/shv.sys
             h0/simplevisor/x64/NT/shv.pdb

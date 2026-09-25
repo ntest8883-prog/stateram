@@ -28,7 +28,8 @@ volatile UINT64 ShvH0LastGuestPhysicalAddress;
 volatile UINT64 ShvH0LastExitQualification;
 UINT64 ShvH1TestPageVirtualAddress;
 UINT64 ShvH1BackingPageVirtualAddress;
-volatile long ShvH1RestoreCount;
+UINT64 ShvH1BackingPagePhysicalAddress;
+volatile long ShvH1RemapCount;
 
 VOID
 ShvUnload (
