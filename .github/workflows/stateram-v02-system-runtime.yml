@@ -88,7 +88,7 @@ jobs:
         shell: powershell
         run: |
           Push-Location .\core-v01
-          $host = Start-Process -FilePath ".\build\Release\StateRAM_Runtime_Host.exe" -WorkingDirectory $PWD -RedirectStandardOutput ".\runtime_host.log" -RedirectStandardError ".\runtime_host_error.log" -PassThru
+          $runtimeHost = Start-Process -FilePath ".\build\Release\StateRAM_Runtime_Host.exe" -WorkingDirectory $PWD -RedirectStandardOutput ".\runtime_host.log" -RedirectStandardError ".\runtime_host_error.log" -PassThru
           Start-Sleep -Milliseconds 800
           $bg = Start-Process -FilePath ".\build\Release\StateRAM_Runtime_SmokeClient.exe" -ArgumentList "--name","background","--loops","30" -WorkingDirectory $PWD -PassThru
           Start-Sleep -Milliseconds 800
@@ -100,9 +100,9 @@ jobs:
           $fgCode = $fg.ExitCode
           $bgCode = $bg.ExitCode
 
-          if (-not $host.HasExited) {
-            Stop-Process -Id $host.Id -Force
-            $host.WaitForExit()
+          if (-not $runtimeHost.HasExited) {
+            Stop-Process -Id $runtimeHost.Id -Force
+            $runtimeHost.WaitForExit()
           }
 
           if ($fgCode -ne 0) { throw "Foreground runtime client failed: $fgCode" }
