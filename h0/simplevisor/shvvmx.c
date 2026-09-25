@@ -140,39 +140,33 @@ ShvVmxEptInitialize (
     tempEpdpte.Read = tempEpdpte.Write = tempEpdpte.Execute = 1;
 
     //
-    // Construct EPT identity map for every 1GB of RAM
+    // Construct the EPT hierarchy for every 1GB range. H1-C stores each
+    // 512-entry PDE table in its own independent 4KB physical page, so no
+    // multi-megabyte contiguous allocation is required.
     //
     __stosq((UINT64*)VpData->Epdpt, tempEpdpte.AsUlonglong, PDPTE_ENTRY_COUNT);
-    for (i = 0; i < PDPTE_ENTRY_COUNT; i++)
-    {
-        //
-        // Set the page frame number of the PDE table
-        //
-        VpData->Epdpt[i].PageFrameNumber = ShvOsGetPhysicalAddress(&VpData->Epde[i][0]) / PAGE_SIZE;
-    }
 
-    //
-    // Fill out a RWX Large PDE
-    //
     tempEpde.AsUlonglong = 0;
     tempEpde.Read = tempEpde.Write = tempEpde.Execute = 1;
     tempEpde.Large = 1;
 
-    //
-    // Loop every 1GB of RAM (described by the PDPTE)
-    //
-    __stosq((UINT64*)VpData->Epde, tempEpde.AsUlonglong, PDPTE_ENTRY_COUNT * PDE_ENTRY_COUNT);
     for (i = 0; i < PDPTE_ENTRY_COUNT; i++)
     {
-        //
-        // Construct EPT identity map for every 2MB of RAM
-        //
+        VpData->Epdpt[i].PageFrameNumber =
+            ShvOsGetPhysicalAddress(VpData->Epde[i]) / PAGE_SIZE;
+
+        __stosq((UINT64*)VpData->Epde[i],
+                tempEpde.AsUlonglong,
+                PDE_ENTRY_COUNT);
+
         for (j = 0; j < PDE_ENTRY_COUNT; j++)
         {
             VpData->Epde[i][j].PageFrameNumber = (i * 512) + j;
-            VpData->Epde[i][j].Type = ShvVmxMtrrAdjustEffectiveMemoryType(VpData,
-                                                                          VpData->Epde[i][j].PageFrameNumber * _2MB,
-                                                                          MTRR_TYPE_WB);
+            VpData->Epde[i][j].Type =
+                ShvVmxMtrrAdjustEffectiveMemoryType(
+                    VpData,
+                    VpData->Epde[i][j].PageFrameNumber * _2MB,
+                    MTRR_TYPE_WB);
         }
     }
 
