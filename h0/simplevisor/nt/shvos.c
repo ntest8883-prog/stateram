@@ -118,6 +118,7 @@ ShvH1FreePages (
     ShvH0TestPagePhysicalAddress = 0;
     ShvH1TestPageVirtualAddress = 0;
     ShvH1BackingPageVirtualAddress = 0;
+    ShvH1BackingPagePhysicalAddress = 0;
 }
 
 NTSTATUS
@@ -160,13 +161,16 @@ ShvH1PreparePages (
     ShvH0EptTrapCount = 0;
     ShvH0LastGuestPhysicalAddress = 0;
     ShvH0LastExitQualification = 0;
-    ShvH1RestoreCount = 0;
+    ShvH1RemapCount = 0;
 
     ShvH0TestPagePhysicalAddress = ShvOsGetPhysicalAddress(g_H1TestPage);
+    ShvH1BackingPagePhysicalAddress = ShvOsGetPhysicalAddress(g_H1BackingPage);
     ShvH1TestPageVirtualAddress = (UINT64)(ULONG_PTR)g_H1TestPage;
     ShvH1BackingPageVirtualAddress = (UINT64)(ULONG_PTR)g_H1BackingPage;
 
-    if (ShvH0TestPagePhysicalAddress == 0)
+    if ((ShvH0TestPagePhysicalAddress == 0) ||
+        (ShvH1BackingPagePhysicalAddress == 0) ||
+        (ShvH0TestPagePhysicalAddress == ShvH1BackingPagePhysicalAddress))
     {
         ShvH1FreePages();
         return STATUS_UNSUCCESSFUL;
@@ -176,7 +180,7 @@ ShvH1PreparePages (
 }
 
 BOOLEAN
-ShvH1TriggerAndVerifyRestore (
+ShvH1TriggerAndVerifyRemap (
     VOID
     )
 {
@@ -187,9 +191,10 @@ ShvH1TriggerAndVerifyRestore (
     expectedFirstByte = *(PUCHAR)g_H1BackingPage;
 
     //
-    // The target is still poisoned here. This read must encounter the EPT
-    // trap. Root mode reconstructs the complete page from the backing copy
-    // before allowing this same instruction to retry.
+    // The target's real physical page still contains poison here. This read
+    // must encounter the EPT trap. Root mode changes the EPT leaf so the same
+    // guest-physical page is backed by the separate physical page, then retries
+    // this exact instruction.
     //
     firstByte = *(volatile UCHAR*)g_H1TestPage;
 
@@ -198,7 +203,7 @@ ShvH1TriggerAndVerifyRestore (
         return FALSE;
     }
 
-    if ((ShvH0EptTrapCount < 1) || (ShvH1RestoreCount < 1))
+    if ((ShvH0EptTrapCount < 1) || (ShvH1RemapCount < 1))
     {
         return FALSE;
     }
@@ -497,7 +502,7 @@ DriverUnload (
     ExUnregisterCallback(g_PowerCallbackRegistration);
 
     //
-    // Unload the hypervisor before releasing the private H0-C page.
+    // Unload the hypervisor before releasing the private H1-B pages.
     //
     ShvUnload();
     ShvH1FreePages();
@@ -520,8 +525,8 @@ DriverEntry (
     UNREFERENCED_PARAMETER(RegistryPath);
 
     //
-    // H1-A owns exactly two private pages: a target and a backing copy.
-    // No application or ordinary Windows page is selected for this experiment.
+    // H1-B owns exactly two private pages: a target GPA and an alternate
+    // physical backing page. No application or ordinary Windows page is used.
     //
     status = ShvH1PreparePages();
     if (!NT_SUCCESS(status))
@@ -585,10 +590,11 @@ DriverEntry (
 
     //
     // Deliberately read the poisoned target. DriverEntry succeeds only if
-    // EPT traps the access, root mode reconstructs all 4096 bytes from the
-    // separate backing page, and the full restored page verifies correctly.
+    // EPT traps the access, remaps the target GPA to the alternate physical
+    // page, retries the read, and the entire 4096-byte guest view matches the
+    // alternate backing page.
     //
-    if (ShvH1TriggerAndVerifyRestore() == FALSE)
+    if (ShvH1TriggerAndVerifyRemap() == FALSE)
     {
         ShvUnload();
         ExUnregisterCallback(g_PowerCallbackRegistration);
@@ -596,10 +602,11 @@ DriverEntry (
         return STATUS_UNSUCCESSFUL;
     }
 
-    ShvOsDebugPrint("H1-A PASS: trap=%ld restore=%ld GPA=0x%llX qualification=0x%llX\n",
+    ShvOsDebugPrint("H1-B PASS: trap=%ld remap=%ld GPA=0x%llX backing=0x%llX qualification=0x%llX\n",
                     ShvH0EptTrapCount,
-                    ShvH1RestoreCount,
+                    ShvH1RemapCount,
                     ShvH0LastGuestPhysicalAddress,
+                    ShvH1BackingPagePhysicalAddress,
                     ShvH0LastExitQualification);
 
     return STATUS_SUCCESS;
