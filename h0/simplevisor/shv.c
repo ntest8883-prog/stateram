@@ -26,6 +26,9 @@ UINT64 ShvH0TestPagePhysicalAddress;
 volatile long ShvH0EptTrapCount;
 volatile UINT64 ShvH0LastGuestPhysicalAddress;
 volatile UINT64 ShvH0LastExitQualification;
+UINT64 ShvH1TestPageVirtualAddress;
+UINT64 ShvH1BackingPageVirtualAddress;
+volatile long ShvH1RestoreCount;
 
 VOID
 ShvUnload (
