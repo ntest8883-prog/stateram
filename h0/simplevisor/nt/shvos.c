@@ -230,7 +230,7 @@ ShvH1TriggerAndVerifyReclaim (
     //
     oldByte = ((PUCHAR)g_H1BackingPage)[H1_WRITE_OFFSET];
     newByte = oldByte ^ H1_WRITE_XOR;
-    ((volatile PUCHAR)g_H1TestPage)[H1_WRITE_OFFSET] = newByte;
+    *(volatile UCHAR*)((PUCHAR)g_H1TestPage + H1_WRITE_OFFSET) = newByte;
 
     if (((PUCHAR)g_H1TestPage)[H1_WRITE_OFFSET] != newByte ||
         ((PUCHAR)g_H1BackingPage)[H1_WRITE_OFFSET] != newByte)
@@ -255,7 +255,7 @@ ShvH1TriggerAndVerifyReclaim (
     // Restore the logical payload byte so unload sees the same logical data
     // pattern the test started with. The original HPA remains detached/scratch.
     //
-    ((volatile PUCHAR)g_H1TestPage)[H1_WRITE_OFFSET] = oldByte;
+    *(volatile UCHAR*)((PUCHAR)g_H1TestPage + H1_WRITE_OFFSET) = oldByte;
 
     if (((PUCHAR)g_H1BackingPage)[H1_WRITE_OFFSET] != oldByte)
     {
