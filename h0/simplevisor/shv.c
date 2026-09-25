@@ -22,6 +22,11 @@ Environment:
 
 #include "shv.h"
 
+UINT64 ShvH0TestPagePhysicalAddress;
+volatile long ShvH0EptTrapCount;
+volatile UINT64 ShvH0LastGuestPhysicalAddress;
+volatile UINT64 ShvH0LastExitQualification;
+
 VOID
 ShvUnload (
     VOID
