@@ -220,7 +220,7 @@ ShvVmxEptInitialize (
         tempEpdpte.AsUlonglong = 0;
         tempEpdpte.Read = tempEpdpte.Write = tempEpdpte.Execute = 1;
         tempEpdpte.PageFrameNumber =
-            ShvOsGetPhysicalAddress(&VpData->H0EptPt) / PAGE_SIZE;
+            ShvOsGetPhysicalAddress(VpData->H0EptPt) / PAGE_SIZE;
 
         VpData->Epde[h0PdptIndex][h0PdeIndex].AsUlonglong =
             tempEpdpte.AsUlonglong;
