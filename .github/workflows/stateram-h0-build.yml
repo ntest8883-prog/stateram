@@ -1,0 +1,88 @@
+name: StateRAM H0 baseline build
+
+on:
+  push:
+    branches:
+      - h0-baseline
+    paths:
+      - "h0/**"
+      - ".github/workflows/stateram-h0-build.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "h0/**"
+      - ".github/workflows/stateram-h0-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build pinned SimpleVisor NT x64 baseline
+    runs-on: windows-2025-vs2026
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Add NuGet to PATH
+        uses: NuGet/setup-nuget@v2
+
+      - name: Restore Windows SDK and WDK packages
+        shell: pwsh
+        run: |
+          nuget restore h0/simplevisor/packages.config `
+            -PackagesDirectory h0/simplevisor/packages `
+            -NonInteractive
+
+      - name: Build NT x64 baseline
+        shell: pwsh
+        run: |
+          msbuild h0/simplevisor/shv.vcxproj `
+            /m `
+            /t:Build `
+            /p:Configuration=NT `
+            /p:Platform=x64 `
+            /p:SignMode=Off
+
+      - name: Verify driver artifact exists
+        shell: pwsh
+        run: |
+          $driver = "h0/simplevisor/x64/NT/shv.sys"
+          if (-not (Test-Path $driver)) {
+            throw "Expected driver was not produced: $driver"
+          }
+          $item = Get-Item $driver
+          Write-Host ("Driver: {0} ({1} bytes)" -f $item.FullName, $item.Length)
+
+      - name: Audit produced driver
+        shell: pwsh
+        run: |
+          $driver = (Resolve-Path "h0/simplevisor/x64/NT/shv.sys").Path
+          $hash = (Get-FileHash -Algorithm SHA256 $driver).Hash
+          Write-Host "SHV_SHA256=$hash"
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "Visual Studio C++ toolchain not found." }
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin.exe not found." }
+
+          & $dumpbin.FullName /headers /imports $driver |
+            Tee-Object "h0/simplevisor/x64/NT/shv-audit.txt"
+
+      - name: Upload unsigned H0 baseline
+        uses: actions/upload-artifact@v4
+        with:
+          name: StateRAM-H0-baseline-unsigned
+          path: |
+            h0/simplevisor/x64/NT/shv.sys
+            h0/simplevisor/x64/NT/shv.pdb
+            h0/simplevisor/x64/NT/shv-audit.txt
+          if-no-files-found: error
