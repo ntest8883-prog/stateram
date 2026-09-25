@@ -77,6 +77,21 @@ typedef struct _SHV_DPC_CONTEXT
 #define KGDT64_R3_DATA      0x28
 #define KGDT64_R3_CMTEB     0x50
 
+VOID
+ShvOsFreeContiguousAlignedMemory (
+    _In_ PVOID BaseAddress
+    );
+
+PVOID
+ShvOsAllocateContigousAlignedMemory (
+    _In_ SIZE_T Size
+    );
+
+ULONGLONG
+ShvOsGetPhysicalAddress (
+    _In_ PVOID BaseAddress
+    );
+
 PVOID g_PowerCallbackRegistration;
 PVOID g_H0TestPage;
 
