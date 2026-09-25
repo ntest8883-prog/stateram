@@ -69,6 +69,8 @@ jobs:
           $stage = Join-Path $PWD "browser-e2e-stage"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item .\core-v01\build\Release\StateRAM_Browser_NativeHost.exe $stage\
+          Copy-Item .\core-v01\build\Release\stateram_core.dll $stage\
+          Copy-Item .\core-v01\build\Release\stateram_runtime_client.dll $stage\
           Copy-Item .\core-v01\bridges\browser\INSTALL_BROWSER_BRIDGE_CURRENT_USER.ps1 $stage\
           Copy-Item .\core-v01\bridges\browser\UNINSTALL_BROWSER_BRIDGE_CURRENT_USER.ps1 $stage\
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$stage\INSTALL_BROWSER_BRIDGE_CURRENT_USER.ps1"
