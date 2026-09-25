@@ -268,12 +268,10 @@ const done = arguments[arguments.length - 1];
         if before["tabs"][str(setup["pinned"])]["discarded"]:
             raise RuntimeError("pinned tab was discarded by automatic policy")
 
-        /*
-         * The extension's natural one-minute alarm may already have fired by
-         * this point. That is valid end-to-end behavior, not a failure.
-         * If fewer than four eligible tabs were reclaimed naturally, schedule
-         * the exact same registered alarm once more to finish the check.
-         */
+        # The extension's natural one-minute alarm may already have fired by
+        # this point. That is valid end-to-end behavior, not a failure.
+        # If fewer than four eligible tabs were reclaimed naturally, schedule
+        # the exact same registered alarm once more to finish the check.
         trigger_script = r"""
 const done = arguments[arguments.length - 1];
 (async () => {
