@@ -102,10 +102,11 @@ jobs:
           for ($i = 0; $i -lt 64; $i++) {
             $path = Join-Path $root ("document_{0:D3}.txt" -f $i)
             $marker = "needle-v02 file=$i StateRAM real-file integration "
-            $line = "This is actual file-backed corpus content for StateRAM v0.2. $marker"
+            $filler = "This is actual file-backed corpus content for StateRAM v0.2 without the search marker. "
             $sb = New-Object System.Text.StringBuilder
+            [void]$sb.Append($marker)
             while ($sb.Length -lt $targetBytes) {
-              [void]$sb.Append($line)
+              [void]$sb.Append($filler)
             }
             [IO.File]::WriteAllText($path, $sb.ToString(0, $targetBytes))
           }
