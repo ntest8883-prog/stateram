@@ -1,0 +1,289 @@
+name: StateRAM v0.2 browser bridge
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - v0.2-browser-bridge
+
+permissions:
+  contents: read
+
+jobs:
+  validate-browser-bridge:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Reconstruct generated Core sources
+        shell: powershell
+        run: |
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+
+          $coreParts = @(
+            ".\\core-v01\\src\\stateram_core.part1",
+            ".\\core-v01\\src\\stateram_core.part2",
+            ".\\core-v01\\src\\stateram_core.part3",
+            ".\\core-v01\\src\\stateram_core.part4",
+            ".\\core-v01\\src\\stateram_core.part5",
+            ".\\core-v01\\src\\stateram_core.part6",
+            ".\\core-v01\\src\\stateram_core.part7"
+          )
+
+          $wbParts = @(
+            ".\\core-v01\\workbench\\workbench_win32.part1",
+            ".\\core-v01\\workbench\\workbench_win32.part2",
+            ".\\core-v01\\workbench\\workbench_win32.part3a",
+            ".\\core-v01\\workbench\\workbench_win32.part3b"
+          )
+
+          $evalParts = @(
+            ".\\core-v01\\evaluation\\evaluator.part1",
+            ".\\core-v01\\evaluation\\evaluator.part2",
+            ".\\core-v01\\evaluation\\evaluator.part3",
+            ".\\core-v01\\evaluation\\evaluator.part4"
+          )
+
+          foreach ($f in ($coreParts + $wbParts + $evalParts)) {
+            if (-not (Test-Path $f)) { throw "Missing source part: $f" }
+          }
+
+          $core = ($coreParts | ForEach-Object { Get-Content $_ -Raw }) -join ""
+          [IO.File]::WriteAllText("$PWD\\core-v01\\src\\stateram_core.cpp", $core, $utf8)
+
+          $wb = ($wbParts | ForEach-Object { Get-Content $_ -Raw }) -join ""
+          [IO.File]::WriteAllText("$PWD\\core-v01\\workbench\\workbench_win32.cpp", $wb, $utf8)
+
+          $ev = ($evalParts | ForEach-Object { Get-Content $_ -Raw }) -join ""
+          [IO.File]::WriteAllText("$PWD\\core-v01\\evaluation\\evaluator_win32.cpp", $ev, $utf8)
+
+          Write-Host "V02_BROWSER_SOURCE_RECONSTRUCTION=PASS"
+
+      - name: Configure x64 Release
+        shell: powershell
+        run: |
+          cmake -S .\\core-v01 -B .\\core-v01\\build -A x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build runtime and browser bridge
+        shell: powershell
+        run: |
+          cmake --build .\\core-v01\\build --config Release --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Frozen Core self-check
+        shell: powershell
+        run: |
+          Push-Location .\\core-v01
+          .\\build\\Release\\stateram_core_selfcheck.exe
+          $code = $LASTEXITCODE
+          Pop-Location
+          if ($code -ne 0) { exit $code }
+          Write-Host "STATERAM_CORE_V01_SELF_CHECK_WINDOWS=PASS"
+
+      - name: Validate Chromium extension package
+        shell: powershell
+        run: |
+          $manifestPath = ".\\core-v01\\bridges\\browser\\extension\\manifest.json"
+          $scriptPath = ".\\core-v01\\bridges\\browser\\extension\\background.js"
+
+          node --check $scriptPath
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $m = Get-Content $manifestPath -Raw | ConvertFrom-Json
+          if ($m.manifest_version -ne 3) { throw "Expected Manifest V3" }
+          if ($m.permissions -notcontains "tabs") { throw "Missing tabs permission" }
+          if ($m.permissions -notcontains "nativeMessaging") { throw "Missing nativeMessaging permission" }
+          if ($m.background.service_worker -ne "background.js") { throw "Unexpected service worker" }
+
+          $idScript = "import base64,hashlib,sys; b=base64.b64decode(sys.argv[1]); h=hashlib.sha256(b).digest()[:16]; a='abcdefghijklmnop'; print(''.join(a[x>>4]+a[x&15] for x in h))"
+          $extensionId = (python -c $idScript $m.key).Trim()
+          if ($extensionId -ne "joobkllejoacdkjggddlbgljgkokccge") {
+            throw "Unexpected fixed extension ID: $extensionId"
+          }
+
+          Write-Host "STATERAM_BROWSER_EXTENSION_STATIC_VALIDATION=PASS"
+          Write-Host "STATERAM_BROWSER_EXTENSION_ID=$extensionId"
+
+      - name: Browser bridge policy self-check
+        shell: powershell
+        run: |
+          Push-Location .\\core-v01
+          .\\build\\Release\\StateRAM_Browser_NativeHost.exe --policy-selfcheck | Tee-Object -FilePath ..\\browser_policy_selfcheck.log
+          $code = $LASTEXITCODE
+          Pop-Location
+          if ($code -ne 0) { exit $code }
+
+      - name: Live runtime to native-messaging bridge
+        shell: powershell
+        run: |
+          Push-Location .\\core-v01
+
+          $runtimeHost = Start-Process -FilePath ".\\build\\Release\\StateRAM_Runtime_Host.exe" -WorkingDirectory $PWD -RedirectStandardOutput ".\\browser_runtime_host.log" -RedirectStandardError ".\\browser_runtime_host_error.log" -PassThru
+          Start-Sleep -Milliseconds 800
+
+          python .\\bridges\\browser\\browser_bridge_smoke.py .\\build\\Release\\StateRAM_Browser_NativeHost.exe | Tee-Object -FilePath ..\\browser_native_smoke.log
+          $code = $LASTEXITCODE
+
+          if (-not $runtimeHost.HasExited) {
+            Stop-Process -Id $runtimeHost.Id -Force
+            $runtimeHost.WaitForExit()
+          }
+
+          if ($code -ne 0) {
+            Pop-Location
+            exit $code
+          }
+
+          Copy-Item .\\browser_runtime_host.log ..\\browser_runtime_host.log
+          Pop-Location
+
+          Write-Host "STATERAM_V02_BROWSER_NATIVE_BRIDGE=PASS"
+
+      - name: Validate reversible current-user registration
+        shell: powershell
+        run: |
+          $stage = Join-Path $PWD "bridge-install-test"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          Copy-Item .\\core-v01\\build\\Release\\StateRAM_Browser_NativeHost.exe $stage\\
+          Copy-Item .\\core-v01\\bridges\\browser\\INSTALL_BROWSER_BRIDGE_CURRENT_USER.ps1 $stage\\
+          Copy-Item .\\core-v01\\bridges\\browser\\UNINSTALL_BROWSER_BRIDGE_CURRENT_USER.ps1 $stage\\
+
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$stage\\INSTALL_BROWSER_BRIDGE_CURRENT_USER.ps1"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $hostName = "com.stateram.browser"
+          $keys = @(
+            "HKCU:\\Software\\Google\\Chrome\\NativeMessagingHosts\\$hostName",
+            "HKCU:\\Software\\Microsoft\\Edge\\NativeMessagingHosts\\$hostName",
+            "HKCU:\\Software\\Chromium\\NativeMessagingHosts\\$hostName"
+          )
+
+          $expectedManifest = Join-Path $stage "com.stateram.browser.json"
+          foreach ($key in $keys) {
+            if (-not (Test-Path $key)) { throw "Missing registry key: $key" }
+            $actual = (Get-Item $key).GetValue("")
+            if ($actual -ne $expectedManifest) { throw "Unexpected native host manifest path" }
+          }
+
+          $manifest = Get-Content $expectedManifest -Raw | ConvertFrom-Json
+          if ($manifest.name -ne $hostName) { throw "Unexpected native host name" }
+          if ($manifest.allowed_origins[0] -ne "chrome-extension://joobkllejoacdkjggddlbgljgkokccge/") {
+            throw "Unexpected allowed origin"
+          }
+
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$stage\\UNINSTALL_BROWSER_BRIDGE_CURRENT_USER.ps1"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          foreach ($key in $keys) {
+            if (Test-Path $key) { throw "Uninstall left registry key: $key" }
+          }
+
+          Write-Host "STATERAM_BROWSER_REGISTRATION_REVERSIBILITY=PASS"
+
+      - name: Find Microsoft Defender scanner
+        id: defender
+        shell: powershell
+        run: |
+          $platformRoot = Join-Path $env:ProgramData "Microsoft\\Windows Defender\\Platform"
+          $mp = $null
+          if (Test-Path $platformRoot) {
+            $latest = Get-ChildItem $platformRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1
+            if ($latest) {
+              $candidate = Join-Path $latest.FullName "MpCmdRun.exe"
+              if (Test-Path $candidate) { $mp = $candidate }
+            }
+          }
+          if (-not $mp) {
+            $candidate = Join-Path $env:ProgramFiles "Windows Defender\\MpCmdRun.exe"
+            if (Test-Path $candidate) { $mp = $candidate }
+          }
+          if (-not $mp) { throw "Microsoft Defender scanner unavailable" }
+          "mp=$mp" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Defender scan browser bridge binaries
+        shell: powershell
+        run: |
+          $mp = '${{ steps.defender.outputs.mp }}'
+          $scanDir = Join-Path $PWD "defender-browser-bridge-scan"
+          New-Item -ItemType Directory -Force -Path $scanDir | Out-Null
+
+          $files = @(
+            ".\\core-v01\\build\\Release\\stateram_core.dll",
+            ".\\core-v01\\build\\Release\\stateram_runtime_client.dll",
+            ".\\core-v01\\build\\Release\\StateRAM_Runtime_Host.exe",
+            ".\\core-v01\\build\\Release\\StateRAM_Browser_NativeHost.exe"
+          )
+
+          foreach ($f in $files) {
+            if (-not (Test-Path $f)) { throw "Missing browser bridge binary: $f" }
+            Copy-Item $f $scanDir
+          }
+
+          & $mp -Scan -ScanType 3 -File $scanDir
+          $code = $LASTEXITCODE
+
+          @(
+            "ScanTarget=$scanDir"
+            "MpCmdRunExitCode=$code"
+          ) | Set-Content -Encoding UTF8 .\\STATERAM_V02_BROWSER_DEFENDER_SCAN.txt
+
+          if ($code -ne 0) { throw "Defender browser bridge scan failed with exit code $code" }
+          Write-Host "STATERAM_V02_BROWSER_DEFENDER_SCAN=PASS"
+
+      - name: Assemble browser bridge package
+        shell: powershell
+        run: |
+          $dst = ".\\StateRAM-v0.2-Browser-Bridge"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+
+          Copy-Item .\\core-v01\\build\\Release\\stateram_core.dll $dst\\
+          Copy-Item .\\core-v01\\build\\Release\\stateram_runtime_client.dll $dst\\
+          Copy-Item .\\core-v01\\build\\Release\\StateRAM_Runtime_Host.exe $dst\\
+          Copy-Item .\\core-v01\\build\\Release\\StateRAM_Browser_NativeHost.exe $dst\\
+          Copy-Item .\\core-v01\\bridges\\browser\\INSTALL_BROWSER_BRIDGE_CURRENT_USER.ps1 $dst\\
+          Copy-Item .\\core-v01\\bridges\\browser\\UNINSTALL_BROWSER_BRIDGE_CURRENT_USER.ps1 $dst\\
+          Copy-Item .\\core-v01\\bridges\\browser\\INSTALL_BROWSER_BRIDGE.cmd $dst\\
+          Copy-Item .\\core-v01\\bridges\\browser\\UNINSTALL_BROWSER_BRIDGE.cmd $dst\\
+          Copy-Item .\\core-v01\\bridges\\browser\\RUN_STATERAM_RUNTIME.cmd $dst\\
+          Copy-Item .\\core-v01\\bridges\\browser\\README_BROWSER_BRIDGE.md $dst\\
+          Copy-Item .\\core-v01\\runtime\\README_RUNTIME.md $dst\\
+          Copy-Item .\\STATERAM_V02_BROWSER_DEFENDER_SCAN.txt $dst\\
+          Copy-Item .\\browser_native_smoke.log $dst\\
+          Copy-Item .\\browser_policy_selfcheck.log $dst\\
+
+          Copy-Item .\\core-v01\\bridges\\browser\\extension "$dst\\browser-extension" -Recurse
+
+          $files = @(
+            "$dst\\stateram_core.dll",
+            "$dst\\stateram_runtime_client.dll",
+            "$dst\\StateRAM_Runtime_Host.exe",
+            "$dst\\StateRAM_Browser_NativeHost.exe"
+          )
+
+          $lines = foreach ($f in $files) {
+            $h = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower()
+            "SHA256  $([IO.Path]::GetFileName($f))  $h"
+          }
+
+          $lines | Set-Content -Encoding ASCII "$dst\\SHA256SUMS.txt"
+
+      - name: Upload browser bridge evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: StateRAM-v0.2-Browser-Bridge-Evidence
+          path: |
+            browser_native_smoke.log
+            browser_policy_selfcheck.log
+            browser_runtime_host.log
+            STATERAM_V02_BROWSER_DEFENDER_SCAN.txt
+
+      - name: Upload browser bridge package
+        uses: actions/upload-artifact@v4
+        with:
+          name: StateRAM-v0.2-Browser-Bridge
+          path: StateRAM-v0.2-Browser-Bridge
