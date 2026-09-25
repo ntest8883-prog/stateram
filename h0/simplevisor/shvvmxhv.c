@@ -186,11 +186,8 @@ ShvVmxHandleExit (
     )
 {
     UINT8 advanceRip;
-    UINT32 i;
     UINT64 guestPhysicalAddress;
     UINT64 exitQualification;
-    UINT64* restoreTarget;
-    UINT64* restoreSource;
 
     advanceRip = TRUE;
 
@@ -211,41 +208,28 @@ ShvVmxHandleExit (
 
         if (((guestPhysicalAddress & ~((UINT64)PAGE_SIZE - 1)) ==
              VpData->H0TestPagePhysicalAddress) &&
-            (VpData->H0TestPagePhysicalAddress != 0))
+            (VpData->H0TestPagePhysicalAddress != 0) &&
+            (ShvH1BackingPagePhysicalAddress != 0))
         {
             //
-            // H1-A: the target page contains only poison at this point.
-            // Reconstruct all 4096 bytes from the separate backing page while
-            // executing in VMX root mode. EPT does not apply to these host
-            // memory accesses.
+            // H1-B: do not copy bytes back into the original physical page.
+            // Instead, keep the guest-physical address unchanged while changing
+            // its EPT leaf to point at a different host-physical page.
             //
-            restoreTarget = (UINT64*)(uintptr_t)ShvH1TestPageVirtualAddress;
-            restoreSource = (UINT64*)(uintptr_t)ShvH1BackingPageVirtualAddress;
-
-            if ((restoreTarget != NULL) && (restoreSource != NULL))
-            {
-                for (i = 0; i < (PAGE_SIZE / sizeof(UINT64)); i++)
-                {
-                    restoreTarget[i] = restoreSource[i];
-                }
-
-                _InterlockedIncrement(&ShvH1RestoreCount);
-            }
-
-            //
-            // Restore guest access only after reconstruction is complete.
-            //
+            VpData->H0EptPt[VpData->H0TestPteIndex].PageFrameNumber =
+                ShvH1BackingPagePhysicalAddress / PAGE_SIZE;
             VpData->H0EptPt[VpData->H0TestPteIndex].Read = 1;
             VpData->H0EptPt[VpData->H0TestPteIndex].Write = 1;
             VpData->H0EptPt[VpData->H0TestPteIndex].Execute = 1;
 
             ShvH0LastGuestPhysicalAddress = guestPhysicalAddress;
             ShvH0LastExitQualification = exitQualification;
+            _InterlockedIncrement(&ShvH1RemapCount);
             _InterlockedIncrement(&ShvH0EptTrapCount);
 
             //
-            // The guest memory instruction has not executed yet. Keep RIP on
-            // the same instruction so VMRESUME retries it against restored data.
+            // The guest instruction has not executed yet. Keep RIP unchanged so
+            // VMRESUME retries the same access through the new EPT translation.
             //
             advanceRip = FALSE;
         }
