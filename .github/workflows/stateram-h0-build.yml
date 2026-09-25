@@ -7,6 +7,12 @@ on:
     paths:
       - "h0/**"
       - ".github/workflows/stateram-h0-build.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "h0/**"
+      - ".github/workflows/stateram-h0-build.yml"
   workflow_dispatch:
 
 permissions:
