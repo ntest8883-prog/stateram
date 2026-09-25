@@ -1,0 +1,235 @@
+name: StateRAM v0.2 real Chrome end-to-end
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - v0.2-browser-e2e
+
+permissions:
+  contents: read
+
+jobs:
+  real-chrome-e2e:
+    runs-on: windows-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Reconstruct generated Core sources
+        shell: powershell
+        run: |
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          $coreParts = @(
+            ".\core-v01\src\stateram_core.part1",
+            ".\core-v01\src\stateram_core.part2",
+            ".\core-v01\src\stateram_core.part3",
+            ".\core-v01\src\stateram_core.part4",
+            ".\core-v01\src\stateram_core.part5",
+            ".\core-v01\src\stateram_core.part6",
+            ".\core-v01\src\stateram_core.part7"
+          )
+          $wbParts = @(
+            ".\core-v01\workbench\workbench_win32.part1",
+            ".\core-v01\workbench\workbench_win32.part2",
+            ".\core-v01\workbench\workbench_win32.part3a",
+            ".\core-v01\workbench\workbench_win32.part3b"
+          )
+          $evalParts = @(
+            ".\core-v01\evaluation\evaluator.part1",
+            ".\core-v01\evaluation\evaluator.part2",
+            ".\core-v01\evaluation\evaluator.part3",
+            ".\core-v01\evaluation\evaluator.part4"
+          )
+          foreach ($f in ($coreParts + $wbParts + $evalParts)) {
+            if (-not (Test-Path $f)) { throw "Missing source part: $f" }
+          }
+          $core = ($coreParts | ForEach-Object { Get-Content $_ -Raw }) -join ""
+          [IO.File]::WriteAllText("$PWD\core-v01\src\stateram_core.cpp", $core, $utf8)
+          $wb = ($wbParts | ForEach-Object { Get-Content $_ -Raw }) -join ""
+          [IO.File]::WriteAllText("$PWD\core-v01\workbench\workbench_win32.cpp", $wb, $utf8)
+          $ev = ($evalParts | ForEach-Object { Get-Content $_ -Raw }) -join ""
+          [IO.File]::WriteAllText("$PWD\core-v01\evaluation\evaluator_win32.cpp", $ev, $utf8)
+          Write-Host "STATERAM_E2E_SOURCE_RECONSTRUCTION=PASS"
+
+      - name: Build exact candidate
+        shell: powershell
+        run: |
+          cmake -S .\core-v01 -B .\core-v01\build -A x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build .\core-v01\build --config Release --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "STATERAM_E2E_BUILD=PASS"
+
+      - name: Prepare exact current-user browser registration
+        shell: powershell
+        run: |
+          $stage = Join-Path $PWD "browser-e2e-stage"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item .\core-v01\build\Release\StateRAM_Browser_NativeHost.exe $stage\
+          Copy-Item .\core-v01\bridges\browser\INSTALL_BROWSER_BRIDGE_CURRENT_USER.ps1 $stage\
+          Copy-Item .\core-v01\bridges\browser\UNINSTALL_BROWSER_BRIDGE_CURRENT_USER.ps1 $stage\
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$stage\INSTALL_BROWSER_BRIDGE_CURRENT_USER.ps1"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "STATERAM_E2E_NATIVE_REGISTRATION=PASS"
+
+      - name: Install Puppeteer test harness
+        shell: powershell
+        run: |
+          $env:PUPPETEER_SKIP_DOWNLOAD = "true"
+          npm install puppeteer@25.12.0 --no-save --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node -e "console.log(require('puppeteer/package.json').version)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Real Chrome end-to-end
+        shell: powershell
+        run: |
+          $runtimeLog = Join-Path $PWD "stateram_real_chrome_runtime.log"
+          $runtimeErr = Join-Path $PWD "stateram_real_chrome_runtime_error.log"
+          $runtimeHost = Start-Process -FilePath ".\core-v01\build\Release\StateRAM_Runtime_Host.exe" -ArgumentList "--test-pressure=3" -WorkingDirectory $PWD -RedirectStandardOutput $runtimeLog -RedirectStandardError $runtimeErr -PassThru
+          try {
+            Start-Sleep -Milliseconds 800
+            node .\core-v01\bridges\browser\browser_real_e2e.mjs .\core-v01\bridges\browser\extension .\stateram_real_chrome_e2e.json
+            if ($LASTEXITCODE -ne 0) { throw "Real Chrome end-to-end failed with exit code $LASTEXITCODE" }
+            $r = Get-Content .\stateram_real_chrome_e2e.json -Raw | ConvertFrom-Json
+            if (-not $r.pass) { throw "E2E result did not pass" }
+            if ($r.controlledRuntimePressure -ne 3) { throw "Runtime pressure was not 3" }
+            if ($r.realIdleSeconds -lt 60) { throw "Cold tabs were not really idle for >=60 seconds" }
+            if ($r.coldTabsDiscarded -ne 4) { throw "Expected four cold tabs to be discarded" }
+            if (-not $r.activeTabProtected) { throw "Active tab was not protected" }
+            if (-not $r.pinnedTabProtected) { throw "Pinned tab was not protected" }
+            if (-not $r.discardedTabReconstructed) { throw "Discarded tab did not reconstruct" }
+            if (-not $r.realHttpReloadObserved) { throw "No real HTTP reload was observed" }
+            Write-Host "STATERAM_REAL_CHROME_FULL_CHAIN=PASS"
+            $r | ConvertTo-Json -Depth 8
+          }
+          finally {
+            if ($runtimeHost -and -not $runtimeHost.HasExited) {
+              Stop-Process -Id $runtimeHost.Id -Force
+              $runtimeHost.WaitForExit()
+            }
+          }
+
+      - name: Remove browser native registration and verify clean state
+        if: always()
+        shell: powershell
+        run: |
+          $stage = Join-Path $PWD "browser-e2e-stage"
+          if (Test-Path "$stage\UNINSTALL_BROWSER_BRIDGE_CURRENT_USER.ps1") {
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$stage\UNINSTALL_BROWSER_BRIDGE_CURRENT_USER.ps1"
+          }
+          $hostName = "com.stateram.browser"
+          $keys = @(
+            "HKCU:\Software\Google\Chrome\NativeMessagingHosts\$hostName",
+            "HKCU:\Software\Microsoft\Edge\NativeMessagingHosts\$hostName",
+            "HKCU:\Software\Chromium\NativeMessagingHosts\$hostName"
+          )
+          foreach ($key in $keys) {
+            if (Test-Path $key) { throw "StateRAM browser registration remained after uninstall: $key" }
+          }
+          Write-Host "STATERAM_REAL_CHROME_CLEAN_UNINSTALL=PASS"
+
+      - name: Defender scan exact candidate
+        if: success()
+        shell: powershell
+        run: |
+          $platformRoot = Join-Path $env:ProgramData "Microsoft\Windows Defender\Platform"
+          $mp = $null
+          if (Test-Path $platformRoot) {
+            $latest = Get-ChildItem $platformRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1
+            if ($latest) {
+              $candidate = Join-Path $latest.FullName "MpCmdRun.exe"
+              if (Test-Path $candidate) { $mp = $candidate }
+            }
+          }
+          if (-not $mp) {
+            $candidate = Join-Path $env:ProgramFiles "Windows Defender\MpCmdRun.exe"
+            if (Test-Path $candidate) { $mp = $candidate }
+          }
+          if (-not $mp) { throw "Microsoft Defender scanner unavailable" }
+          $scanDir = Join-Path $PWD "stateram-e2e-defender"
+          New-Item -ItemType Directory -Force -Path $scanDir | Out-Null
+          @(
+            ".\core-v01\build\Release\stateram_core.dll",
+            ".\core-v01\build\Release\stateram_runtime_client.dll",
+            ".\core-v01\build\Release\StateRAM_Runtime_Host.exe",
+            ".\core-v01\build\Release\StateRAM_Browser_NativeHost.exe"
+          ) | ForEach-Object { Copy-Item $_ $scanDir }
+          & $mp -Scan -ScanType 3 -File $scanDir
+          $code = $LASTEXITCODE
+          @(
+            "MpCmdRunExitCode=$code"
+            "CandidateCommit=$env:GITHUB_SHA"
+          ) | Set-Content -Encoding UTF8 .\STATERAM_REAL_CHROME_DEFENDER.txt
+          if ($code -ne 0) { throw "Defender scan failed: $code" }
+          Write-Host "STATERAM_REAL_CHROME_DEFENDER=PASS"
+
+      - name: Assemble install candidate
+        if: success()
+        shell: powershell
+        run: |
+          $dst = ".\StateRAM-v0.2-Real-Browser-Candidate"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          Copy-Item .\core-v01\build\Release\stateram_core.dll $dst\
+          Copy-Item .\core-v01\build\Release\stateram_runtime_client.dll $dst\
+          Copy-Item .\core-v01\build\Release\StateRAM_Runtime_Host.exe $dst\
+          Copy-Item .\core-v01\build\Release\StateRAM_Browser_NativeHost.exe $dst\
+          Copy-Item .\core-v01\bridges\browser\INSTALL_BROWSER_BRIDGE_CURRENT_USER.ps1 $dst\
+          Copy-Item .\core-v01\bridges\browser\UNINSTALL_BROWSER_BRIDGE_CURRENT_USER.ps1 $dst\
+          Copy-Item .\core-v01\bridges\browser\INSTALL_BROWSER_BRIDGE.cmd $dst\
+          Copy-Item .\core-v01\bridges\browser\UNINSTALL_BROWSER_BRIDGE.cmd $dst\
+          Copy-Item .\core-v01\bridges\browser\RUN_STATERAM_RUNTIME.cmd $dst\
+          Copy-Item .\core-v01\bridges\browser\README_BROWSER_BRIDGE.md $dst\
+          Copy-Item .\core-v01\runtime\README_RUNTIME.md $dst\
+          Copy-Item .\core-v01\bridges\browser\extension "$dst\browser-extension" -Recurse
+          Copy-Item .\stateram_real_chrome_e2e.json $dst\
+          Copy-Item .\STATERAM_REAL_CHROME_DEFENDER.txt $dst\
+          @'
+          StateRAM v0.2 real-browser candidate
+
+          This exact binary/extension set completed the disposable Windows + real Chrome
+          end-to-end validation contained in stateram_real_chrome_e2e.json.
+
+          Normal use:
+          1. Run INSTALL_BROWSER_BRIDGE.cmd as a normal user.
+          2. Load browser-extension as an unpacked extension in Chrome or Edge.
+          3. Run RUN_STATERAM_RUNTIME.cmd while using the browser.
+          4. Use UNINSTALL_BROWSER_BRIDGE.cmd to remove the current-user native registration.
+
+          IMPORTANT:
+          The CI-only --test-pressure option exists only for disposable validation.
+          RUN_STATERAM_RUNTIME.cmd does not use it. Normal runs use actual Windows memory pressure.
+          '@ | Set-Content -Encoding UTF8 "$dst\README_FIRST.txt"
+          $hashFiles = @(
+            "$dst\stateram_core.dll",
+            "$dst\stateram_runtime_client.dll",
+            "$dst\StateRAM_Runtime_Host.exe",
+            "$dst\StateRAM_Browser_NativeHost.exe"
+          )
+          $hashes = foreach ($f in $hashFiles) {
+            $h = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower()
+            "SHA256  $([IO.Path]::GetFileName($f))  $h"
+          }
+          $hashes | Set-Content -Encoding ASCII "$dst\SHA256SUMS.txt"
+
+      - name: Upload end-to-end evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: StateRAM-v0.2-Real-Browser-E2E-Evidence
+          path: |
+            stateram_real_chrome_e2e.json
+            stateram_real_chrome_runtime.log
+            stateram_real_chrome_runtime_error.log
+            STATERAM_REAL_CHROME_DEFENDER.txt
+          if-no-files-found: ignore
+
+      - name: Upload install candidate
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: StateRAM-v0.2-Real-Browser-Candidate
+          path: StateRAM-v0.2-Real-Browser-Candidate
