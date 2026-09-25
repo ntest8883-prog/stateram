@@ -1,0 +1,311 @@
+#ifdef _WIN32
+#define _WIN32_WINNT 0x0602
+#define NOMINMAX
+#include <windows.h>
+
+#include "stateram_core.h"
+
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+static constexpr uint64_t KB = 1024ull;
+static constexpr uint64_t MB = 1024ull * 1024ull;
+static constexpr uint64_t GB = 1024ull * MB;
+static constexpr uint64_t MAX_LOGICAL = 3500ull * MB;
+static constexpr uint64_t MAX_SINGLE_FILE = 256ull * MB;
+static constexpr size_t MAX_FILES = 2000;
+static constexpr uint64_t SEARCH_CHUNK = 1ull * MB;
+
+struct FileMeta {
+    uint64_t size = 0;
+    uint64_t write_time = 0;
+};
+
+struct FileBacking {
+    std::wstring path;
+    uint64_t size = 0;
+    uint64_t write_time = 0;
+};
+
+struct ManagedFile {
+    std::wstring path;
+    std::string display;
+    std::unique_ptr<FileBacking> backing;
+    SRObjectId object_id = 0;
+};
+
+static uint64_t filetime64(const FILETIME& ft) {
+    ULARGE_INTEGER u{};
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    return u.QuadPart;
+}
+
+static bool query_file_meta(const std::wstring& path, FileMeta& out) {
+    HANDLE h = CreateFileW(
+        path.c_str(),
+        FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER size{};
+    FILETIME create{}, access{}, write{};
+    const bool ok =
+        GetFileSizeEx(h, &size) != FALSE &&
+        GetFileTime(h, &create, &access, &write) != FALSE;
+
+    CloseHandle(h);
+
+    if (!ok || size.QuadPart < 0) return false;
+
+    out.size = static_cast<uint64_t>(size.QuadPart);
+    out.write_time = filetime64(write);
+    return true;
+}
+
+static int file_read_cb(
+    SRObjectId,
+    uint64_t offset,
+    uint64_t length,
+    void* destination,
+    void* user
+) {
+    auto* b = static_cast<FileBacking*>(user);
+    if (!b || !destination) return 0;
+    if (offset > b->size || length > b->size - offset) return 0;
+
+    FileMeta now{};
+    if (!query_file_meta(b->path, now)) return 0;
+
+    /* Fail closed when the backing file changes during a session. */
+    if (now.size != b->size || now.write_time != b->write_time) {
+        return 0;
+    }
+
+    HANDLE h = CreateFileW(
+        b->path.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_SEQUENTIAL_SCAN,
+        nullptr);
+
+    if (h == INVALID_HANDLE_VALUE) return 0;
+
+    LARGE_INTEGER pos{};
+    pos.QuadPart = static_cast<LONGLONG>(offset);
+
+    bool ok =
+        SetFilePointerEx(h, pos, nullptr, FILE_BEGIN) != FALSE;
+
+    uint8_t* out = static_cast<uint8_t*>(destination);
+    uint64_t remaining = length;
+
+    while (ok && remaining > 0) {
+        const DWORD ask = static_cast<DWORD>(
+            std::min<uint64_t>(remaining, 4ull * MB));
+
+        DWORD got = 0;
+        if (!ReadFile(h, out, ask, &got, nullptr) || got == 0) {
+            ok = false;
+            break;
+        }
+
+        out += got;
+        remaining -= got;
+    }
+
+    CloseHandle(h);
+    return ok && remaining == 0 ? 1 : 0;
+}
+
+static std::string utf8_from_wide(const std::wstring& w) {
+    if (w.empty()) return {};
+
+    const int n = WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        w.c_str(),
+        static_cast<int>(w.size()),
+        nullptr,
+        0,
+        nullptr,
+        nullptr);
+
+    if (n <= 0) return {};
+
+    std::string out(static_cast<size_t>(n), '\0');
+
+    WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        w.c_str(),
+        static_cast<int>(w.size()),
+        out.data(),
+        n,
+        nullptr,
+        nullptr);
+
+    return out;
+}
+
+static std::string ascii_lower(std::string s) {
+    for (char& c : s) {
+        c = static_cast<char>(
+            std::tolower(static_cast<unsigned char>(c)));
+    }
+    return s;
+}
+
+static std::wstring lower_ext(std::wstring s) {
+    for (wchar_t& c : s) c = static_cast<wchar_t>(towlower(c));
+    return s;
+}
+
+static bool supported_extension(const fs::path& p) {
+    static const std::unordered_set<std::wstring> ext = {
+        L".txt", L".md", L".markdown", L".c", L".cc", L".cpp", L".cxx",
+        L".h", L".hh", L".hpp", L".py", L".js", L".ts", L".tsx", L".jsx",
+        L".java", L".cs", L".go", L".rs", L".swift", L".kt", L".kts",
+        L".json", L".yaml", L".yml", L".toml", L".ini", L".cfg", L".conf",
+        L".xml", L".html", L".htm", L".css", L".scss", L".sql", L".sh",
+        L".ps1", L".bat", L".cmd", L".log", L".csv"
+    };
+
+    return ext.count(lower_ext(p.extension().wstring())) != 0;
+}
+
+static double now_ms() {
+    static LARGE_INTEGER freq = [] {
+        LARGE_INTEGER f{};
+        QueryPerformanceFrequency(&f);
+        return f;
+    }();
+
+    LARGE_INTEGER q{};
+    QueryPerformanceCounter(&q);
+
+    return 1000.0 *
+        static_cast<double>(q.QuadPart) /
+        static_cast<double>(freq.QuadPart);
+}
+
+class FolderWorkspace {
+public:
+    ~FolderWorkspace() {
+        if (ctx_) sr_context_destroy(ctx_);
+    }
+
+    bool open_folder(const fs::path& root) {
+        SRContextConfig cfg{};
+        cfg.target_raw_bytes = 256ull * MB;
+        cfg.hard_raw_bytes = 512ull * MB;
+        cfg.foreground_burst_bytes = 64ull * MB;
+        cfg.comfortable_available_bytes = 1024ull * MB;
+        cfg.emergency_available_bytes = 640ull * MB;
+        cfg.background_period_ms = 25;
+        cfg.prewarm_segments_per_hint = 2;
+        cfg.overlay_consolidate_pages = 16;
+
+        if (sr_context_create(&cfg, &ctx_) != SR_OK) return false;
+
+        std::error_code ec;
+        if (!fs::exists(root, ec) || !fs::is_directory(root, ec)) return false;
+
+        root_ = fs::weakly_canonical(root, ec);
+        if (ec) root_ = root;
+
+        uint64_t logical = 0;
+
+        fs::recursive_directory_iterator it(
+            root_,
+            fs::directory_options::skip_permission_denied,
+            ec);
+
+        const fs::recursive_directory_iterator end;
+
+        for (; !ec && it != end; it.increment(ec)) {
+            if (files_.size() >= MAX_FILES) break;
+
+            const fs::directory_entry& e = *it;
+            if (!e.is_regular_file(ec) || ec) {
+                ec.clear();
+                continue;
+            }
+
+            if (!supported_extension(e.path())) continue;
+
+            FileMeta meta{};
+            const std::wstring full = e.path().wstring();
+
+            if (!query_file_meta(full, meta)) continue;
+            if (meta.size == 0 || meta.size > MAX_SINGLE_FILE) continue;
+            if (logical + meta.size > MAX_LOGICAL) break;
+
+            auto backing = std::make_unique<FileBacking>();
+            backing->path = full;
+            backing->size = meta.size;
+            backing->write_time = meta.write_time;
+
+            SRObjectDescriptor d{};
+            d.name = "real-file";
+            d.logical_size = meta.size;
+            d.critical_prefix_bytes = std::min<uint64_t>(meta.size, 256ull * KB);
+            d.semantic_class = SR_SEM_FILE_BACKED_ASSET;
+            d.backing_kind = SR_BACKING_FILE;
+            d.backing_read = file_read_cb;
+            d.user = backing.get();
+
+            SRObjectId id = 0;
+            if (sr_register_object(
+                    ctx_,
+                    &d,
+                    nullptr,
+                    0,
+                    &id) != SR_OK) {
+                continue;
+            }
+
+            ManagedFile mf{};
+            mf.path = full;
+
+            std::error_code rec;
+            fs::path rel = fs::relative(e.path(), root_, rec);
+            mf.display = utf8_from_wide(
+                (rec ? e.path().filename() : rel).wstring());
+
+            mf.backing = std::move(backing);
+            mf.object_id = id;
+
+            logical += meta.size;
+            files_.push_back(std::move(mf));
+        }
+
+        return !files_.empty();
+    }
+
+    size_t file_count() const { return files_.size(); }
+
+    uint64_t logical_bytes() const {
+        SRStats s{};
+        if (ctx_) sr_get_stats(ctx_, &s);
+        return s.logical_bytes;
+    }

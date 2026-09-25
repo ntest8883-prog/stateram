@@ -1,0 +1,488 @@
+    void print_files(size_t limit = 100) const {
+        const size_t n = std::min(limit, files_.size());
+        for (size_t i = 0; i < n; ++i) {
+            std::cout
+                << std::setw(4) << i
+                << "  "
+                << files_[i].display
+                << "  ("
+                << (files_[i].backing->size / 1024.0)
+                << " KiB)\n";
+        }
+
+        if (files_.size() > n) {
+            std::cout
+                << "... "
+                << (files_.size() - n)
+                << " more files\n";
+        }
+    }
+
+    bool print_stats() const {
+        SRStats s{};
+        if (sr_get_stats(ctx_, &s) != SR_OK) return false;
+
+        std::cout
+            << "files=" << files_.size() << "\n"
+            << "logical_mb="
+            << std::fixed << std::setprecision(2)
+            << (s.logical_bytes / static_cast<double>(MB))
+            << "\nraw_mb="
+            << (s.raw_resident_bytes / static_cast<double>(MB))
+            << "\noverlay_kb="
+            << (s.overlay_bytes / static_cast<double>(KB))
+            << "\npromotions=" << s.promotions
+            << "\nevictions=" << s.streaming_evictions
+            << "\npromotion_failures=" << s.promotion_failures
+            << "\n";
+        return true;
+    }
+
+    bool show_file(size_t index, size_t bytes = 16 * 1024) {
+        if (index >= files_.size()) return false;
+        auto& f = files_[index];
+
+        const uint64_t length =
+            std::min<uint64_t>(bytes, f.backing->size);
+
+        SRLease lease = nullptr;
+        const double t0 = now_ms();
+
+        const int rc = sr_acquire(
+            ctx_,
+            f.object_id,
+            0,
+            length,
+            SR_ACCESS_READ,
+            SR_LATENCY_INTERACTIVE,
+            &lease);
+
+        if (rc != SR_OK) {
+            std::cerr
+                << "StateRAM could not reconstruct the file. "
+                << "If the file changed externally, reopen the workspace.\n";
+            return false;
+        }
+
+        const auto* p =
+            static_cast<const uint8_t*>(
+                sr_lease_data(lease));
+
+        std::string text(
+            reinterpret_cast<const char*>(p),
+            reinterpret_cast<const char*>(p) + length);
+
+        sr_release(lease);
+
+        for (char& c : text) {
+            const unsigned char u =
+                static_cast<unsigned char>(c);
+
+            if (u == 0) c = ' ';
+            else if (u < 9) c = ' ';
+        }
+
+        std::cout
+            << "\n--- "
+            << f.display
+            << " ---\n"
+            << text
+            << "\n--- end preview ("
+            << std::fixed << std::setprecision(3)
+            << (now_ms() - t0)
+            << " ms) ---\n";
+
+        sr_hint_hot(ctx_, f.object_id);
+        return true;
+    }
+
+    struct SearchResult {
+        size_t file_index = 0;
+        uint64_t offset = 0;
+    };
+
+    bool search(
+        const std::string& needle,
+        std::vector<SearchResult>& out,
+        size_t max_results = 100
+    ) {
+        out.clear();
+        if (needle.empty()) return false;
+
+        const std::string wanted =
+            ascii_lower(needle);
+
+        const double t0 = now_ms();
+        uint64_t scanned = 0;
+
+        for (size_t fi = 0; fi < files_.size(); ++fi) {
+            auto& f = files_[fi];
+            const uint64_t size = f.backing->size;
+
+            std::string carry;
+
+            for (uint64_t off = 0; off < size; off += SEARCH_CHUNK) {
+                const uint64_t len =
+                    std::min<uint64_t>(
+                        SEARCH_CHUNK,
+                        size - off);
+
+                SRLease lease = nullptr;
+
+                const int rc = sr_acquire(
+                    ctx_,
+                    f.object_id,
+                    off,
+                    len,
+                    SR_ACCESS_READ,
+                    SR_LATENCY_NORMAL,
+                    &lease);
+
+                if (rc != SR_OK) {
+                    std::cerr
+                        << "Search stopped because a backing file changed "
+                        << "or could not be reconstructed: "
+                        << f.display
+                        << "\n";
+                    return false;
+                }
+
+                const auto* p =
+                    static_cast<const char*>(
+                        sr_lease_data(lease));
+
+                std::string block = carry;
+                block.append(
+                    p,
+                    p + static_cast<size_t>(len));
+
+                sr_release(lease);
+                scanned += len;
+
+                const std::string lower =
+                    ascii_lower(block);
+
+                size_t pos = 0;
+                while ((pos = lower.find(wanted, pos))
+                       != std::string::npos) {
+                    uint64_t absolute = 0;
+
+                    if (off == 0) {
+                        absolute =
+                            static_cast<uint64_t>(pos);
+                    } else {
+                        const uint64_t carry_bytes =
+                            static_cast<uint64_t>(
+                                carry.size());
+
+                        if (pos < carry_bytes) {
+                            const uint64_t from_previous =
+                                carry_bytes - pos;
+
+                            if (from_previous > off) {
+                                ++pos;
+                                continue;
+                            }
+
+                            absolute =
+                                off - from_previous;
+                        } else {
+                            absolute =
+                                off +
+                                static_cast<uint64_t>(
+                                    pos - carry.size());
+                        }
+                    }
+
+                    out.push_back({fi, absolute});
+
+                    if (out.size() >= max_results) {
+                        sr_hint_cold(ctx_, f.object_id);
+
+                        const double elapsed =
+                            now_ms() - t0;
+
+                        std::cout
+                            << "search_ms="
+                            << std::fixed
+                            << std::setprecision(3)
+                            << elapsed
+                            << " scanned_mb="
+                            << (scanned / static_cast<double>(MB))
+                            << " capped_results="
+                            << out.size()
+                            << "\n";
+
+                        return true;
+                    }
+
+                    ++pos;
+                }
+
+                const size_t overlap =
+                    wanted.size() > 1
+                        ? wanted.size() - 1
+                        : 0;
+
+                if (overlap == 0) {
+                    carry.clear();
+                } else if (block.size() <= overlap) {
+                    carry = block;
+                } else {
+                    carry =
+                        block.substr(
+                            block.size() - overlap);
+                }
+            }
+
+            sr_hint_cold(ctx_, f.object_id);
+        }
+
+        const double elapsed =
+            now_ms() - t0;
+
+        std::cout
+            << "search_ms="
+            << std::fixed
+            << std::setprecision(3)
+            << elapsed
+            << " scanned_mb="
+            << (scanned / static_cast<double>(MB))
+            << " results="
+            << out.size()
+            << "\n";
+
+        return true;
+    }
+
+    void print_results(
+        const std::vector<SearchResult>& results
+    ) const {
+        if (results.empty()) {
+            std::cout << "No matches.\n";
+            return;
+        }
+
+        for (size_t i = 0; i < results.size(); ++i) {
+            const auto& r = results[i];
+            if (r.file_index >= files_.size()) continue;
+
+            std::cout
+                << std::setw(3) << i + 1
+                << "  "
+                << files_[r.file_index].display
+                << "  byte "
+                << r.offset
+                << "\n";
+        }
+    }
+
+    SRStats stats() const {
+        SRStats s{};
+        if (ctx_) sr_get_stats(ctx_, &s);
+        return s;
+    }
+
+    bool trim(uint64_t target = 64ull * MB) {
+        const int rc =
+            sr_trim(ctx_, target);
+
+        SRStats s{};
+        sr_get_stats(ctx_, &s);
+
+        std::cout
+            << "trim_rc=" << rc
+            << " raw_mb="
+            << std::fixed << std::setprecision(2)
+            << (s.raw_resident_bytes /
+                static_cast<double>(MB))
+            << "\n";
+
+        return rc == SR_OK;
+    }
+
+private:
+    SRContext ctx_ = nullptr;
+    fs::path root_;
+    std::vector<ManagedFile> files_;
+};
+
+static void print_help() {
+    std::cout
+        << "\nCommands:\n"
+        << "  files              list managed files\n"
+        << "  open N             preview file N\n"
+        << "  search TEXT        search the real folder through StateRAM\n"
+        << "  stats              show logical/raw StateRAM footprint\n"
+        << "  trim               compact cold raw state\n"
+        << "  help               show commands\n"
+        << "  quit               exit\n\n";
+}
+
+static int run_interactive(const fs::path& root) {
+    FolderWorkspace ws;
+
+    std::cout
+        << "Opening real folder: "
+        << utf8_from_wide(root.wstring())
+        << "\n";
+
+    if (!ws.open_folder(root)) {
+        std::cerr
+            << "No supported readable files were found, "
+            << "or StateRAM could not initialize.\n";
+        return 2;
+    }
+
+    std::cout
+        << "StateRAM real-folder workspace ready.\n";
+    ws.print_stats();
+    print_help();
+
+    std::string line;
+
+    for (;;) {
+        std::cout << "stateram> ";
+        if (!std::getline(std::cin, line)) break;
+
+        if (line == "quit" || line == "exit") break;
+        if (line == "help") {
+            print_help();
+            continue;
+        }
+        if (line == "files") {
+            ws.print_files();
+            continue;
+        }
+        if (line == "stats") {
+            ws.print_stats();
+            continue;
+        }
+        if (line == "trim") {
+            ws.trim();
+            continue;
+        }
+
+        if (line.rfind("open ", 0) == 0) {
+            try {
+                const size_t index =
+                    static_cast<size_t>(
+                        std::stoull(
+                            line.substr(5)));
+
+                if (!ws.show_file(index)) {
+                    std::cout << "Could not open that file index.\n";
+                }
+            } catch (...) {
+                std::cout << "Usage: open N\n";
+            }
+            continue;
+        }
+
+        if (line.rfind("search ", 0) == 0) {
+            const std::string q =
+                line.substr(7);
+
+            std::vector<FolderWorkspace::SearchResult> results;
+
+            if (ws.search(q, results)) {
+                ws.print_results(results);
+                ws.print_stats();
+            }
+            continue;
+        }
+
+        std::cout << "Unknown command. Type help.\n";
+    }
+
+    return 0;
+}
+
+static int run_smoke(
+    const fs::path& root,
+    const std::string& needle
+) {
+    FolderWorkspace ws;
+    if (!ws.open_folder(root)) return 10;
+
+    std::vector<FolderWorkspace::SearchResult> results;
+    if (!ws.search(needle, results, 5000)) return 11;
+
+    if (results.empty()) return 12;
+    if (!ws.show_file(0, 4096)) return 13;
+
+    const bool trim_ok =
+        ws.trim(32ull * MB);
+
+    const SRStats s = ws.stats();
+
+    std::ofstream out(
+        "stateram_v02_folder_smoke.json",
+        std::ios::binary);
+
+    out
+        << "{\n"
+        << "  \"files\": "
+        << ws.file_count()
+        << ",\n"
+        << "  \"logical_mb\": "
+        << std::fixed
+        << std::setprecision(3)
+        << (ws.logical_bytes() /
+            static_cast<double>(MB))
+        << ",\n"
+        << "  \"matches\": "
+        << results.size()
+        << ",\n"
+        << "  \"raw_mb_after_trim\": "
+        << (s.raw_resident_bytes / static_cast<double>(MB))
+        << ",\n"
+        << "  \"promotions\": "
+        << s.promotions
+        << ",\n"
+        << "  \"streaming_evictions\": "
+        << s.streaming_evictions
+        << ",\n"
+        << "  \"promotion_failures\": "
+        << s.promotion_failures
+        << ",\n"
+        << "  \"trim_pass\": "
+        << (trim_ok ? "true" : "false")
+        << ",\n"
+        << "  \"pass\": "
+        << (trim_ok ? "true" : "false")
+        << "\n"
+        << "}\n";
+
+    std::cout
+        << "STATERAM_V02_REAL_FOLDER_SMOKE="
+        << (trim_ok ? "PASS" : "FAIL")
+        << "\n";
+
+    return trim_ok ? 0 : 14;
+}
+
+int wmain(int argc, wchar_t** argv) {
+    if (argc >= 4 &&
+        std::wstring(argv[1]) == L"--smoke") {
+
+        return run_smoke(
+            fs::path(argv[2]),
+            utf8_from_wide(argv[3]));
+    }
+
+    if (argc < 2) {
+        std::wcout
+            << L"Usage:\n"
+            << L"  StateRAM_FolderWorkspace.exe <folder>\n\n"
+            << L"Example:\n"
+            << L"  StateRAM_FolderWorkspace.exe C:\\path\\to\\project\n";
+        return 1;
+    }
+
+    return run_interactive(
+        fs::path(argv[1]));
+}
+#else
+int main() { return 1; }
+#endif
