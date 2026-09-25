@@ -222,14 +222,22 @@ const done = arguments[arguments.length - 1];
         time.sleep(65)
 
         snapshot_script = r"""
-const ids = arguments[0];
+const baseUrl = arguments[0];
 const done = arguments[arguments.length - 1];
 
 (async () => {
   const out = {};
-  for (const id of [ids.pinned, ...ids.cold, ids.active]) {
-    const tab = await chrome.tabs.get(id);
-    out[String(id)] = {
+  const allTabs = await chrome.tabs.query({});
+
+  for (const tab of allTabs) {
+    const url = tab.url || tab.pendingUrl || "";
+    if (!url.startsWith(baseUrl + "/")) continue;
+
+    const remainder = url.slice((baseUrl + "/").length);
+    const name = remainder.split(/[?#]/, 1)[0];
+
+    out[name] = {
+      id: tab.id,
       active: tab.active,
       pinned: tab.pinned,
       discarded: tab.discarded,
@@ -251,21 +259,46 @@ const done = arguments[arguments.length - 1];
   done({ok: false, error: String(error)});
 });
 """
-        before = fail_if_js_error(
-            driver.execute_async_script(snapshot_script, setup),
-            "pre-policy snapshot",
-        )
 
-        automatically_discarded = [
-            tab_id
-            for tab_id in setup["cold"]
-            if before["tabs"][str(tab_id)]["discarded"]
+        expected_names = [
+            "pinned",
+            "cold1",
+            "cold2",
+            "cold3",
+            "cold4",
+            "active",
         ]
 
-        if before["tabs"][str(setup["active"])]["discarded"]:
+        def require_test_tabs(snapshot, label):
+            missing = [
+                name
+                for name in expected_names
+                if name not in snapshot["tabs"]
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"{label}: browser lost test tabs {missing}; "
+                    f"snapshot={snapshot}"
+                )
+
+        before = fail_if_js_error(
+            driver.execute_async_script(snapshot_script, base_url),
+            "pre-policy snapshot",
+        )
+        require_test_tabs(before, "pre-policy snapshot")
+
+        cold_names = ["cold1", "cold2", "cold3", "cold4"]
+
+        automatically_discarded = [
+            name
+            for name in cold_names
+            if before["tabs"][name]["discarded"]
+        ]
+
+        if before["tabs"]["active"]["discarded"]:
             raise RuntimeError("active tab was discarded by automatic policy")
 
-        if before["tabs"][str(setup["pinned"])]["discarded"]:
+        if before["tabs"]["pinned"]["discarded"]:
             raise RuntimeError("pinned tab was discarded by automatic policy")
 
         # The extension's natural one-minute alarm may already have fired by
@@ -293,14 +326,15 @@ const done = arguments[arguments.length - 1];
 
         while time.time() < deadline:
             after = fail_if_js_error(
-                driver.execute_async_script(snapshot_script, setup),
+                driver.execute_async_script(snapshot_script, base_url),
                 "post-policy snapshot",
             )
+            require_test_tabs(after, "post-policy snapshot")
 
             discarded = [
-                tab_id
-                for tab_id in setup["cold"]
-                if after["tabs"][str(tab_id)]["discarded"]
+                name
+                for name in cold_names
+                if after["tabs"][name]["discarded"]
             ]
 
             if len(discarded) == 4:
@@ -311,10 +345,12 @@ const done = arguments[arguments.length - 1];
         if after is None:
             raise RuntimeError("no post-policy snapshot")
 
+        require_test_tabs(after, "final post-policy snapshot")
+
         discarded = [
-            tab_id
-            for tab_id in setup["cold"]
-            if after["tabs"][str(tab_id)]["discarded"]
+            name
+            for name in cold_names
+            if after["tabs"][name]["discarded"]
         ]
 
         if len(discarded) != 4:
@@ -323,10 +359,10 @@ const done = arguments[arguments.length - 1];
                 f"got {len(discarded)}; state={after}"
             )
 
-        if after["tabs"][str(setup["active"])]["discarded"]:
+        if after["tabs"]["active"]["discarded"]:
             raise RuntimeError("StateRAM discarded active tab")
 
-        if after["tabs"][str(setup["pinned"])]["discarded"]:
+        if after["tabs"]["pinned"]["discarded"]:
             raise RuntimeError("StateRAM discarded pinned tab")
 
         if int(after["state"]["lastPressure"]) != 3:
@@ -339,7 +375,8 @@ const done = arguments[arguments.length - 1];
                 f"discard accounting too small: {after['state']}"
             )
 
-        reload_id = setup["cold"][0]
+        reload_id = int(after["tabs"]["cold1"]["id"])
+        original_reload_id = int(setup["cold"][0])
         requests_before = STATE.get("cold1")
 
         activate_script = r"""
@@ -357,28 +394,17 @@ chrome.tabs.update(tabId, {active: true})
         reload_state = None
         reload_deadline = time.time() + 20
 
-        single_tab_script = r"""
-const tabId = arguments[0];
-const done = arguments[arguments.length - 1];
-chrome.tabs.get(tabId)
-  .then(tab => done({
-    ok: true,
-    tab: {
-      active: tab.active,
-      discarded: tab.discarded,
-      status: tab.status,
-      title: tab.title,
-      url: tab.url
-    }
-  }))
-  .catch(error => done({ok: false, error: String(error)}));
-"""
-
         while time.time() < reload_deadline:
-            reload_state = fail_if_js_error(
-                driver.execute_async_script(single_tab_script, reload_id),
+            current = fail_if_js_error(
+                driver.execute_async_script(snapshot_script, base_url),
                 "reload snapshot",
-            )["tab"]
+            )
+
+            if "cold1" not in current["tabs"]:
+                time.sleep(0.3)
+                continue
+
+            reload_state = current["tabs"]["cold1"]
 
             if (
                 reload_state["active"]
@@ -420,14 +446,11 @@ chrome.tabs.get(tabId)
                 automatically_discarded
             ),
             "coldTabsDiscarded": len(discarded),
-            "activeTabProtected": not after["tabs"][str(setup["active"])][
-                "discarded"
-            ],
-            "pinnedTabProtected": not after["tabs"][str(setup["pinned"])][
-                "discarded"
-            ],
+            "activeTabProtected": not after["tabs"]["active"]["discarded"],
+            "pinnedTabProtected": not after["tabs"]["pinned"]["discarded"],
             "discardedTabReconstructed": True,
             "realHttpReloadObserved": requests_after > requests_before,
+            "tabIdStableAcrossDiscard": reload_id == original_reload_id,
             "totalDiscardedRecorded": int(after["state"]["totalDiscarded"]),
             "lastDecision": after["state"]["lastDecision"],
             "requestCounts": STATE.snapshot(),
