@@ -186,8 +186,11 @@ ShvVmxHandleExit (
     )
 {
     UINT8 advanceRip;
+    UINT32 i;
     UINT64 guestPhysicalAddress;
     UINT64 exitQualification;
+    UINT64* restoreTarget;
+    UINT64* restoreSource;
 
     advanceRip = TRUE;
 
@@ -211,10 +214,26 @@ ShvVmxHandleExit (
             (VpData->H0TestPagePhysicalAddress != 0))
         {
             //
-            // H0-C: restore access to the one private page that we armed.
-            // Intel specifies that the EPT violation itself invalidates the
-            // mapping used by the faulting access, so the retried instruction
-            // will observe the updated permission bits.
+            // H1-A: the target page contains only poison at this point.
+            // Reconstruct all 4096 bytes from the separate backing page while
+            // executing in VMX root mode. EPT does not apply to these host
+            // memory accesses.
+            //
+            restoreTarget = (UINT64*)(uintptr_t)ShvH1TestPageVirtualAddress;
+            restoreSource = (UINT64*)(uintptr_t)ShvH1BackingPageVirtualAddress;
+
+            if ((restoreTarget != NULL) && (restoreSource != NULL))
+            {
+                for (i = 0; i < (PAGE_SIZE / sizeof(UINT64)); i++)
+                {
+                    restoreTarget[i] = restoreSource[i];
+                }
+
+                _InterlockedIncrement(&ShvH1RestoreCount);
+            }
+
+            //
+            // Restore guest access only after reconstruction is complete.
             //
             VpData->H0EptPt[VpData->H0TestPteIndex].Read = 1;
             VpData->H0EptPt[VpData->H0TestPteIndex].Write = 1;
@@ -225,8 +244,8 @@ ShvVmxHandleExit (
             _InterlockedIncrement(&ShvH0EptTrapCount);
 
             //
-            // The memory instruction has not executed yet. Leave RIP on the
-            // same instruction so VMRESUME retries it after access is restored.
+            // The guest memory instruction has not executed yet. Keep RIP on
+            // the same instruction so VMRESUME retries it against restored data.
             //
             advanceRip = FALSE;
         }
