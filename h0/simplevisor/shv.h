@@ -182,3 +182,8 @@ ShvOsRunCallbackOnProcessors (
 
 extern PSHV_VP_DATA* ShvGlobalData;
 
+extern UINT64 ShvH0TestPagePhysicalAddress;
+extern volatile long ShvH0EptTrapCount;
+extern volatile UINT64 ShvH0LastGuestPhysicalAddress;
+extern volatile UINT64 ShvH0LastExitQualification;
+

@@ -615,6 +615,31 @@ typedef struct _VMX_PDPTE
     };
 } VMX_PDPTE, *PVMX_PDPTE;
 
+typedef struct _VMX_PTE
+{
+    union
+    {
+        struct
+        {
+            UINT64 Read : 1;
+            UINT64 Write : 1;
+            UINT64 Execute : 1;
+            UINT64 Type : 3;
+            UINT64 IgnorePat : 1;
+            UINT64 Reserved : 1;
+            UINT64 Accessed : 1;
+            UINT64 Dirty : 1;
+            UINT64 UserModeExecute : 1;
+            UINT64 SoftwareUse : 1;
+            UINT64 PageFrameNumber : 36;
+            UINT64 ReservedHigh : 4;
+            UINT64 SoftwareUseHigh : 11;
+            UINT64 SupressVme : 1;
+        };
+        UINT64 AsUlonglong;
+    };
+} VMX_PTE, *PVMX_PTE;
+
 typedef struct _VMX_LARGE_PDE
 {
     union
@@ -644,6 +669,7 @@ typedef struct _VMX_LARGE_PDE
 static_assert(sizeof(VMX_EPTP) == sizeof(UINT64), "EPTP Size Mismatch");
 static_assert(sizeof(VMX_EPML4E) == sizeof(UINT64), "EPML4E Size Mismatch");
 static_assert(sizeof(VMX_PDPTE) == sizeof(UINT64), "EPDPTE Size Mismatch");
+static_assert(sizeof(VMX_PTE) == sizeof(UINT64), "EPTE Size Mismatch");
 
 #define PML4E_ENTRY_COUNT   512
 #define PDPTE_ENTRY_COUNT   512

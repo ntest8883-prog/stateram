@@ -80,6 +80,9 @@ typedef struct _SHV_VP_DATA
             UINT64 VmcsPhysicalAddress;
             UINT64 MsrBitmapPhysicalAddress;
             UINT64 EptPml4PhysicalAddress;
+            UINT64 H0TestPagePhysicalAddress;
+            PVMX_PTE H0EptPt;
+            UINT32 H0TestPteIndex;
             UINT32 EptControls;
         };
     };
@@ -124,3 +127,8 @@ VOID
 ShvUnload (
     VOID
     );
+
+extern UINT64 ShvH0TestPagePhysicalAddress;
+extern volatile long ShvH0EptTrapCount;
+extern volatile UINT64 ShvH0LastGuestPhysicalAddress;
+extern volatile UINT64 ShvH0LastExitQualification;

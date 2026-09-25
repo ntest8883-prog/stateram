@@ -77,7 +77,99 @@ typedef struct _SHV_DPC_CONTEXT
 #define KGDT64_R3_DATA      0x28
 #define KGDT64_R3_CMTEB     0x50
 
+VOID
+ShvOsFreeContiguousAlignedMemory (
+    _In_ PVOID BaseAddress
+    );
+
+PVOID
+ShvOsAllocateContigousAlignedMemory (
+    _In_ SIZE_T Size
+    );
+
+ULONGLONG
+ShvOsGetPhysicalAddress (
+    _In_ PVOID BaseAddress
+    );
+
 PVOID g_PowerCallbackRegistration;
+PVOID g_H0TestPage;
+
+#define H0_TEST_BYTE 0xA5
+
+VOID
+ShvH0FreeTestPage (
+    VOID
+    )
+{
+    if (g_H0TestPage != NULL)
+    {
+        ShvOsFreeContiguousAlignedMemory(g_H0TestPage);
+        g_H0TestPage = NULL;
+    }
+
+    ShvH0TestPagePhysicalAddress = 0;
+}
+
+NTSTATUS
+ShvH0PrepareTestPage (
+    VOID
+    )
+{
+    g_H0TestPage = ShvOsAllocateContigousAlignedMemory(PAGE_SIZE);
+    if (g_H0TestPage == NULL)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    *(volatile UCHAR*)g_H0TestPage = H0_TEST_BYTE;
+
+    ShvH0EptTrapCount = 0;
+    ShvH0LastGuestPhysicalAddress = 0;
+    ShvH0LastExitQualification = 0;
+    ShvH0TestPagePhysicalAddress = ShvOsGetPhysicalAddress(g_H0TestPage);
+
+    if (ShvH0TestPagePhysicalAddress == 0)
+    {
+        ShvH0FreeTestPage();
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+BOOLEAN
+ShvH0TriggerAndVerifyTrap (
+    VOID
+    )
+{
+    UCHAR value;
+
+    //
+    // This single volatile read is the H0-C experiment. The page was marked
+    // inaccessible in EPT before VM launch. A successful return means the
+    // VM-exit handler restored access and the CPU retried this same read.
+    //
+    value = *(volatile UCHAR*)g_H0TestPage;
+
+    if (value != H0_TEST_BYTE)
+    {
+        return FALSE;
+    }
+
+    if (ShvH0EptTrapCount < 1)
+    {
+        return FALSE;
+    }
+
+    if ((ShvH0LastGuestPhysicalAddress & ~((UINT64)PAGE_SIZE - 1)) !=
+        ShvH0TestPagePhysicalAddress)
+    {
+        return FALSE;
+    }
+
+    return TRUE;
+}
 
 NTSTATUS
 FORCEINLINE
@@ -358,9 +450,10 @@ DriverUnload (
     ExUnregisterCallback(g_PowerCallbackRegistration);
 
     //
-    // Unload the hypervisor
+    // Unload the hypervisor before releasing the private H0-C page.
     //
     ShvUnload();
+    ShvH0FreeTestPage();
 }
 
 NTSTATUS
@@ -380,6 +473,16 @@ DriverEntry (
     UNREFERENCED_PARAMETER(RegistryPath);
 
     //
+    // H0-C owns exactly one private physical page. No application or normal
+    // Windows page is selected for this experiment.
+    //
+    status = ShvH0PrepareTestPage();
+    if (!NT_SUCCESS(status))
+    {
+        return status;
+    }
+
+    //
     // Make the driver (and SHV itself) unloadable
     //
     DriverObject->DriverUnload = DriverUnload;
@@ -390,6 +493,7 @@ DriverEntry (
     status = ExCreateCallback(&callbackObject, &objectAttributes, FALSE, TRUE);
     if (!NT_SUCCESS(status))
     {
+        ShvH0FreeTestPage();
         return status;
     }
 
@@ -412,6 +516,7 @@ DriverEntry (
     //
     if (g_PowerCallbackRegistration == NULL)
     {
+        ShvH0FreeTestPage();
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -427,8 +532,28 @@ DriverEntry (
     if (!NT_SUCCESS(status))
     {
         ExUnregisterCallback(g_PowerCallbackRegistration);
+        ShvH0FreeTestPage();
+        return status;
     }
 
-    return status;
+    //
+    // Deliberately touch the private page once. DriverEntry succeeds only if
+    // the access produced our expected EPT violation and the retried read
+    // returned the sentinel byte intact.
+    //
+    if (ShvH0TriggerAndVerifyTrap() == FALSE)
+    {
+        ShvUnload();
+        ExUnregisterCallback(g_PowerCallbackRegistration);
+        ShvH0FreeTestPage();
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    ShvOsDebugPrint("H0-C PASS: EPT trap count=%ld GPA=0x%llX qualification=0x%llX\n",
+                    ShvH0EptTrapCount,
+                    ShvH0LastGuestPhysicalAddress,
+                    ShvH0LastExitQualification);
+
+    return STATUS_SUCCESS;
 }
 

@@ -118,9 +118,12 @@ ShvVmxEptInitialize (
     _In_ PSHV_VP_DATA VpData
     )
 {
-    UINT32 i, j;
+    UINT32 i, j, k;
+    UINT32 h0PdptIndex, h0PdeIndex, h0PteIndex;
+    UINT64 h0LargePageBase;
     VMX_PDPTE tempEpdpte;
     VMX_LARGE_PDE tempEpde;
+    VMX_PTE tempEpte;
 
     //
     // Fill out the EPML4E which covers the first 512GB of RAM
@@ -171,6 +174,56 @@ ShvVmxEptInitialize (
                                                                           VpData->Epde[i][j].PageFrameNumber * _2MB,
                                                                           MTRR_TYPE_WB);
         }
+    }
+
+    //
+    // H0-C: split only the 2MB identity mapping that contains our private
+    // test page into 4KB leaves, then remove access from exactly one 4KB leaf.
+    // All other mappings remain identical to the proven H0-B baseline.
+    //
+    if (ShvH0TestPagePhysicalAddress != 0)
+    {
+        h0PdptIndex = (UINT32)((ShvH0TestPagePhysicalAddress >> 30) & 0x1FF);
+        h0PdeIndex = (UINT32)((ShvH0TestPagePhysicalAddress >> 21) & 0x1FF);
+        h0PteIndex = (UINT32)((ShvH0TestPagePhysicalAddress >> 12) & 0x1FF);
+        h0LargePageBase = ShvH0TestPagePhysicalAddress & ~((UINT64)_2MB - 1);
+
+        VpData->H0TestPagePhysicalAddress = ShvH0TestPagePhysicalAddress;
+        VpData->H0TestPteIndex = h0PteIndex;
+
+        tempEpte.AsUlonglong = 0;
+        tempEpte.Read = tempEpte.Write = tempEpte.Execute = 1;
+        tempEpte.Type = VpData->Epde[h0PdptIndex][h0PdeIndex].Type;
+
+        __stosq((UINT64*)VpData->H0EptPt,
+                tempEpte.AsUlonglong,
+                PDE_ENTRY_COUNT);
+
+        for (k = 0; k < PDE_ENTRY_COUNT; k++)
+        {
+            VpData->H0EptPt[k].PageFrameNumber =
+                (h0LargePageBase / PAGE_SIZE) + k;
+        }
+
+        //
+        // Arm the controlled trap: no guest read/write/execute access until
+        // the VM-exit handler observes the page and restores its permissions.
+        //
+        VpData->H0EptPt[h0PteIndex].Read = 0;
+        VpData->H0EptPt[h0PteIndex].Write = 0;
+        VpData->H0EptPt[h0PteIndex].Execute = 0;
+
+        //
+        // Replace the original 2MB leaf PDE with a non-leaf PDE pointing to
+        // the private 4KB page table above.
+        //
+        tempEpdpte.AsUlonglong = 0;
+        tempEpdpte.Read = tempEpdpte.Write = tempEpdpte.Execute = 1;
+        tempEpdpte.PageFrameNumber =
+            ShvOsGetPhysicalAddress(VpData->H0EptPt) / PAGE_SIZE;
+
+        VpData->Epde[h0PdptIndex][h0PdeIndex].AsUlonglong =
+            tempEpdpte.AsUlonglong;
     }
 }
 

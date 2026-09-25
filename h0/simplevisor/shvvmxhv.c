@@ -181,16 +181,16 @@ ShvVmxHandleVmx (
 
 VOID
 ShvVmxHandleExit (
-    _In_ PSHV_VP_STATE VpState
+    _In_ PSHV_VP_STATE VpState,
+    _In_ PSHV_VP_DATA VpData
     )
 {
-    //
-    // This is the generic VM-Exit handler. Decode the reason for the exit and
-    // call the appropriate handler. As per Intel specifications, given that we
-    // have requested no optional exits whatsoever, we should only see CPUID,
-    // INVD, XSETBV and other VMX instructions. GETSEC cannot happen as we do
-    // not run in SMX context.
-    //
+    UINT8 advanceRip;
+    UINT64 guestPhysicalAddress;
+    UINT64 exitQualification;
+
+    advanceRip = TRUE;
+
     switch (VpState->ExitReason)
     {
     case EXIT_REASON_CPUID:
@@ -201,6 +201,35 @@ ShvVmxHandleExit (
         break;
     case EXIT_REASON_XSETBV:
         ShvVmxHandleXsetbv(VpState);
+        break;
+    case EXIT_REASON_EPT_VIOLATION:
+        guestPhysicalAddress = ShvVmxRead(GUEST_PHYSICAL_ADDRESS);
+        exitQualification = ShvVmxRead(EXIT_QUALIFICATION);
+
+        if (((guestPhysicalAddress & ~((UINT64)PAGE_SIZE - 1)) ==
+             VpData->H0TestPagePhysicalAddress) &&
+            (VpData->H0TestPagePhysicalAddress != 0))
+        {
+            //
+            // H0-C: restore access to the one private page that we armed.
+            // Intel specifies that the EPT violation itself invalidates the
+            // mapping used by the faulting access, so the retried instruction
+            // will observe the updated permission bits.
+            //
+            VpData->H0EptPt[VpData->H0TestPteIndex].Read = 1;
+            VpData->H0EptPt[VpData->H0TestPteIndex].Write = 1;
+            VpData->H0EptPt[VpData->H0TestPteIndex].Execute = 1;
+
+            ShvH0LastGuestPhysicalAddress = guestPhysicalAddress;
+            ShvH0LastExitQualification = exitQualification;
+            _InterlockedIncrement(&ShvH0EptTrapCount);
+
+            //
+            // The memory instruction has not executed yet. Leave RIP on the
+            // same instruction so VMRESUME retries it after access is restored.
+            //
+            advanceRip = FALSE;
+        }
         break;
     case EXIT_REASON_VMCALL:
     case EXIT_REASON_VMCLEAR:
@@ -218,13 +247,11 @@ ShvVmxHandleExit (
         break;
     }
 
-    //
-    // Move the instruction pointer to the next instruction after the one that
-    // caused the exit. Since we are not doing any special handling or changing
-    // of execution, this can be done for any exit reason.
-    //
-    VpState->GuestRip += ShvVmxRead(VM_EXIT_INSTRUCTION_LEN);
-    __vmx_vmwrite(GUEST_RIP, VpState->GuestRip);
+    if (advanceRip != FALSE)
+    {
+        VpState->GuestRip += ShvVmxRead(VM_EXIT_INSTRUCTION_LEN);
+        __vmx_vmwrite(GUEST_RIP, VpState->GuestRip);
+    }
 }
 
 DECLSPEC_NORETURN
@@ -264,7 +291,7 @@ ShvVmxEntryHandler (
     //
     // Call the generic handler
     //
-    ShvVmxHandleExit(&guestContext);
+    ShvVmxHandleExit(&guestContext, vpData);
 
     //
     // Did we hit the magic exit sequence, or should we resume back to the VM

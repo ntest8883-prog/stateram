@@ -22,6 +22,11 @@ Environment:
 
 #include "shv.h"
 
+UINT64 ShvH0TestPagePhysicalAddress;
+volatile long ShvH0EptTrapCount;
+volatile UINT64 ShvH0LastGuestPhysicalAddress;
+volatile UINT64 ShvH0LastExitQualification;
+
 VOID
 ShvUnload (
     VOID
@@ -73,6 +78,13 @@ ShvLoad (
     {
         ShvOsDebugPrint("The SHV failed to initialize (0x%lX) Failed CPU: %d\n",
                         callbackContext.FailureStatus, callbackContext.FailedCpu);
+
+        //
+        // H0-C safety: a multi-CPU launch can fail after another logical
+        // processor has already entered VMX. Roll back every successfully
+        // virtualized processor before returning failure to Windows.
+        //
+        ShvOsRunCallbackOnProcessors(ShvVpUnloadCallback, NULL);
         return callbackContext.FailureStatus;
     }
 

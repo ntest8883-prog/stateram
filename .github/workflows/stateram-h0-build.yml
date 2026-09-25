@@ -4,12 +4,14 @@ on:
   push:
     branches:
       - h0-baseline
+      - h0-ept-trap
     paths:
       - "h0/**"
       - ".github/workflows/stateram-h0-build.yml"
   pull_request:
     branches:
       - main
+      - h0-baseline
     paths:
       - "h0/**"
       - ".github/workflows/stateram-h0-build.yml"
@@ -80,7 +82,7 @@ jobs:
       - name: Upload unsigned H0 baseline
         uses: actions/upload-artifact@v4
         with:
-          name: StateRAM-H0-baseline-unsigned
+          name: StateRAM-H0C-ept-trap-unsigned
           path: |
             h0/simplevisor/x64/NT/shv.sys
             h0/simplevisor/x64/NT/shv.pdb
