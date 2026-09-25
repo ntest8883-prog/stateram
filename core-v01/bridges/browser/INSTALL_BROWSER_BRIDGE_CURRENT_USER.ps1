@@ -9,6 +9,17 @@ if (-not (Test-Path $exePath)) {
     throw "Missing native host executable: $exePath"
 }
 
+$requiredRuntimeFiles = @(
+    (Join-Path $PSScriptRoot "stateram_core.dll"),
+    (Join-Path $PSScriptRoot "stateram_runtime_client.dll")
+)
+
+foreach ($required in $requiredRuntimeFiles) {
+    if (-not (Test-Path $required)) {
+        throw "Missing StateRAM runtime dependency: $required"
+    }
+}
+
 $manifest = [ordered]@{
     name = $hostName
     description = "StateRAM Browser Bridge native host"
@@ -19,9 +30,9 @@ $manifest = [ordered]@{
     )
 }
 
-$manifest |
-    ConvertTo-Json -Depth 5 |
-    Set-Content -Encoding UTF8 $manifestPath
+$manifestJson = $manifest | ConvertTo-Json -Depth 5
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[IO.File]::WriteAllText($manifestPath, $manifestJson, $utf8NoBom)
 
 $keys = @(
     "HKCU:\Software\Google\Chrome\NativeMessagingHosts\$hostName",
