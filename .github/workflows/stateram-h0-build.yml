@@ -60,6 +60,23 @@ jobs:
           $item = Get-Item $driver
           Write-Host ("Driver: {0} ({1} bytes)" -f $item.FullName, $item.Length)
 
+      - name: Audit produced driver
+        shell: pwsh
+        run: |
+          $driver = (Resolve-Path "h0/simplevisor/x64/NT/shv.sys").Path
+          $hash = (Get-FileHash -Algorithm SHA256 $driver).Hash
+          Write-Host "SHV_SHA256=$hash"
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "Visual Studio C++ toolchain not found." }
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin.exe not found." }
+
+          & $dumpbin.FullName /headers /imports $driver |
+            Tee-Object "h0/simplevisor/x64/NT/shv-audit.txt"
+
       - name: Upload unsigned H0 baseline
         uses: actions/upload-artifact@v4
         with:
@@ -67,4 +84,5 @@ jobs:
           path: |
             h0/simplevisor/x64/NT/shv.sys
             h0/simplevisor/x64/NT/shv.pdb
+            h0/simplevisor/x64/NT/shv-audit.txt
           if-no-files-found: error
