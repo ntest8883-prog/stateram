@@ -97,6 +97,8 @@ PVOID g_H1TestPage;
 PVOID g_H1BackingPage;
 
 #define H1_POISON_BYTE 0xCC
+#define H1_WRITE_OFFSET 1379
+#define H1_WRITE_XOR    0x5A
 
 VOID
 ShvH1FreePages (
@@ -162,6 +164,8 @@ ShvH1PreparePages (
     ShvH0LastGuestPhysicalAddress = 0;
     ShvH0LastExitQualification = 0;
     ShvH1RemapCount = 0;
+    ShvH1WriteTrapCount = 0;
+    ShvH1DetachedFrameVerifiedCount = 0;
 
     ShvH0TestPagePhysicalAddress = ShvOsGetPhysicalAddress(g_H1TestPage);
     ShvH1BackingPagePhysicalAddress = ShvOsGetPhysicalAddress(g_H1BackingPage);
@@ -180,25 +184,22 @@ ShvH1PreparePages (
 }
 
 BOOLEAN
-ShvH1TriggerAndVerifyRemap (
+ShvH1TriggerAndVerifyReclaim (
     VOID
     )
 {
     SIZE_T matched;
     volatile UCHAR firstByte;
-    UCHAR expectedFirstByte;
-
-    expectedFirstByte = *(PUCHAR)g_H1BackingPage;
+    UCHAR oldByte;
+    UCHAR newByte;
 
     //
-    // The target's real physical page still contains poison here. This read
-    // must encounter the EPT trap. Root mode changes the EPT leaf so the same
-    // guest-physical page is backed by the separate physical page, then retries
-    // this exact instruction.
+    // Phase 1: first access must be transparently redirected from the target
+    // GPA to the alternate physical backing page.
     //
     firstByte = *(volatile UCHAR*)g_H1TestPage;
 
-    if (firstByte != expectedFirstByte)
+    if (firstByte != *(PUCHAR)g_H1BackingPage)
     {
         return FALSE;
     }
@@ -216,6 +217,47 @@ ShvH1TriggerAndVerifyRemap (
 
     matched = RtlCompareMemory(g_H1TestPage, g_H1BackingPage, PAGE_SIZE);
     if (matched != PAGE_SIZE)
+    {
+        return FALSE;
+    }
+
+    //
+    // Phase 2: deliberately write through the target GPA. The EPT leaf is
+    // read-only after phase 1, so this causes a second controlled violation.
+    // Root mode then overwrites and verifies the now-detached original HPA as
+    // scratch space, proving that physical frame can be reused independently,
+    // while the guest write is retried against the alternate backing HPA.
+    //
+    oldByte = ((PUCHAR)g_H1BackingPage)[H1_WRITE_OFFSET];
+    newByte = oldByte ^ H1_WRITE_XOR;
+    ((volatile PUCHAR)g_H1TestPage)[H1_WRITE_OFFSET] = newByte;
+
+    if (((PUCHAR)g_H1TestPage)[H1_WRITE_OFFSET] != newByte ||
+        ((PUCHAR)g_H1BackingPage)[H1_WRITE_OFFSET] != newByte)
+    {
+        return FALSE;
+    }
+
+    if ((ShvH0EptTrapCount < 2) ||
+        (ShvH1WriteTrapCount < 1) ||
+        (ShvH1DetachedFrameVerifiedCount < 1))
+    {
+        return FALSE;
+    }
+
+    matched = RtlCompareMemory(g_H1TestPage, g_H1BackingPage, PAGE_SIZE);
+    if (matched != PAGE_SIZE)
+    {
+        return FALSE;
+    }
+
+    //
+    // Restore the logical payload byte so unload sees the same logical data
+    // pattern the test started with. The original HPA remains detached/scratch.
+    //
+    ((volatile PUCHAR)g_H1TestPage)[H1_WRITE_OFFSET] = oldByte;
+
+    if (((PUCHAR)g_H1BackingPage)[H1_WRITE_OFFSET] != oldByte)
     {
         return FALSE;
     }
@@ -502,7 +544,7 @@ DriverUnload (
     ExUnregisterCallback(g_PowerCallbackRegistration);
 
     //
-    // Unload the hypervisor before releasing the private H1-B pages.
+    // Unload the hypervisor before releasing the private H1-C pages.
     //
     ShvUnload();
     ShvH1FreePages();
@@ -525,7 +567,7 @@ DriverEntry (
     UNREFERENCED_PARAMETER(RegistryPath);
 
     //
-    // H1-B owns exactly two private pages: a target GPA and an alternate
+    // H1-C owns exactly two private pages: a target GPA and an alternate
     // physical backing page. No application or ordinary Windows page is used.
     //
     status = ShvH1PreparePages();
@@ -589,12 +631,11 @@ DriverEntry (
     }
 
     //
-    // Deliberately read the poisoned target. DriverEntry succeeds only if
-    // EPT traps the access, remaps the target GPA to the alternate physical
-    // page, retries the read, and the entire 4096-byte guest view matches the
-    // alternate backing page.
+    // H1-C performs both a transparent remap and a second write-fault phase
+    // that reuses the detached original HPA as root-mode scratch space while
+    // the guest continues using the alternate backing page.
     //
-    if (ShvH1TriggerAndVerifyRemap() == FALSE)
+    if (ShvH1TriggerAndVerifyReclaim() == FALSE)
     {
         ShvUnload();
         ExUnregisterCallback(g_PowerCallbackRegistration);
@@ -602,9 +643,11 @@ DriverEntry (
         return STATUS_UNSUCCESSFUL;
     }
 
-    ShvOsDebugPrint("H1-B PASS: trap=%ld remap=%ld GPA=0x%llX backing=0x%llX qualification=0x%llX\n",
+    ShvOsDebugPrint("H1-C PASS: traps=%ld remaps=%ld write_traps=%ld detached_verified=%ld GPA=0x%llX backing=0x%llX qualification=0x%llX\n",
                     ShvH0EptTrapCount,
                     ShvH1RemapCount,
+                    ShvH1WriteTrapCount,
+                    ShvH1DetachedFrameVerifiedCount,
                     ShvH0LastGuestPhysicalAddress,
                     ShvH1BackingPagePhysicalAddress,
                     ShvH0LastExitQualification);
