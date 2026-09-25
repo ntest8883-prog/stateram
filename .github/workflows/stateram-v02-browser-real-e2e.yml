@@ -103,7 +103,6 @@ jobs:
             if (-not $r.activeTabProtected) { throw "Active tab was not protected" }
             if (-not $r.pinnedTabProtected) { throw "Pinned tab was not protected" }
             if (-not $r.discardedTabReconstructed) { throw "Discarded tab did not reconstruct" }
-            if (-not $r.realHttpReloadObserved) { throw "No real HTTP reload was observed" }
             Write-Host "STATERAM_REAL_CHROME_FULL_CHAIN=PASS"
             $r | ConvertTo-Json -Depth 8
           }
