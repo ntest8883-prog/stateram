@@ -1,0 +1,65 @@
+name: StateRAM H0 baseline build
+
+on:
+  push:
+    branches:
+      - h0-baseline
+    paths:
+      - "h0/**"
+      - ".github/workflows/stateram-h0-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build pinned SimpleVisor NT x64 baseline
+    runs-on: windows-2025-vs2026
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Add NuGet to PATH
+        uses: NuGet/setup-nuget@v2
+
+      - name: Restore Windows SDK and WDK packages
+        shell: pwsh
+        run: |
+          nuget restore h0/simplevisor/packages.config `
+            -PackagesDirectory h0/simplevisor/packages `
+            -NonInteractive
+
+      - name: Build NT x64 baseline
+        shell: pwsh
+        run: |
+          msbuild h0/simplevisor/shv.vcxproj `
+            /m `
+            /t:Build `
+            /p:Configuration=NT `
+            /p:Platform=x64 `
+            /p:SignMode=Off
+
+      - name: Verify driver artifact exists
+        shell: pwsh
+        run: |
+          $drivers = Get-ChildItem h0/simplevisor -Recurse -Filter *.sys
+          if (-not $drivers) {
+            throw "Build completed without producing a .sys driver."
+          }
+          $drivers | ForEach-Object {
+            Write-Host ("Driver: {0} ({1} bytes)" -f $_.FullName, $_.Length)
+          }
+
+      - name: Upload unsigned H0 baseline
+        uses: actions/upload-artifact@v4
+        with:
+          name: StateRAM-H0-baseline-unsigned
+          path: |
+            h0/simplevisor/**/*.sys
+            h0/simplevisor/**/*.pdb
+          if-no-files-found: error
