@@ -128,7 +128,7 @@ static SystemState system_state() {
             break;
         default:
             out.global_raw_budget = std::min<uint64_t>(
-                1024ull * MB,
+                768ull * MB,
                 std::max<uint64_t>(256ull * MB, headroom_budget / 2));
             break;
     }
