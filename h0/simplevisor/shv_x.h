@@ -84,19 +84,26 @@ typedef struct _SHV_VP_DATA
             PVMX_PTE H0EptPt;
             UINT32 H0TestPteIndex;
             UINT32 EptControls;
+            UINT32 H1Phase;
         };
     };
 
     DECLSPEC_ALIGN(PAGE_SIZE) UINT8 MsrBitmap[PAGE_SIZE];
     DECLSPEC_ALIGN(PAGE_SIZE) VMX_EPML4E Epml4[PML4E_ENTRY_COUNT];
     DECLSPEC_ALIGN(PAGE_SIZE) VMX_PDPTE Epdpt[PDPTE_ENTRY_COUNT];
-    DECLSPEC_ALIGN(PAGE_SIZE) VMX_LARGE_PDE Epde[PDPTE_ENTRY_COUNT][PDE_ENTRY_COUNT];
+
+    //
+    // H1-C allocator hardening: the 512 PDE tables are each one 4KB page.
+    // Store software pointers here instead of embedding one 2MB physically
+    // contiguous array in SHV_VP_DATA.
+    //
+    PVMX_LARGE_PDE Epde[PDPTE_ENTRY_COUNT];
 
     DECLSPEC_ALIGN(PAGE_SIZE) VMX_VMCS VmxOn;
     DECLSPEC_ALIGN(PAGE_SIZE) VMX_VMCS Vmcs;
 } SHV_VP_DATA, *PSHV_VP_DATA;
 
-C_ASSERT(sizeof(SHV_VP_DATA) == (KERNEL_STACK_SIZE + (512 + 5) * PAGE_SIZE));
+C_ASSERT(sizeof(SHV_VP_DATA) == (KERNEL_STACK_SIZE + 6 * PAGE_SIZE));
 
 VOID
 _sldt (
@@ -136,3 +143,5 @@ extern UINT64 ShvH1TestPageVirtualAddress;
 extern UINT64 ShvH1BackingPageVirtualAddress;
 extern UINT64 ShvH1BackingPagePhysicalAddress;
 extern volatile long ShvH1RemapCount;
+extern volatile long ShvH1WriteTrapCount;
+extern volatile long ShvH1DetachedFrameVerifiedCount;

@@ -186,8 +186,11 @@ ShvVmxHandleExit (
     )
 {
     UINT8 advanceRip;
+    UINT8 detachedFrameVerified;
+    UINT32 i;
     UINT64 guestPhysicalAddress;
     UINT64 exitQualification;
+    UINT64* detachedFrame;
 
     advanceRip = TRUE;
 
@@ -211,25 +214,91 @@ ShvVmxHandleExit (
             (VpData->H0TestPagePhysicalAddress != 0) &&
             (ShvH1BackingPagePhysicalAddress != 0))
         {
-            //
-            // H1-B: do not copy bytes back into the original physical page.
-            // Instead, keep the guest-physical address unchanged while changing
-            // its EPT leaf to point at a different host-physical page.
-            //
-            VpData->H0EptPt[VpData->H0TestPteIndex].PageFrameNumber =
-                ShvH1BackingPagePhysicalAddress / PAGE_SIZE;
-            VpData->H0EptPt[VpData->H0TestPteIndex].Read = 1;
-            VpData->H0EptPt[VpData->H0TestPteIndex].Write = 1;
-            VpData->H0EptPt[VpData->H0TestPteIndex].Execute = 1;
+            if (VpData->H1Phase == 0)
+            {
+                //
+                // H1-C phase 1: detach the original host physical frame.
+                // The guest keeps the exact same GPA, but CPU accesses are now
+                // backed by the alternate HPA. Leave writes blocked so the
+                // deliberate guest write below produces a second VM exit.
+                //
+                VpData->H0EptPt[VpData->H0TestPteIndex].PageFrameNumber =
+                    ShvH1BackingPagePhysicalAddress / PAGE_SIZE;
+                VpData->H0EptPt[VpData->H0TestPteIndex].Read = 1;
+                VpData->H0EptPt[VpData->H0TestPteIndex].Write = 0;
+                VpData->H0EptPt[VpData->H0TestPteIndex].Execute = 0;
+                VpData->H1Phase = 1;
+                _InterlockedIncrement(&ShvH1RemapCount);
+            }
+            else if ((VpData->H1Phase == 1) &&
+                     ((exitQualification & 0x2) != 0))
+            {
+                //
+                // H1-C phase 2: while the guest's logical page is still backed
+                // by HPA B, directly reuse the detached original HPA A from
+                // VMX root mode. Host accesses do not pass through EPT.
+                //
+                detachedFrame =
+                    (UINT64*)(uintptr_t)ShvH1TestPageVirtualAddress;
+                detachedFrameVerified = FALSE;
+
+                if (detachedFrame != NULL)
+                {
+                    for (i = 0; i < (PAGE_SIZE / sizeof(UINT64)); i++)
+                    {
+                        detachedFrame[i] = 0x3C3C3C3C3C3C3C3CULL;
+                    }
+
+                    detachedFrameVerified = TRUE;
+                    for (i = 0; i < (PAGE_SIZE / sizeof(UINT64)); i++)
+                    {
+                        if (detachedFrame[i] != 0x3C3C3C3C3C3C3C3CULL)
+                        {
+                            detachedFrameVerified = FALSE;
+                            break;
+                        }
+                    }
+                }
+
+                if (detachedFrameVerified != FALSE)
+                {
+                    _InterlockedIncrement(&ShvH1DetachedFrameVerifiedCount);
+                }
+
+                //
+                // Keep GPA A mapped to HPA B and now allow the pending guest
+                // write to complete there. The scratch contents in HPA A must
+                // therefore remain invisible to the guest logical page.
+                //
+                VpData->H0EptPt[VpData->H0TestPteIndex].PageFrameNumber =
+                    ShvH1BackingPagePhysicalAddress / PAGE_SIZE;
+                VpData->H0EptPt[VpData->H0TestPteIndex].Read = 1;
+                VpData->H0EptPt[VpData->H0TestPteIndex].Write = 1;
+                VpData->H0EptPt[VpData->H0TestPteIndex].Execute = 0;
+                VpData->H1Phase = 2;
+                _InterlockedIncrement(&ShvH1WriteTrapCount);
+            }
+            else
+            {
+                //
+                // A stale local translation can conservatively be retried with
+                // the permissions implied by this VP's current phase.
+                //
+                VpData->H0EptPt[VpData->H0TestPteIndex].PageFrameNumber =
+                    ShvH1BackingPagePhysicalAddress / PAGE_SIZE;
+                VpData->H0EptPt[VpData->H0TestPteIndex].Read = 1;
+                VpData->H0EptPt[VpData->H0TestPteIndex].Write =
+                    (VpData->H1Phase >= 2) ? 1 : 0;
+                VpData->H0EptPt[VpData->H0TestPteIndex].Execute = 0;
+            }
 
             ShvH0LastGuestPhysicalAddress = guestPhysicalAddress;
             ShvH0LastExitQualification = exitQualification;
-            _InterlockedIncrement(&ShvH1RemapCount);
             _InterlockedIncrement(&ShvH0EptTrapCount);
 
             //
-            // The guest instruction has not executed yet. Keep RIP unchanged so
-            // VMRESUME retries the same access through the new EPT translation.
+            // The faulting guest memory instruction has not executed. Keep RIP
+            // unchanged so VMRESUME retries it through the updated EPT leaf.
             //
             advanceRip = FALSE;
         }

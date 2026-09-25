@@ -180,7 +180,7 @@ ShvVpUnloadCallback (
     {
         __analysis_assume((cpuInfo[0] != 0) && (cpuInfo[1] != 0));
         vpData = (PSHV_VP_DATA)((UINT64)cpuInfo[0] << 32 | (UINT32)cpuInfo[1]);
-        ShvOsFreeContiguousAlignedMemory(vpData, sizeof(*vpData));
+        ShvVpFreeData(vpData, 1);
     }
 }
 
@@ -190,41 +190,55 @@ ShvVpAllocateData (
     )
 {
     PSHV_VP_DATA data;
+    UINT32 i;
 
     //
-    // Allocate a contiguous chunk of RAM to back this allocation
+    // H1-C allocator hardening:
+    // The original SimpleVisor layout embedded all 512 PDE pages in one
+    // ~2MB physically-contiguous SHV_VP_DATA allocation. On a 4GB machine
+    // that can fail after normal runtime fragmentation even when plenty of
+    // total RAM is free.
+    //
+    // Keep only the small VP core contiguous, then allocate each EPT PDE table
+    // as an independent 4KB physical page. EPT only requires each individual
+    // paging-structure page to be physically contiguous and aligned; the 512
+    // tables do not need to be adjacent to one another.
     //
     data = ShvOsAllocateContigousAlignedMemory(sizeof(*data) * CpuCount);
-    if (data != NULL)
+    if (data == NULL)
     {
-        //
-        // Zero out the entire data region
-        //
-        __stosq((UINT64*)data, 0, (sizeof(*data) / sizeof(UINT64)) * CpuCount);
+        return NULL;
+    }
 
-        //
-        // H0-C v2: preserve the proven H0-B size of the large contiguous
-        // per-VP allocation. Allocate the one extra 4KB EPT leaf table
-        // separately so it cannot make that large allocation harder to satisfy.
-        //
-        if (ShvH0TestPagePhysicalAddress != 0)
+    __stosq((UINT64*)data, 0, (sizeof(*data) / sizeof(UINT64)) * CpuCount);
+
+    for (i = 0; i < PDPTE_ENTRY_COUNT; i++)
+    {
+        data->Epde[i] = ShvOsAllocateContigousAlignedMemory(PAGE_SIZE);
+        if (data->Epde[i] == NULL)
         {
-            data->H0EptPt = ShvOsAllocateContigousAlignedMemory(PAGE_SIZE);
-            if (data->H0EptPt == NULL)
-            {
-                ShvOsFreeContiguousAlignedMemory(data, sizeof(*data) * CpuCount);
-                data = NULL;
-            }
-            else
-            {
-                __stosq((UINT64*)data->H0EptPt, 0, PAGE_SIZE / sizeof(UINT64));
-            }
+            ShvVpFreeData(data, CpuCount);
+            return NULL;
         }
+
+        __stosq((UINT64*)data->Epde[i], 0, PAGE_SIZE / sizeof(UINT64));
     }
 
     //
-    // Return what is hopefully a valid pointer, otherwise NULL.
+    // The controlled target's 4KB EPT leaf table remains separate as well.
     //
+    if (ShvH0TestPagePhysicalAddress != 0)
+    {
+        data->H0EptPt = ShvOsAllocateContigousAlignedMemory(PAGE_SIZE);
+        if (data->H0EptPt == NULL)
+        {
+            ShvVpFreeData(data, CpuCount);
+            return NULL;
+        }
+
+        __stosq((UINT64*)data->H0EptPt, 0, PAGE_SIZE / sizeof(UINT64));
+    }
+
     return data;
 }
 
@@ -234,14 +248,26 @@ ShvVpFreeData (
     _In_ UINT32 CpuCount
     )
 {
-    //
-    // Release the separate H0-C leaf table first, then the proven baseline
-    // per-VP allocation.
-    //
+    UINT32 i;
+
+    if (Data == NULL)
+    {
+        return;
+    }
+
     if (Data->H0EptPt != NULL)
     {
         ShvOsFreeContiguousAlignedMemory(Data->H0EptPt, PAGE_SIZE);
         Data->H0EptPt = NULL;
+    }
+
+    for (i = 0; i < PDPTE_ENTRY_COUNT; i++)
+    {
+        if (Data->Epde[i] != NULL)
+        {
+            ShvOsFreeContiguousAlignedMemory(Data->Epde[i], PAGE_SIZE);
+            Data->Epde[i] = NULL;
+        }
     }
 
     ShvOsFreeContiguousAlignedMemory(Data, sizeof(*Data) * CpuCount);
