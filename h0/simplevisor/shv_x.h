@@ -84,6 +84,7 @@ typedef struct _SHV_VP_DATA
             PVMX_PTE H0EptPt;
             UINT32 H0TestPteIndex;
             UINT32 EptControls;
+            UINT32 H1Phase;
         };
     };
 
@@ -144,4 +145,3 @@ extern UINT64 ShvH1BackingPagePhysicalAddress;
 extern volatile long ShvH1RemapCount;
 extern volatile long ShvH1WriteTrapCount;
 extern volatile long ShvH1DetachedFrameVerifiedCount;
-extern volatile long ShvH1Phase;
