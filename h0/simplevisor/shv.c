@@ -30,6 +30,9 @@ UINT64 ShvH1TestPageVirtualAddress;
 UINT64 ShvH1BackingPageVirtualAddress;
 UINT64 ShvH1BackingPagePhysicalAddress;
 volatile long ShvH1RemapCount;
+volatile long ShvH1WriteTrapCount;
+volatile long ShvH1DetachedFrameVerifiedCount;
+volatile long ShvH1Phase;
 
 VOID
 ShvUnload (
