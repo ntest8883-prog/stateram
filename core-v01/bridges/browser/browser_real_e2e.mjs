@@ -59,9 +59,9 @@ let browser;
 
 try {
   browser = await puppeteer.launch({
-    channel: "chrome",
-    headless: "new",
+    headless: true,
     pipe: true,
+    dumpio: true,
     enableExtensions: [extensionDir],
     args: [
       "--no-first-run",
