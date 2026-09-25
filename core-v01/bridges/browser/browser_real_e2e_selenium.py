@@ -256,18 +256,24 @@ const done = arguments[arguments.length - 1];
             "pre-policy snapshot",
         )
 
-        for tab_id in setup["cold"]:
-            if before["tabs"][str(tab_id)]["discarded"]:
-                raise RuntimeError(
-                    f"cold tab {tab_id} discarded before forced scheduler tick"
-                )
+        automatically_discarded = [
+            tab_id
+            for tab_id in setup["cold"]
+            if before["tabs"][str(tab_id)]["discarded"]
+        ]
 
         if before["tabs"][str(setup["active"])]["discarded"]:
-            raise RuntimeError("active tab discarded before policy")
+            raise RuntimeError("active tab was discarded by automatic policy")
 
         if before["tabs"][str(setup["pinned"])]["discarded"]:
-            raise RuntimeError("pinned tab discarded before policy")
+            raise RuntimeError("pinned tab was discarded by automatic policy")
 
+        /*
+         * The extension's natural one-minute alarm may already have fired by
+         * this point. That is valid end-to-end behavior, not a failure.
+         * If fewer than four eligible tabs were reclaimed naturally, schedule
+         * the exact same registered alarm once more to finish the check.
+         */
         trigger_script = r"""
 const done = arguments[arguments.length - 1];
 (async () => {
@@ -277,10 +283,12 @@ const done = arguments[arguments.length - 1];
   done({ok: true});
 })().catch(error => done({ok: false, error: String(error)}));
 """
-        fail_if_js_error(
-            driver.execute_async_script(trigger_script),
-            "alarm trigger",
-        )
+
+        if len(automatically_discarded) < 4:
+            fail_if_js_error(
+                driver.execute_async_script(trigger_script),
+                "alarm trigger",
+            )
 
         after = None
         deadline = time.time() + 20
@@ -410,6 +418,9 @@ chrome.tabs.get(tabId)
             "controlledRuntimePressure": 3,
             "realIdleSeconds": 65,
             "eligibleColdTabs": 4,
+            "automaticAlarmDiscardedBeforeTrigger": len(
+                automatically_discarded
+            ),
             "coldTabsDiscarded": len(discarded),
             "activeTabProtected": not after["tabs"][str(setup["active"])][
                 "discarded"
