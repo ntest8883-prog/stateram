@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "StateRAM Browser Bridge",
+  "version": "0.2.0",
+  "description": "Lets the StateRAM runtime reclaim cold Chromium tabs under real system memory pressure.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwuJi+qGzaq8K9BsIj7VNCMi3iJRgfW2b1r8HGQWtibR+7huTOhxYi/NcCjF03nIlaAUBUbGUmQzq+41JSnjUUf2V93yG0U7PF0fllmzed40Fi6aqPx92Fnyfx8c06dBHEQjnFOOFVqZsZZ+ixaUe6iY+oMlZjrKPwIJ3hkMEm6v5pYbPi5IfaZCl8M3FI8HDTCFBZN0HOQx6JtGonCG+ae3oL94A8KEGLxmz2kX/huFHXzRH3vKn9U07vNhFU1co9IC8rg5oAdRvAMu1VUdOAdRlqFgI0kU1RWVA65OINCpllenB77aVl546TiyXvycCSF1GlE8/og4MV4d7UtqusQIDAQAB",
+  "permissions": [
+    "tabs",
+    "alarms",
+    "nativeMessaging",
+    "storage"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "StateRAM Browser Bridge"
+  }
+}
