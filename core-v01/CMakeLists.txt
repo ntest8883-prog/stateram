@@ -45,4 +45,12 @@ if (WIN32)
     add_executable(stateram_4to8_evaluator_safe evaluation/evaluator_launcher.cpp)
     set_target_properties(stateram_4to8_evaluator_safe PROPERTIES OUTPUT_NAME "StateRAM_4to8_Evaluator_Safe")
     target_link_libraries(stateram_4to8_evaluator_safe PRIVATE user32 advapi32)
+
+    add_executable(stateram_folder_workspace integrations/folder_workspace.cpp)
+    set_target_properties(stateram_folder_workspace PROPERTIES OUTPUT_NAME "StateRAM_FolderWorkspace")
+    target_link_libraries(stateram_folder_workspace PRIVATE stateram_core)
+
+    add_executable(stateram_folder_workspace_safe integrations/folder_workspace_launcher.cpp)
+    set_target_properties(stateram_folder_workspace_safe PROPERTIES OUTPUT_NAME "StateRAM_FolderWorkspace_Safe")
+    target_link_libraries(stateram_folder_workspace_safe PRIVATE user32 advapi32)
 endif()
