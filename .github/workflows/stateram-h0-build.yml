@@ -53,19 +53,18 @@ jobs:
       - name: Verify driver artifact exists
         shell: pwsh
         run: |
-          $drivers = Get-ChildItem h0/simplevisor -Recurse -Filter *.sys
-          if (-not $drivers) {
-            throw "Build completed without producing a .sys driver."
+          $driver = "h0/simplevisor/x64/NT/shv.sys"
+          if (-not (Test-Path $driver)) {
+            throw "Expected driver was not produced: $driver"
           }
-          $drivers | ForEach-Object {
-            Write-Host ("Driver: {0} ({1} bytes)" -f $_.FullName, $_.Length)
-          }
+          $item = Get-Item $driver
+          Write-Host ("Driver: {0} ({1} bytes)" -f $item.FullName, $item.Length)
 
       - name: Upload unsigned H0 baseline
         uses: actions/upload-artifact@v4
         with:
           name: StateRAM-H0-baseline-unsigned
           path: |
-            h0/simplevisor/**/*.sys
-            h0/simplevisor/**/*.pdb
+            h0/simplevisor/x64/NT/shv.sys
+            h0/simplevisor/x64/NT/shv.pdb
           if-no-files-found: error
