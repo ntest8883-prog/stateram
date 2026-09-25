@@ -59,14 +59,15 @@ let browser;
 
 try {
   browser = await puppeteer.launch({
-    headless: true,
+    headless: false,
     pipe: true,
     dumpio: true,
     enableExtensions: [extensionDir],
     args: [
       "--no-first-run",
       "--no-default-browser-check",
-      "--disable-background-networking"
+      "--disable-background-networking",
+      "--window-size=1280,900"
     ]
   });
 
