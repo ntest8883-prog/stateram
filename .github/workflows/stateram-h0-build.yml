@@ -6,7 +6,6 @@ on:
       - h0-baseline
       - h0-ept-trap
       - h1-restore
-      - h1-restore
       - h1-ept-remap
     paths:
       - "h0/**"
@@ -16,6 +15,7 @@ on:
       - main
       - h0-baseline
       - h0-ept-trap
+      - h1-restore
     paths:
       - "h0/**"
       - ".github/workflows/stateram-h0-build.yml"
