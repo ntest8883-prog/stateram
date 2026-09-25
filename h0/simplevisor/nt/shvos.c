@@ -93,45 +93,82 @@ ShvOsGetPhysicalAddress (
     );
 
 PVOID g_PowerCallbackRegistration;
-PVOID g_H0TestPage;
+PVOID g_H1TestPage;
+PVOID g_H1BackingPage;
 
-#define H0_TEST_BYTE 0xA5
+#define H1_POISON_BYTE 0xCC
 
 VOID
-ShvH0FreeTestPage (
+ShvH1FreePages (
     VOID
     )
 {
-    if (g_H0TestPage != NULL)
+    if (g_H1BackingPage != NULL)
     {
-        ShvOsFreeContiguousAlignedMemory(g_H0TestPage);
-        g_H0TestPage = NULL;
+        ShvOsFreeContiguousAlignedMemory(g_H1BackingPage);
+        g_H1BackingPage = NULL;
+    }
+
+    if (g_H1TestPage != NULL)
+    {
+        ShvOsFreeContiguousAlignedMemory(g_H1TestPage);
+        g_H1TestPage = NULL;
     }
 
     ShvH0TestPagePhysicalAddress = 0;
+    ShvH1TestPageVirtualAddress = 0;
+    ShvH1BackingPageVirtualAddress = 0;
 }
 
 NTSTATUS
-ShvH0PrepareTestPage (
+ShvH1PreparePages (
     VOID
     )
 {
-    g_H0TestPage = ShvOsAllocateContigousAlignedMemory(PAGE_SIZE);
-    if (g_H0TestPage == NULL)
+    ULONG i;
+    PUCHAR testBytes;
+    PUCHAR backingBytes;
+
+    g_H1TestPage = ShvOsAllocateContigousAlignedMemory(PAGE_SIZE);
+    if (g_H1TestPage == NULL)
     {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    *(volatile UCHAR*)g_H0TestPage = H0_TEST_BYTE;
+    g_H1BackingPage = ShvOsAllocateContigousAlignedMemory(PAGE_SIZE);
+    if (g_H1BackingPage == NULL)
+    {
+        ShvH1FreePages();
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    testBytes = (PUCHAR)g_H1TestPage;
+    backingBytes = (PUCHAR)g_H1BackingPage;
+
+    for (i = 0; i < PAGE_SIZE; i++)
+    {
+        testBytes[i] = (UCHAR)(((i * 131u) + 17u) & 0xFFu);
+        backingBytes[i] = testBytes[i];
+    }
+
+    //
+    // The original 4KB payload is intentionally destroyed here. The backing
+    // page is now the only copy of the expected payload before VMX starts.
+    //
+    RtlFillMemory(g_H1TestPage, PAGE_SIZE, H1_POISON_BYTE);
 
     ShvH0EptTrapCount = 0;
     ShvH0LastGuestPhysicalAddress = 0;
     ShvH0LastExitQualification = 0;
-    ShvH0TestPagePhysicalAddress = ShvOsGetPhysicalAddress(g_H0TestPage);
+    ShvH1RestoreCount = 0;
+
+    ShvH0TestPagePhysicalAddress = ShvOsGetPhysicalAddress(g_H1TestPage);
+    ShvH1TestPageVirtualAddress = (UINT64)(ULONG_PTR)g_H1TestPage;
+    ShvH1BackingPageVirtualAddress = (UINT64)(ULONG_PTR)g_H1BackingPage;
 
     if (ShvH0TestPagePhysicalAddress == 0)
     {
-        ShvH0FreeTestPage();
+        ShvH1FreePages();
         return STATUS_UNSUCCESSFUL;
     }
 
@@ -139,31 +176,41 @@ ShvH0PrepareTestPage (
 }
 
 BOOLEAN
-ShvH0TriggerAndVerifyTrap (
+ShvH1TriggerAndVerifyRestore (
     VOID
     )
 {
-    UCHAR value;
+    SIZE_T matched;
+    volatile UCHAR firstByte;
+    UCHAR expectedFirstByte;
+
+    expectedFirstByte = *(PUCHAR)g_H1BackingPage;
 
     //
-    // This single volatile read is the H0-C experiment. The page was marked
-    // inaccessible in EPT before VM launch. A successful return means the
-    // VM-exit handler restored access and the CPU retried this same read.
+    // The target is still poisoned here. This read must encounter the EPT
+    // trap. Root mode reconstructs the complete page from the backing copy
+    // before allowing this same instruction to retry.
     //
-    value = *(volatile UCHAR*)g_H0TestPage;
+    firstByte = *(volatile UCHAR*)g_H1TestPage;
 
-    if (value != H0_TEST_BYTE)
+    if (firstByte != expectedFirstByte)
     {
         return FALSE;
     }
 
-    if (ShvH0EptTrapCount < 1)
+    if ((ShvH0EptTrapCount < 1) || (ShvH1RestoreCount < 1))
     {
         return FALSE;
     }
 
     if ((ShvH0LastGuestPhysicalAddress & ~((UINT64)PAGE_SIZE - 1)) !=
         ShvH0TestPagePhysicalAddress)
+    {
+        return FALSE;
+    }
+
+    matched = RtlCompareMemory(g_H1TestPage, g_H1BackingPage, PAGE_SIZE);
+    if (matched != PAGE_SIZE)
     {
         return FALSE;
     }
@@ -453,7 +500,7 @@ DriverUnload (
     // Unload the hypervisor before releasing the private H0-C page.
     //
     ShvUnload();
-    ShvH0FreeTestPage();
+    ShvH1FreePages();
 }
 
 NTSTATUS
@@ -473,10 +520,10 @@ DriverEntry (
     UNREFERENCED_PARAMETER(RegistryPath);
 
     //
-    // H0-C owns exactly one private physical page. No application or normal
-    // Windows page is selected for this experiment.
+    // H1-A owns exactly two private pages: a target and a backing copy.
+    // No application or ordinary Windows page is selected for this experiment.
     //
-    status = ShvH0PrepareTestPage();
+    status = ShvH1PreparePages();
     if (!NT_SUCCESS(status))
     {
         return status;
@@ -493,7 +540,7 @@ DriverEntry (
     status = ExCreateCallback(&callbackObject, &objectAttributes, FALSE, TRUE);
     if (!NT_SUCCESS(status))
     {
-        ShvH0FreeTestPage();
+        ShvH1FreePages();
         return status;
     }
 
@@ -516,7 +563,7 @@ DriverEntry (
     //
     if (g_PowerCallbackRegistration == NULL)
     {
-        ShvH0FreeTestPage();
+        ShvH1FreePages();
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -532,25 +579,26 @@ DriverEntry (
     if (!NT_SUCCESS(status))
     {
         ExUnregisterCallback(g_PowerCallbackRegistration);
-        ShvH0FreeTestPage();
+        ShvH1FreePages();
         return status;
     }
 
     //
-    // Deliberately touch the private page once. DriverEntry succeeds only if
-    // the access produced our expected EPT violation and the retried read
-    // returned the sentinel byte intact.
+    // Deliberately read the poisoned target. DriverEntry succeeds only if
+    // EPT traps the access, root mode reconstructs all 4096 bytes from the
+    // separate backing page, and the full restored page verifies correctly.
     //
-    if (ShvH0TriggerAndVerifyTrap() == FALSE)
+    if (ShvH1TriggerAndVerifyRestore() == FALSE)
     {
         ShvUnload();
         ExUnregisterCallback(g_PowerCallbackRegistration);
-        ShvH0FreeTestPage();
+        ShvH1FreePages();
         return STATUS_UNSUCCESSFUL;
     }
 
-    ShvOsDebugPrint("H0-C PASS: EPT trap count=%ld GPA=0x%llX qualification=0x%llX\n",
+    ShvOsDebugPrint("H1-A PASS: trap=%ld restore=%ld GPA=0x%llX qualification=0x%llX\n",
                     ShvH0EptTrapCount,
+                    ShvH1RestoreCount,
                     ShvH0LastGuestPhysicalAddress,
                     ShvH0LastExitQualification);
 
