@@ -201,6 +201,25 @@ ShvVpAllocateData (
         // Zero out the entire data region
         //
         __stosq((UINT64*)data, 0, (sizeof(*data) / sizeof(UINT64)) * CpuCount);
+
+        //
+        // H0-C v2: preserve the proven H0-B size of the large contiguous
+        // per-VP allocation. Allocate the one extra 4KB EPT leaf table
+        // separately so it cannot make that large allocation harder to satisfy.
+        //
+        if (ShvH0TestPagePhysicalAddress != 0)
+        {
+            data->H0EptPt = ShvOsAllocateContigousAlignedMemory(PAGE_SIZE);
+            if (data->H0EptPt == NULL)
+            {
+                ShvOsFreeContiguousAlignedMemory(data, sizeof(*data) * CpuCount);
+                data = NULL;
+            }
+            else
+            {
+                __stosq((UINT64*)data->H0EptPt, 0, PAGE_SIZE / sizeof(UINT64));
+            }
+        }
     }
 
     //
@@ -216,8 +235,15 @@ ShvVpFreeData (
     )
 {
     //
-    // Free the contiguous chunk of RAM
+    // Release the separate H0-C leaf table first, then the proven baseline
+    // per-VP allocation.
     //
+    if (Data->H0EptPt != NULL)
+    {
+        ShvOsFreeContiguousAlignedMemory(Data->H0EptPt, PAGE_SIZE);
+        Data->H0EptPt = NULL;
+    }
+
     ShvOsFreeContiguousAlignedMemory(Data, sizeof(*Data) * CpuCount);
 }
 
