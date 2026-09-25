@@ -80,6 +80,8 @@ typedef struct _SHV_VP_DATA
             UINT64 VmcsPhysicalAddress;
             UINT64 MsrBitmapPhysicalAddress;
             UINT64 EptPml4PhysicalAddress;
+            UINT64 H0TestPagePhysicalAddress;
+            UINT32 H0TestPteIndex;
             UINT32 EptControls;
         };
     };
@@ -88,12 +90,13 @@ typedef struct _SHV_VP_DATA
     DECLSPEC_ALIGN(PAGE_SIZE) VMX_EPML4E Epml4[PML4E_ENTRY_COUNT];
     DECLSPEC_ALIGN(PAGE_SIZE) VMX_PDPTE Epdpt[PDPTE_ENTRY_COUNT];
     DECLSPEC_ALIGN(PAGE_SIZE) VMX_LARGE_PDE Epde[PDPTE_ENTRY_COUNT][PDE_ENTRY_COUNT];
+    DECLSPEC_ALIGN(PAGE_SIZE) VMX_PTE H0EptPt[PDE_ENTRY_COUNT];
 
     DECLSPEC_ALIGN(PAGE_SIZE) VMX_VMCS VmxOn;
     DECLSPEC_ALIGN(PAGE_SIZE) VMX_VMCS Vmcs;
 } SHV_VP_DATA, *PSHV_VP_DATA;
 
-C_ASSERT(sizeof(SHV_VP_DATA) == (KERNEL_STACK_SIZE + (512 + 5) * PAGE_SIZE));
+C_ASSERT(sizeof(SHV_VP_DATA) == (KERNEL_STACK_SIZE + (512 + 6) * PAGE_SIZE));
 
 VOID
 _sldt (
