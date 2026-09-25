@@ -263,9 +263,7 @@ ShvVmxEnterRootModeOnVp (
     //
     if (((VpData->MsrData[12].QuadPart & VMX_EPT_PAGE_WALK_4_BIT) != 0) &&
         ((VpData->MsrData[12].QuadPart & VMX_EPTP_WB_BIT) != 0) &&
-        ((VpData->MsrData[12].QuadPart & VMX_EPT_2MB_PAGE_BIT) != 0) &&
-        ((VpData->MsrData[12].QuadPart & VMX_EPT_INVEPT_BIT) != 0) &&
-        ((VpData->MsrData[12].QuadPart & VMX_EPT_EXTENT_CONTEXT_BIT) != 0))
+        ((VpData->MsrData[12].QuadPart & VMX_EPT_2MB_PAGE_BIT) != 0))
     {
         //
         // Enable EPT if these features are supported
