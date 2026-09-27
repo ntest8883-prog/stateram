@@ -185,3 +185,22 @@ extern volatile long ShvH2DecompressionCount;
 extern volatile long ShvH2HashFailureCount;
 extern volatile long ShvH2CompletedTouches;
 extern volatile long ShvH2FlushCount;
+
+UINT64
+ShvH2HashBuffer (
+    const UINT8* Buffer,
+    UINT32 Length
+    );
+
+UINT8
+ShvH2CompressPage (
+    UINT32 PageIndex,
+    const UINT8* Source,
+    UINT32* CompressedLength
+    );
+
+UINT8
+ShvH2DecompressPage (
+    UINT32 PageIndex,
+    UINT8* Destination
+    );
