@@ -820,10 +820,10 @@ DriverUnload (
     ExUnregisterCallback(g_PowerCallbackRegistration);
 
     //
-    // Unload the hypervisor before releasing the private H1-D page pool.
+    // Unload the hypervisor before releasing the private H2-A page pool.
     //
     ShvUnload();
-    ShvH1FreePages();
+    ShvH2FreePages();
 }
 
 NTSTATUS
@@ -833,6 +833,8 @@ DriverEntry (
     )
 {
     NTSTATUS status;
+    ULONG i;
+    ULONG totalCompressed;
     PCALLBACK_OBJECT callbackObject;
     UNICODE_STRING callbackName =
         RTL_CONSTANT_STRING(L"\\Callback\\PowerState");
@@ -843,11 +845,11 @@ DriverEntry (
     UNREFERENCED_PARAMETER(RegistryPath);
 
     //
-    // H1-D owns eight private target pages plus eight private backing pages.
-    // All allocations are page-sized; no application or ordinary Windows page
-    // is used by this controlled repeated-reclamation milestone.
+    // H2-A owns eight private target GPA frames, exactly three compressed-store
+    // pages, and one shared hot cache frame. It proves compressed backing and
+    // demand restoration without touching application/ordinary Windows pages.
     //
-    status = ShvH1PreparePages();
+    status = ShvH2PreparePages();
     if (!NT_SUCCESS(status))
     {
         return status;
@@ -864,7 +866,7 @@ DriverEntry (
     status = ExCreateCallback(&callbackObject, &objectAttributes, FALSE, TRUE);
     if (!NT_SUCCESS(status))
     {
-        ShvH1FreePages();
+        ShvH2FreePages();
         return status;
     }
 
@@ -887,7 +889,7 @@ DriverEntry (
     //
     if (g_PowerCallbackRegistration == NULL)
     {
-        ShvH1FreePages();
+        ShvH2FreePages();
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -903,34 +905,45 @@ DriverEntry (
     if (!NT_SUCCESS(status))
     {
         ExUnregisterCallback(g_PowerCallbackRegistration);
-        ShvH1FreePages();
+        ShvH2FreePages();
         return status;
     }
 
     //
-    // H1-D runs hundreds of complete reset -> trap -> remap -> detached-frame
-    // reuse -> write -> verify cycles on every logical processor, rotating
-    // across eight independent target/backing page pairs.
+    // H2-A repeatedly cycles all eight logical pages through one 4KB hot cache.
+    // Cold contents live in three physical compressed-store pages, with
+    // full-page hashes checked across every compress/decompress transition.
     //
-    if (ShvH1DRunCycles() == FALSE)
+    if (ShvH2RunCompressionHarness() == FALSE)
     {
         ShvUnload();
         ExUnregisterCallback(g_PowerCallbackRegistration);
-        ShvH1FreePages();
+        ShvH2FreePages();
         return STATUS_UNSUCCESSFUL;
     }
 
-    ShvOsDebugPrint("H1-D PASS: cycles=%ld resets=%ld traps=%ld remaps=%ld write_traps=%ld detached_verified=%ld invept=%ld invept_fail=%ld last_GPA=0x%llX qualification=0x%llX\n",
-                    ShvH1DCompletedCycles,
-                    ShvH1DResetCount,
+    totalCompressed = 0;
+    for (i = 0; i < H2A_PAGE_COUNT; i++)
+    {
+        totalCompressed += ShvH2CompressedLength[i];
+    }
+
+    ShvOsDebugPrint("H2-A PASS: logical_backing=%lu store_reserved=%lu cache=%lu retained_backing=%lu payload=%lu pageins=%ld evictions=%ld compressions=%ld decompressions=%ld touches=%ld flushes=%ld traps=%ld invept=%ld invept_fail=%ld hash_fail=%ld\n",
+                    (ULONG)(H2A_PAGE_COUNT * PAGE_SIZE),
+                    (ULONG)(H2A_STORE_PAGE_COUNT * PAGE_SIZE),
+                    (ULONG)PAGE_SIZE,
+                    (ULONG)((H2A_STORE_PAGE_COUNT + 1) * PAGE_SIZE),
+                    totalCompressed,
+                    ShvH2PageInCount,
+                    ShvH2EvictionCount,
+                    ShvH2CompressionCount,
+                    ShvH2DecompressionCount,
+                    ShvH2CompletedTouches,
+                    ShvH2FlushCount,
                     ShvH0EptTrapCount,
-                    ShvH1RemapCount,
-                    ShvH1WriteTrapCount,
-                    ShvH1DetachedFrameVerifiedCount,
                     ShvH1DInveptCount,
                     ShvH1DInveptFailureCount,
-                    ShvH0LastGuestPhysicalAddress,
-                    ShvH0LastExitQualification);
+                    ShvH2HashFailureCount);
 
     return STATUS_SUCCESS;
 }
