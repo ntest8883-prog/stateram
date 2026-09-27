@@ -224,7 +224,7 @@ ShvH1DRunCycles (
     long failureBefore;
 
     result = TRUE;
-    cpuCount = ShvOsGetActiveProcessorCount();
+    cpuCount = (INT32)KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
 
     if ((cpuCount <= 0) ||
         (cpuCount > (INT32)(sizeof(KAFFINITY) * 8)))
