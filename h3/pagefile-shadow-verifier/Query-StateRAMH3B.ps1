@@ -1,6 +1,7 @@
 param(
     [ValidateSet("query","reset")]
-    [string]$Command = "query"
+    [string]$Command = "query",
+    [switch]$SelfTest
 )
 
 $signature = @'
@@ -73,6 +74,22 @@ public static class StateRAMH3BNative
 
 if (-not ("StateRAMH3BNative" -as [type])) {
     Add-Type -TypeDefinition $signature
+}
+
+if ($SelfTest) {
+    $commandSize = [Runtime.InteropServices.Marshal]::SizeOf([type]"StateRAMH3BNative+Command")
+    $counterSize = [Runtime.InteropServices.Marshal]::SizeOf([type]"StateRAMH3BNative+Counters")
+
+    if ($commandSize -ne 8) {
+        throw "Protocol self-test failed: Command size is $commandSize, expected 8."
+    }
+
+    if ($counterSize -ne 192) {
+        throw "Protocol self-test failed: Counters size is $counterSize, expected 192."
+    }
+
+    Write-Host "StateRAMH3B query protocol self-test: PASS (Command=8, Counters=192)"
+    exit 0
 }
 
 $port = [IntPtr]::Zero
