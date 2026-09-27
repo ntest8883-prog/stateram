@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - h3-pagefile-shadow-verify
+      - h3-pagefile-shadow-dispatch
     paths:
       - "h3/pagefile-shadow-verifier/**"
       - ".github/workflows/stateram-h3b-shadow.yml"
