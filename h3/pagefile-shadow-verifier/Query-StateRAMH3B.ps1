@@ -45,6 +45,7 @@ public static class StateRAMH3BNative
         public Int64 HistoryRecordDrops;
         public Int64 KnownPagefiles;
         public Int64 HistoryCapacity;
+        public Int64 PagefileTableFull;
     }
 
     [DllImport("fltlib.dll", CharSet = CharSet.Unicode)]
@@ -132,6 +133,7 @@ try {
         HistoryRecordDrops      = $reply.HistoryRecordDrops
         KnownPagefiles          = $reply.KnownPagefiles
         HistoryCapacity         = $reply.HistoryCapacity
+        PagefileTableFull       = $reply.PagefileTableFull
     } | Format-List
 }
 finally {
