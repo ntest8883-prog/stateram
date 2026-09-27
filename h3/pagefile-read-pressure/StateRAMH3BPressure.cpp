@@ -331,7 +331,15 @@ static int TargetMode(DWORD parentPid, SIZE_T targetMiB)
     }
 
     wprintf(L"TARGET_TRIMMED=YES\n");
-    SetEvent(ready);
+    if (!SetEvent(ready))
+    {
+        fwprintf(stderr, L"TARGET_ERROR signal-ready=%lu\n", GetLastError());
+        VirtualFree(target, 0, MEM_RELEASE);
+        CloseHandle(ready);
+        CloseHandle(go);
+        CloseHandle(done);
+        return 25;
+    }
 
     DWORD wait = WaitForSingleObject(go, kTargetGoWaitMs);
     if (wait != WAIT_OBJECT_0)
@@ -348,7 +356,16 @@ static int TargetMode(DWORD parentPid, SIZE_T targetMiB)
     bool valid = VerifyRegion(target, bytes, seed);
     wprintf(L"TARGET_VERIFY=%s\n", valid ? L"PASS" : L"FAIL");
 
-    SetEvent(done);
+    if (!SetEvent(done))
+    {
+        fwprintf(stderr, L"TARGET_ERROR signal-done=%lu\n", GetLastError());
+        VirtualFree(target, 0, MEM_RELEASE);
+        CloseHandle(ready);
+        CloseHandle(go);
+        CloseHandle(done);
+        return 26;
+    }
+
     VirtualFree(target, 0, MEM_RELEASE);
     CloseHandle(ready);
     CloseHandle(go);
@@ -410,6 +427,108 @@ static int SelfTest()
         sizeof(H3B_COMMAND),
         sizeof(H3B_COUNTERS),
         static_cast<unsigned long long>(ms.totalPhysMiB));
+    return 0;
+}
+
+static int MachinePreflight()
+{
+    H3B_COUNTERS counters = {};
+    if (!QueryH3B(counters))
+    {
+        fwprintf(stderr, L"PREFLIGHT=FAIL reason=H3B_QUERY\n");
+        return 70;
+    }
+
+    if (counters.ShadowMismatches != 0)
+    {
+        fwprintf(stderr, L"PREFLIGHT=FAIL reason=EXISTING_MISMATCHES value=%lld\n",
+            counters.ShadowMismatches);
+        return 71;
+    }
+
+    if ((counters.KnownPagefiles <= 0) ||
+        (counters.PagingFileCreates <= 0) ||
+        (counters.PagefileTableFull != 0))
+    {
+        fwprintf(stderr,
+            L"PREFLIGHT=FAIL reason=PAGEFILE_STATE known=%lld creates=%lld tableFull=%lld\n",
+            counters.KnownPagefiles,
+            counters.PagingFileCreates,
+            counters.PagefileTableFull);
+        return 72;
+    }
+
+    MemSnapshot memory = {};
+    if (!GetMemorySnapshot(memory))
+    {
+        fwprintf(stderr, L"PREFLIGHT=FAIL reason=MEMORY_STATUS\n");
+        return 73;
+    }
+
+    HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+    bool hasMemoryPriority =
+        (GetProcAddress(kernel32, "SetProcessInformation") != nullptr);
+
+    const SIZE_T bytes = 8 * kMiB;
+    const uint64_t seed = 0x505245464C494748ull;
+    void* sample = VirtualAlloc(
+        nullptr,
+        bytes,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE);
+
+    if (!sample)
+    {
+        fwprintf(stderr, L"PREFLIGHT=FAIL reason=ALLOC error=%lu\n", GetLastError());
+        return 74;
+    }
+
+    FillRegion(sample, bytes, seed);
+
+    if (!SetProcessWorkingSetSize(
+            GetCurrentProcess(),
+            static_cast<SIZE_T>(-1),
+            static_cast<SIZE_T>(-1)))
+    {
+        DWORD error = GetLastError();
+        VirtualFree(sample, 0, MEM_RELEASE);
+        fwprintf(stderr, L"PREFLIGHT=FAIL reason=WORKING_SET_TRIM error=%lu\n", error);
+        return 75;
+    }
+
+    bool valid = VerifyRegion(sample, bytes, seed);
+    VirtualFree(sample, 0, MEM_RELEASE);
+
+    if (!valid)
+    {
+        fwprintf(stderr, L"PREFLIGHT=FAIL reason=DATA_VERIFY\n");
+        return 76;
+    }
+
+    H3B_COUNTERS after = {};
+    if (!QueryH3B(after))
+    {
+        fwprintf(stderr, L"PREFLIGHT=FAIL reason=FINAL_H3B_QUERY\n");
+        return 77;
+    }
+
+    if (after.ShadowMismatches != counters.ShadowMismatches)
+    {
+        fwprintf(stderr, L"PREFLIGHT=FAIL reason=NEW_MISMATCH delta=%lld\n",
+            after.ShadowMismatches - counters.ShadowMismatches);
+        return 78;
+    }
+
+    wprintf(L"PREFLIGHT=PASS totalPhys=%llu MiB available=%llu MiB "
+            L"commitAvailable=%llu MiB memoryPriorityApi=%s "
+            L"knownPagefiles=%lld historyDrops=%lld\n",
+        static_cast<unsigned long long>(memory.totalPhysMiB),
+        static_cast<unsigned long long>(memory.availPhysMiB),
+        static_cast<unsigned long long>(memory.availCommitMiB),
+        hasMemoryPriority ? L"YES" : L"NO",
+        after.KnownPagefiles,
+        after.HistoryRecordDrops);
+
     return 0;
 }
 
@@ -544,7 +663,23 @@ static int ParentMode()
 
     do
     {
-        DWORD wait = WaitForSingleObject(ready, kTargetReadyWaitMs);
+        HANDLE readyWaitHandles[2] = { ready, pi.hProcess };
+        DWORD wait = WaitForMultipleObjects(
+            2,
+            readyWaitHandles,
+            FALSE,
+            kTargetReadyWaitMs);
+
+        if (wait == (WAIT_OBJECT_0 + 1))
+        {
+            DWORD childCode = STILL_ACTIVE;
+            GetExitCodeProcess(pi.hProcess, &childCode);
+            fwprintf(stderr,
+                L"RESULT=ABORT reason=TARGET_EXITED_BEFORE_READY code=%lu\n",
+                static_cast<unsigned long>(childCode));
+            break;
+        }
+
         if (wait != WAIT_OBJECT_0)
         {
             fwprintf(stderr, L"RESULT=ABORT reason=TARGET_READY_TIMEOUT wait=%lu\n", wait);
@@ -643,8 +778,7 @@ static int ParentMode()
             allocatedMiB += kPressureChunk / kMiB;
             ++blockNumber;
 
-            if ((allocatedMiB >= 256) &&
-                ((allocatedMiB % 64) == 0))
+            if ((allocatedMiB % 64) == 0)
             {
                 H3B_COUNTERS probe = {};
                 if (!QueryH3B(probe))
@@ -691,7 +825,8 @@ static int ParentMode()
                     break;
                 }
 
-                if ((writeDelta >= kEvidencePagefileWrites) &&
+                if ((allocatedMiB >= 256) &&
+                    (writeDelta >= kEvidencePagefileWrites) &&
                     (shadowDelta >= kEvidenceShadowPages))
                 {
                     wprintf(L"PRESSURE_STOP reason=FRESH_PAGEFILE_EVIDENCE "
@@ -762,14 +897,24 @@ static int ParentMode()
 
         SetEvent(go);
 
-        wait = WaitForSingleObject(done, kTargetVerifyWaitMs);
-        if (wait != WAIT_OBJECT_0)
+        HANDLE verifyWaitHandles[2] = { done, pi.hProcess };
+        wait = WaitForMultipleObjects(
+            2,
+            verifyWaitHandles,
+            FALSE,
+            kTargetVerifyWaitMs);
+
+        if ((wait != WAIT_OBJECT_0) &&
+            (wait != (WAIT_OBJECT_0 + 1)))
         {
             fwprintf(stderr, L"RESULT=ABORT reason=TARGET_VERIFY_TIMEOUT wait=%lu\n", wait);
             break;
         }
 
-        WaitForSingleObject(pi.hProcess, 30000);
+        if (wait == WAIT_OBJECT_0)
+        {
+            WaitForSingleObject(pi.hProcess, 30000);
+        }
 
         DWORD childCode = STILL_ACTIVE;
         GetExitCodeProcess(pi.hProcess, &childCode);
@@ -861,6 +1006,11 @@ int wmain(int argc, wchar_t** argv)
         return SelfTest();
     }
 
+    if ((argc == 2) && (_wcsicmp(argv[1], L"--preflight") == 0))
+    {
+        return MachinePreflight();
+    }
+
     if ((argc == 4) && (_wcsicmp(argv[1], L"--target") == 0))
     {
         wchar_t* end1 = nullptr;
@@ -886,7 +1036,7 @@ int wmain(int argc, wchar_t** argv)
 
     if (argc != 1)
     {
-        fwprintf(stderr, L"Usage: StateRAMH3BPressure.exe [--selftest]\n");
+        fwprintf(stderr, L"Usage: StateRAMH3BPressure.exe [--selftest|--preflight]\n");
         return 1;
     }
 
