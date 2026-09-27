@@ -70,6 +70,32 @@ class Model:
         self.shadow.clear()
 
 
+
+class AliasModel(Model):
+    """Models multiple FILE_OBJECT-like handles that name one paging file."""
+
+    def __init__(self, history_slots: int = 8):
+        super().__init__(history_slots)
+        self.aliases: Dict[str, str] = {}
+
+    def alias(self, handle: str, paging_file: str) -> None:
+        self.aliases[handle] = paging_file
+
+    def begin_write_handle(self, handle: str, start: int, length: int) -> int:
+        return self.begin_write(self.aliases[handle], start, length)
+
+    def complete_write_handle(
+        self,
+        handle: str,
+        seq: int,
+        pages: Dict[int, bytes],
+    ) -> None:
+        self.complete_write(self.aliases[handle], seq, pages)
+
+    def read_handle(self, handle: str, offset: int, actual: bytes) -> str:
+        return self.read(self.aliases[handle], offset, actual)
+
+
 def page(ch: int) -> bytes:
     return bytes([ch]) * PAGE
 
@@ -145,8 +171,36 @@ def main() -> None:
     assert r.read("C", 0, page(2)) == "match"
     assert r.read("C", 0, page(1)) == "mismatch"
 
+    # 13. Multiple FILE_OBJECT aliases for one paging file must share history.
+    # A newer overlapping write through alias B invalidates the older sample
+    # originally published through alias A.
+    a = AliasModel()
+    a.alias("C-object-1", "C-pagefile")
+    a.alias("C-object-2", "C-pagefile")
+    old_alias = a.begin_write_handle("C-object-1", 0, PAGE)
+    a.complete_write_handle("C-object-1", old_alias, {0: page(1)})
+    newer_alias = a.begin_write_handle("C-object-2", 0, PAGE)
+    assert a.read_handle("C-object-1", 0, page(1)) == "untracked"
+    a.complete_write_handle("C-object-2", newer_alias, {0: page(2)})
+    assert a.read_handle("C-object-1", 0, page(2)) == "match"
+
+    # 14. Non-overlapping writes through aliases of the same paging file do
+    # not invalidate an unrelated page.
+    keep = a.begin_write_handle("C-object-1", 8 * PAGE, PAGE)
+    a.complete_write_handle("C-object-1", keep, {8 * PAGE: page(3)})
+    other = a.begin_write_handle("C-object-2", 20 * PAGE, PAGE)
+    a.complete_write_handle("C-object-2", other, {20 * PAGE: page(4)})
+    assert a.read_handle("C-object-1", 8 * PAGE, page(3)) == "match"
+
+    # 15. Aliases from different paging-file identities remain independent.
+    a.alias("D-object-1", "D-pagefile")
+    d = a.begin_write_handle("D-object-1", 0, PAGE)
+    a.complete_write_handle("D-object-1", d, {0: page(9)})
+    assert a.read_handle("D-object-1", 0, page(9)) == "match"
+    assert a.read_handle("C-object-1", 0, page(2)) == "match"
+
     print("H3B_HISTORY_MODEL=PASS")
-    print("cases=12")
+    print("cases=15")
 
 
 if __name__ == "__main__":
