@@ -124,81 +124,198 @@ ShvVmxInvalidateEpt (
     return result;
 }
 
-UINT8
-ShvH1DResetTarget (
+static
+PVMX_PTE
+ShvH2GetTargetLeaf (
     _In_ PSHV_VP_DATA VpData,
-    _In_ UINT32 Sequence,
-    _Out_ UINT32* TargetIndex
+    _In_ UINT32 TargetIndex
     )
 {
-    UINT32 i;
-    UINT32 t;
     UINT32 r;
     UINT32 pteIndex;
-    UINT8 value;
-    UINT8* target;
-    UINT8* backing;
+
+    if (TargetIndex >= H2A_PAGE_COUNT)
+    {
+        return NULL;
+    }
+
+    r = VpData->H1TargetRegionIndex[TargetIndex];
+    pteIndex = VpData->H1TargetPteIndex[TargetIndex];
+
+    if ((r >= VpData->H1RegionCount) ||
+        (VpData->H1EptPt[r] == NULL))
+    {
+        return NULL;
+    }
+
+    return &VpData->H1EptPt[r][pteIndex];
+}
+
+UINT8
+ShvH2EvictResident (
+    _In_ PSHV_VP_DATA VpData
+    )
+{
+    INT32 resident;
+    UINT32 compressedLength;
+    UINT64 hash;
+    UINT8* cache;
     PVMX_PTE leaf;
 
-    t = Sequence % H1D_PAGE_COUNT;
-    *TargetIndex = t;
+    resident = VpData->H2ResidentTarget;
+    if (resident < 0)
+    {
+        return TRUE;
+    }
 
-    if ((ShvH1TargetPagePhysicalAddresses[t] == 0) ||
-        (ShvH1BackingPagePhysicalAddresses[t] == 0) ||
-        (ShvH1TargetPageVirtualAddresses[t] == 0) ||
-        (ShvH1BackingPageVirtualAddresses[t] == 0))
+    if (resident >= H2A_PAGE_COUNT)
     {
         return FALSE;
     }
 
-    target =
-        (UINT8*)(uintptr_t)ShvH1TargetPageVirtualAddresses[t];
-    backing =
-        (UINT8*)(uintptr_t)ShvH1BackingPageVirtualAddresses[t];
+    leaf = ShvH2GetTargetLeaf(VpData, (UINT32)resident);
+    cache = (UINT8*)(uintptr_t)ShvH2CachePageVirtualAddress;
 
-    //
-    // Re-seed both physical frames from VMX root mode. Host accesses bypass
-    // EPT, so this initializes true HPA A and HPA B even if the guest is
-    // currently seeing GPA A remapped to B.
-    //
-    for (i = 0; i < PAGE_SIZE; i++)
-    {
-        value =
-            (UINT8)(((i * 131u) +
-                     (Sequence * 17u) +
-                     (t * 29u) +
-                     0x5Du) & 0xFFu);
-        target[i] = value;
-        backing[i] = value;
-    }
-
-    r = VpData->H1TargetRegionIndex[t];
-    pteIndex = VpData->H1TargetPteIndex[t];
-
-    if (r >= VpData->H1RegionCount)
+    if ((leaf == NULL) ||
+        (cache == NULL) ||
+        (ShvH1TargetPagePhysicalAddresses[resident] == 0))
     {
         return FALSE;
     }
 
-    leaf = &VpData->H1EptPt[r][pteIndex];
-
     //
-    // Re-arm the target for a fresh cycle. This changes the live EPT physical
-    // address back from HPA B to HPA A and removes permissions.
+    // First revoke the old GPA->cache mapping and invalidate it before the
+    // shared cache frame is touched or reused for another logical page.
     //
     leaf->PageFrameNumber =
-        ShvH1TargetPagePhysicalAddresses[t] / PAGE_SIZE;
+        ShvH1TargetPagePhysicalAddresses[resident] / PAGE_SIZE;
     leaf->Read = 0;
     leaf->Write = 0;
     leaf->Execute = 0;
-    VpData->H1Phase[t] = 0;
 
     if (ShvVmxInvalidateEpt(VpData) == FALSE)
     {
         return FALSE;
     }
 
-    _InterlockedIncrement(&ShvH1DResetCount);
+    //
+    // The logical page is now cold. Re-encode the entire 4KB cache image into
+    // its fixed 1536-byte compressed slot and remember a full-page integrity
+    // hash. No OS service or allocation is used in VMX root mode.
+    //
+    hash = ShvH2HashBuffer(cache, PAGE_SIZE);
+    compressedLength = 0;
+
+    if (ShvH2CompressPage((UINT32)resident,
+                          cache,
+                          &compressedLength) == FALSE)
+    {
+        _InterlockedIncrement(&ShvH2HashFailureCount);
+        return FALSE;
+    }
+
+    ShvH2CompressedLength[resident] = compressedLength;
+    ShvH2PageHash[resident] = hash;
+    VpData->H2ResidentTarget = -1;
+
+    _InterlockedIncrement(&ShvH2CompressionCount);
+    _InterlockedIncrement(&ShvH2EvictionCount);
+    return TRUE;
+}
+
+UINT8
+ShvH2PageIn (
+    _In_ PSHV_VP_DATA VpData,
+    _In_ UINT32 TargetIndex
+    )
+{
+    UINT32 i;
+    UINT64 hash;
+    UINT64* cacheQwords;
+    UINT8* cache;
+    PVMX_PTE leaf;
+
+    if ((TargetIndex >= H2A_PAGE_COUNT) ||
+        (ShvH2CachePagePhysicalAddress == 0) ||
+        (ShvH2CachePageVirtualAddress == 0))
+    {
+        return FALSE;
+    }
+
+    if (VpData->H2ResidentTarget == (INT32)TargetIndex)
+    {
+        return FALSE;
+    }
+
+    if (ShvH2EvictResident(VpData) == FALSE)
+    {
+        return FALSE;
+    }
+
+    cache = (UINT8*)(uintptr_t)ShvH2CachePageVirtualAddress;
+    cacheQwords = (UINT64*)cache;
+
+    //
+    // Poison the shared cache before every decode. A short/partial decode
+    // therefore cannot accidentally pass because old cache bytes survived.
+    //
+    for (i = 0; i < (PAGE_SIZE / sizeof(UINT64)); i++)
+    {
+        cacheQwords[i] = 0xE7E7E7E7E7E7E7E7ULL;
+    }
+
+    if (ShvH2DecompressPage(TargetIndex, cache) == FALSE)
+    {
+        _InterlockedIncrement(&ShvH2HashFailureCount);
+        return FALSE;
+    }
+
+    hash = ShvH2HashBuffer(cache, PAGE_SIZE);
+    if (hash != ShvH2PageHash[TargetIndex])
+    {
+        _InterlockedIncrement(&ShvH2HashFailureCount);
+        return FALSE;
+    }
+
+    leaf = ShvH2GetTargetLeaf(VpData, TargetIndex);
+    if (leaf == NULL)
+    {
+        return FALSE;
+    }
+
+    //
+    // Materialize this logical page by mapping its unchanged GPA to the one
+    // shared hot cache HPA. Writes are allowed; any dirty contents are
+    // recompressed when the next logical page faults in.
+    //
+    leaf->PageFrameNumber =
+        ShvH2CachePagePhysicalAddress / PAGE_SIZE;
+    leaf->Read = 1;
+    leaf->Write = 1;
+    leaf->Execute = 0;
+
+    if (ShvVmxInvalidateEpt(VpData) == FALSE)
+    {
+        return FALSE;
+    }
+
+    VpData->H2ResidentTarget = (INT32)TargetIndex;
+    _InterlockedIncrement(&ShvH2DecompressionCount);
+    _InterlockedIncrement(&ShvH2PageInCount);
+    return TRUE;
+}
+
+UINT8
+ShvH2FlushResident (
+    _In_ PSHV_VP_DATA VpData
+    )
+{
+    if (ShvH2EvictResident(VpData) == FALSE)
+    {
+        return FALSE;
+    }
+
+    _InterlockedIncrement(&ShvH2FlushCount);
     return TRUE;
 }
 
@@ -225,30 +342,24 @@ ShvVmxHandleCpuid (
     }
 
     //
-    // H1-D uses a private ring-0 CPUID leaf as a tiny hypercall to reset one
-    // controlled target for the next reclaim cycle.
+    // H2-A uses one private ring-0 CPUID leaf to force the final hot cache
+    // page back into compressed storage so every logical page ends cold.
     //
-    if ((VpState->VpRegs->Rax == H1D_CPUID_RESET_LEAF) &&
+    if ((VpState->VpRegs->Rax == H2A_CPUID_FLUSH_LEAF) &&
         ((ShvVmxRead(GUEST_CS_SELECTOR) & RPL_MASK) == DPL_SYSTEM))
     {
-        UINT32 targetIndex;
-        UINT32 sequence;
-
-        sequence = (UINT32)VpState->VpRegs->Rcx;
-        targetIndex = 0;
-
-        if (ShvH1DResetTarget(VpData, sequence, &targetIndex) != FALSE)
+        if (ShvH2FlushResident(VpData) != FALSE)
         {
-            VpState->VpRegs->Rax = H1D_CPUID_RESET_OK;
-            VpState->VpRegs->Rbx = targetIndex;
-            VpState->VpRegs->Rcx = sequence;
+            VpState->VpRegs->Rax = H2A_CPUID_FLUSH_OK;
+            VpState->VpRegs->Rbx = 0;
+            VpState->VpRegs->Rcx = 0;
             VpState->VpRegs->Rdx = 0;
         }
         else
         {
             VpState->VpRegs->Rax = 0;
-            VpState->VpRegs->Rbx = targetIndex;
-            VpState->VpRegs->Rcx = sequence;
+            VpState->VpRegs->Rbx = 0;
+            VpState->VpRegs->Rcx = 0;
             VpState->VpRegs->Rdx = 1;
         }
 
@@ -326,15 +437,10 @@ ShvVmxHandleExit (
     )
 {
     UINT8 advanceRip;
-    UINT8 detachedFrameVerified;
-    UINT32 i;
     UINT32 t;
-    UINT32 r;
-    UINT32 pteIndex;
     UINT64 guestPhysicalAddress;
     UINT64 guestPageBase;
     UINT64 exitQualification;
-    UINT64* detachedFrame;
     PVMX_PTE leaf;
 
     advanceRip = TRUE;
@@ -358,7 +464,7 @@ ShvVmxHandleExit (
         exitQualification =
             ShvVmxRead(EXIT_QUALIFICATION);
 
-        for (t = 0; t < H1D_PAGE_COUNT; t++)
+        for (t = 0; t < H2A_PAGE_COUNT; t++)
         {
             if (guestPageBase ==
                 VpData->H1TargetPagePhysicalAddress[t])
@@ -367,108 +473,41 @@ ShvVmxHandleExit (
             }
         }
 
-        if ((t < H1D_PAGE_COUNT) &&
-            (ShvH1BackingPagePhysicalAddresses[t] != 0))
+        if (t < H2A_PAGE_COUNT)
         {
-            r = VpData->H1TargetRegionIndex[t];
-            pteIndex = VpData->H1TargetPteIndex[t];
-
-            if (r < VpData->H1RegionCount)
+            if (ShvH2PageIn(VpData, t) == FALSE)
             {
-                leaf = &VpData->H1EptPt[r][pteIndex];
-
-                if (VpData->H1Phase[t] == 0)
+                //
+                // Fail open only to the driver's private poisoned target HPA.
+                // This prevents a decompression error from spinning forever on
+                // the same EPT fault; the guest harness will observe bad data
+                // and DriverEntry will fail cleanly.
+                //
+                leaf = ShvH2GetTargetLeaf(VpData, t);
+                if (leaf != NULL)
                 {
-                    //
-                    // Phase 1: detach HPA A and redirect this GPA to HPA B.
-                    //
                     leaf->PageFrameNumber =
-                        ShvH1BackingPagePhysicalAddresses[t] /
-                        PAGE_SIZE;
-                    leaf->Read = 1;
-                    leaf->Write = 0;
-                    leaf->Execute = 0;
-                    VpData->H1Phase[t] = 1;
-
-                    ShvVmxInvalidateEpt(VpData);
-                    _InterlockedIncrement(&ShvH1RemapCount);
-                }
-                else if ((VpData->H1Phase[t] == 1) &&
-                         ((exitQualification & 0x2) != 0))
-                {
-                    //
-                    // Phase 2: reuse detached HPA A as VMX-root scratch while
-                    // the guest logical page remains backed by HPA B.
-                    //
-                    detachedFrame =
-                        (UINT64*)(uintptr_t)
-                            ShvH1TargetPageVirtualAddresses[t];
-                    detachedFrameVerified = FALSE;
-
-                    if (detachedFrame != NULL)
-                    {
-                        for (i = 0;
-                             i < (PAGE_SIZE / sizeof(UINT64));
-                             i++)
-                        {
-                            detachedFrame[i] =
-                                0x3C3C3C3C3C3C3C3CULL ^
-                                (((UINT64)t) << 56);
-                        }
-
-                        detachedFrameVerified = TRUE;
-                        for (i = 0;
-                             i < (PAGE_SIZE / sizeof(UINT64));
-                             i++)
-                        {
-                            if (detachedFrame[i] !=
-                                (0x3C3C3C3C3C3C3C3CULL ^
-                                 (((UINT64)t) << 56)))
-                            {
-                                detachedFrameVerified = FALSE;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (detachedFrameVerified != FALSE)
-                    {
-                        _InterlockedIncrement(
-                            &ShvH1DetachedFrameVerifiedCount);
-                    }
-
-                    leaf->PageFrameNumber =
-                        ShvH1BackingPagePhysicalAddresses[t] /
+                        ShvH1TargetPagePhysicalAddresses[t] /
                         PAGE_SIZE;
                     leaf->Read = 1;
                     leaf->Write = 1;
                     leaf->Execute = 0;
-                    VpData->H1Phase[t] = 2;
-
-                    ShvVmxInvalidateEpt(VpData);
-                    _InterlockedIncrement(&ShvH1WriteTrapCount);
-                }
-                else
-                {
-                    leaf->PageFrameNumber =
-                        ShvH1BackingPagePhysicalAddresses[t] /
-                        PAGE_SIZE;
-                    leaf->Read = 1;
-                    leaf->Write =
-                        (VpData->H1Phase[t] >= 2) ? 1 : 0;
-                    leaf->Execute = 0;
-
                     ShvVmxInvalidateEpt(VpData);
                 }
-
-                ShvH0LastGuestPhysicalAddress =
-                    guestPhysicalAddress;
-                ShvH0LastExitQualification =
-                    exitQualification;
-                _InterlockedIncrement(&ShvH0EptTrapCount);
-
-                advanceRip = FALSE;
             }
+
+            ShvH0LastGuestPhysicalAddress =
+                guestPhysicalAddress;
+            ShvH0LastExitQualification =
+                exitQualification;
+            _InterlockedIncrement(&ShvH0EptTrapCount);
+
+            //
+            // EPT violations happen before the guest memory instruction. Retry
+            // the exact instruction through either the restored cache mapping
+            // or the controlled failure mapping above.
+            //
+            advanceRip = FALSE;
         }
         break;
     case EXIT_REASON_VMCALL:
