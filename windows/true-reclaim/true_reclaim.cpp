@@ -173,51 +173,37 @@ bool CompressAndDecommit(SIZE_T index,
     BYTE* page = g_region + index * g_page_size;
     const std::uint64_t hash = HashPage(page, g_page_size);
 
-    SIZE_T needed = 0;
-    SetLastError(ERROR_SUCCESS);
-    const BOOL probe =
-        Compress(g_compressor,
-                 page,
-                 g_page_size,
-                 nullptr,
-                 0,
-                 &needed);
-
-    if (!probe && GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
-        InterlockedExchange(&meta.state, PAGE_RESIDENT);
-        return false;
-    }
-
-    if (needed == 0) {
-        InterlockedExchange(&meta.state, PAGE_RESIDENT);
-        return false;
-    }
-
-    // The zero-sized probe returns the buffer size required to guarantee
-    // compression succeeds, not the final compressed payload size. Allocate
-    // that buffer first, then decide whether the actual result is worth
-    // decommitting the source page.
-    void* buffer = HeapAlloc(GetProcessHeap(), 0, needed);
-    if (buffer == nullptr) {
-        InterlockedExchange(&meta.state, PAGE_RESIDENT);
-        return false;
-    }
-
+    // Compress into one reusable-sized stack scratch buffer first. Do not
+    // allocate the API's conservative worst-case size per page: that would
+    // retain nearly a full page of heap capacity for every compressed page
+    // and could erase the very RAM saving this experiment is meant to prove.
+    BYTE scratch[16 * 1024];
     SIZE_T actual = 0;
+
     if (!Compress(g_compressor,
                   page,
                   g_page_size,
-                  buffer,
-                  needed,
+                  scratch,
+                  sizeof(scratch),
                   &actual) ||
-        actual == 0 ||
-        actual >= (g_page_size - 128)) {
-        HeapFree(GetProcessHeap(), 0, buffer);
+        actual == 0) {
+        InterlockedExchange(&meta.state, PAGE_RESIDENT);
+        return false;
+    }
+
+    if (actual >= (g_page_size - 128)) {
         *skipped_incompressible = true;
         InterlockedExchange(&meta.state, PAGE_RESIDENT);
         return true;
     }
 
+    void* buffer = HeapAlloc(GetProcessHeap(), 0, actual);
+    if (buffer == nullptr) {
+        InterlockedExchange(&meta.state, PAGE_RESIDENT);
+        return false;
+    }
+
+    std::memcpy(buffer, scratch, actual);
     meta.compressed = buffer;
     meta.compressed_size = actual;
     meta.hash = hash;
@@ -527,7 +513,9 @@ int main(int argc, char** argv) {
         sample_count == 0 ||
         g_faults_handled < static_cast<LONG64>(sample_count * 2) ||
         g_restores < static_cast<LONG64>(sample_count * 2) ||
-        g_hash_failures != 0) {
+        g_hash_failures != 0 ||
+        private_drop <= 0 ||
+        private_drop < (model_net_saved / 2)) {
         ok = false;
     }
 
