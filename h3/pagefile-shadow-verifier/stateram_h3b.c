@@ -54,10 +54,11 @@ typedef struct _H3B_COUNTERS
     LONG64 CrossObjectMismatches;
     LONG64 NewSystemBufferComparisons;
     LONG64 NewSystemBufferMismatches;
+    LONG64 DynamicPagefileDiscoveries;
 } H3B_COUNTERS, *PH3B_COUNTERS;
 
 C_ASSERT(sizeof(H3B_COMMAND) == 8);
-C_ASSERT(sizeof(H3B_COUNTERS) == 256);
+C_ASSERT(sizeof(H3B_COUNTERS) == 264);
 
 typedef struct _H3B_SHADOW_ENTRY
 {
@@ -140,6 +141,7 @@ volatile LONG64 g_CrossObjectMatches;
 volatile LONG64 g_CrossObjectMismatches;
 volatile LONG64 g_NewSystemBufferComparisons;
 volatile LONG64 g_NewSystemBufferMismatches;
+volatile LONG64 g_DynamicPagefileDiscoveries;
 
 DRIVER_INITIALIZE DriverEntry;
 
@@ -187,6 +189,7 @@ H3BResetCounters (
     InterlockedExchange64(&g_CrossObjectMismatches, 0);
     InterlockedExchange64(&g_NewSystemBufferComparisons, 0);
     InterlockedExchange64(&g_NewSystemBufferMismatches, 0);
+    InterlockedExchange64(&g_DynamicPagefileDiscoveries, 0);
 
     generation = InterlockedIncrement(&g_ShadowGeneration);
 
@@ -300,7 +303,7 @@ H3BIsKnownPagefile (
 }
 
 static
-VOID
+BOOLEAN
 H3BRememberPagefile (
     _In_ PFILE_OBJECT FileObject,
     _In_ PFLT_INSTANCE Instance
@@ -321,7 +324,7 @@ H3BRememberPagefile (
     if (H3BFindPagefileObjectIndexLocked(FileObject) >= 0)
     {
         KeReleaseSpinLock(&g_PagefileLock, oldIrql);
-        return;
+        return FALSE;
     }
 
     for (objectSlot = 0;
@@ -338,7 +341,7 @@ H3BRememberPagefile (
     {
         InterlockedIncrement64(&g_PagefileTableFull);
         KeReleaseSpinLock(&g_PagefileLock, oldIrql);
-        return;
+        return FALSE;
     }
 
     identityIndex = H3BFindPagefileIdentityIndexLocked(Instance);
@@ -359,7 +362,7 @@ H3BRememberPagefile (
         {
             InterlockedIncrement64(&g_PagefileTableFull);
             KeReleaseSpinLock(&g_PagefileLock, oldIrql);
-            return;
+            return FALSE;
         }
 
         RtlZeroMemory(
@@ -390,6 +393,7 @@ H3BRememberPagefile (
     }
 
     KeReleaseSpinLock(&g_PagefileLock, oldIrql);
+    return TRUE;
 }
 
 static
@@ -431,6 +435,50 @@ H3BReleasePagefiles (
             ObDereferenceObject(objects[i]);
         }
     }
+}
+
+static
+BOOLEAN
+H3BEnsureKnownPagefile (
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects
+    )
+{
+    PFILE_OBJECT fileObject;
+
+    fileObject = Data->Iopb->TargetFileObject;
+
+    if (H3BIsKnownPagefile(fileObject))
+    {
+        return TRUE;
+    }
+
+    /*
+     * This fallback lets a DEMAND_START verifier discover already-open
+     * pagefiles without requiring a reboot.  We invoke FsRtlIsPagingFile only
+     * for IRP-based paging I/O, and only from the pre-operation path where
+     * Filter Manager callbacks run at <= APC_LEVEL.
+     */
+    if (!FLT_IS_IRP_OPERATION(Data) ||
+        !FlagOn(Data->Iopb->IrpFlags, IRP_PAGING_IO) ||
+        (KeGetCurrentIrql() > APC_LEVEL))
+    {
+        return FALSE;
+    }
+
+    if (!FsRtlIsPagingFile(fileObject))
+    {
+        return FALSE;
+    }
+
+    if (H3BRememberPagefile(
+            fileObject,
+            FltObjects->Instance))
+    {
+        InterlockedIncrement64(&g_DynamicPagefileDiscoveries);
+    }
+
+    return H3BIsKnownPagefile(fileObject);
 }
 
 static
@@ -1158,10 +1206,9 @@ H3BPreRead (
 {
     ULONG length;
 
-    UNREFERENCED_PARAMETER(FltObjects);
     UNREFERENCED_PARAMETER(CompletionContext);
 
-    if (!H3BIsKnownPagefile(Data->Iopb->TargetFileObject))
+    if (!H3BEnsureKnownPagefile(Data, FltObjects))
     {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
@@ -1209,9 +1256,7 @@ H3BPreWrite (
     ULONG length;
     ULONGLONG writeSequence;
 
-    UNREFERENCED_PARAMETER(FltObjects);
-
-    if (!H3BIsKnownPagefile(Data->Iopb->TargetFileObject))
+    if (!H3BEnsureKnownPagefile(Data, FltObjects))
     {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
@@ -1284,7 +1329,7 @@ H3BPostCreate (
         FlagOn(Data->Iopb->OperationFlags, SL_OPEN_PAGING_FILE) &&
         (FltObjects->FileObject != NULL))
     {
-        H3BRememberPagefile(
+        (VOID)H3BRememberPagefile(
             FltObjects->FileObject,
             FltObjects->Instance);
     }
@@ -1446,6 +1491,7 @@ H3BMessage (
     reply->CrossObjectMismatches = H3BReadCounter(&g_CrossObjectMismatches);
     reply->NewSystemBufferComparisons = H3BReadCounter(&g_NewSystemBufferComparisons);
     reply->NewSystemBufferMismatches = H3BReadCounter(&g_NewSystemBufferMismatches);
+    reply->DynamicPagefileDiscoveries = H3BReadCounter(&g_DynamicPagefileDiscoveries);
 
     *ReturnOutputBufferLength = sizeof(*reply);
     return STATUS_SUCCESS;
