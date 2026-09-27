@@ -55,6 +55,21 @@ This allows the verifier logic to be exercised after a manual load in the same
 Windows boot, rather than requiring another reboot merely to rediscover the
 already-open pagefiles.
 
+## Concurrent-write correctness
+
+H3-B5 does not use pre-write sequence numbers as proof of final storage order.
+If two overlapping writes are simultaneously in flight, both ranges remember
+that uncertainty and neither completion may publish a fingerprint. This remains
+true even if their post-operation callbacks happen in an apparently convenient
+order.
+
+If an in-flight range is evicted from the bounded history ring before its
+completion arrives, the corresponding canonical pagefile enters a conservative
+unknown-write state. New samples and comparisons are suppressed until that late
+completion retires the barrier. If pagefile-object/identity capacity is ever
+exceeded, verification fails closed and `PagefileTableFull` becomes a stop
+signal.
+
 ## Bounded verifier state
 
 - 32,768 direct-mapped shadow entries in nonpaged pool.
