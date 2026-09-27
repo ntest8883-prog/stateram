@@ -92,6 +92,12 @@ ShvOsGetPhysicalAddress (
     _In_ PVOID BaseAddress
     );
 
+VOID
+ShvOsDebugPrint (
+    _In_ PCCH Format,
+    ...
+    );
+
 PVOID g_PowerCallbackRegistration;
 PVOID g_H1TargetPages[H1D_PAGE_COUNT];
 PVOID g_H1BackingPages[H1D_PAGE_COUNT];
