@@ -1,0 +1,93 @@
+name: StateRAM H3-B pagefile shadow verifier build
+
+on:
+  push:
+    branches:
+      - h3-pagefile-shadow-verify
+    paths:
+      - "h3/pagefile-shadow-verifier/**"
+      - ".github/workflows/stateram-h3b-shadow.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Add NuGet to PATH
+        uses: NuGet/setup-nuget@v2
+
+      - name: Restore WDK packages
+        shell: pwsh
+        run: |
+          nuget restore h3/pagefile-shadow-verifier/packages.config `
+            -PackagesDirectory h3/pagefile-shadow-verifier/packages `
+            -NonInteractive
+
+      - name: Build x64 minifilter
+        shell: pwsh
+        run: |
+          msbuild h3/pagefile-shadow-verifier/StateRAMH3B.vcxproj `
+            /m `
+            /t:Build `
+            /p:Configuration=NT `
+            /p:Platform=x64 `
+            /p:SignMode=Off
+
+      - name: Stage package and hash
+        shell: pwsh
+        run: |
+          $root = "h3/pagefile-shadow-verifier"
+          $driver = "$root/x64/NT/StateRAMH3B.sys"
+          if (-not (Test-Path $driver)) {
+            throw "Expected driver was not produced: $driver"
+          }
+
+          $package = "$root/package"
+          New-Item -ItemType Directory -Path $package -Force | Out-Null
+
+          $files = @(
+            "Install-StateRAMH3B.ps1",
+            "Start-StateRAMH3B.ps1",
+            "Stop-StateRAMH3B.ps1",
+            "Prepare-Boot-StateRAMH3B.ps1",
+            "Restore-Manual-StateRAMH3B.ps1",
+            "Query-StateRAMH3B.ps1",
+            "README.md"
+          )
+
+          Copy-Item $driver "$package/StateRAMH3B.sys" -Force
+
+          $pdb = "$root/x64/NT/StateRAMH3B.pdb"
+          if (Test-Path $pdb) {
+            Copy-Item $pdb "$package/StateRAMH3B.pdb" -Force
+          }
+
+          foreach ($name in $files) {
+            Copy-Item "$root/$name" "$package/$name" -Force
+          }
+
+          $item = Get-Item "$package/StateRAMH3B.sys"
+          $hash = (Get-FileHash -Algorithm SHA256 "$package/StateRAMH3B.sys").Hash
+
+          Write-Host ("Driver: {0} ({1} bytes)" -f $item.FullName, $item.Length)
+          Write-Host "H3B_SHADOW_SHA256=$hash"
+
+          "H3B_SHADOW_SHA256=$hash" |
+            Out-File "$package/StateRAMH3B-SHA256.txt" -Encoding ascii
+
+      - name: Upload unsigned H3-B verifier
+        uses: actions/upload-artifact@v4
+        with:
+          name: StateRAM-H3B-pagefile-shadow-unsigned
+          path: h3/pagefile-shadow-verifier/package/*
+          if-no-files-found: error
