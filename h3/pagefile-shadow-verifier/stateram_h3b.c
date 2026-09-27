@@ -1,10 +1,11 @@
 #include <fltKernel.h>
 
-#define H3B_PROTOCOL_VERSION 2
+#define H3B_PROTOCOL_VERSION 3
 #define H3B_COMMAND_QUERY    1
 #define H3B_COMMAND_RESET    2
 
-#define H3B_MAX_PAGEFILES    16
+#define H3B_MAX_PAGEFILE_OBJECTS 16
+#define H3B_MAX_PAGEFILE_IDENTITIES 4
 #define H3B_WRITE_HISTORY_SLOTS 256
 #define H3B_SHADOW_SLOTS     32768
 #define H3B_POOL_TAG         'B3HS'
@@ -45,19 +46,27 @@ typedef struct _H3B_COUNTERS
     LONG64 KnownPagefiles;
     LONG64 HistoryCapacity;
     LONG64 PagefileTableFull;
+    LONG64 PagefileIdentities;
+    LONG64 PagefileAliases;
+    LONG64 ReadNewSystemBuffers;
+    LONG64 CrossObjectComparisons;
+    LONG64 CrossObjectMatches;
+    LONG64 CrossObjectMismatches;
 } H3B_COUNTERS, *PH3B_COUNTERS;
 
 C_ASSERT(sizeof(H3B_COMMAND) == 8);
-C_ASSERT(sizeof(H3B_COUNTERS) == 192);
+C_ASSERT(sizeof(H3B_COUNTERS) == 240);
 
 typedef struct _H3B_SHADOW_ENTRY
 {
-    PFILE_OBJECT FileObject;
+    ULONG IdentityIndex;
+    ULONG Reserved;
+    PFILE_OBJECT WriterFileObject;
     ULONGLONG Offset;
     ULONGLONG Hash1;
     ULONGLONG Hash2;
     ULONG Generation;
-    ULONG Reserved;
+    ULONG Reserved2;
     ULONGLONG WriteSequence;
 } H3B_SHADOW_ENTRY, *PH3B_SHADOW_ENTRY;
 
@@ -72,19 +81,27 @@ typedef struct _H3B_WRITE_RANGE
 
 typedef struct _H3B_PAGEFILE_STATE
 {
-    PFILE_OBJECT FileObject;
+    PFLT_INSTANCE Instance;
     ULONG HistoryHead;
     ULONG HistoryCount;
     ULONGLONG HistoryFloor;
     H3B_WRITE_RANGE History[H3B_WRITE_HISTORY_SLOTS];
 } H3B_PAGEFILE_STATE, *PH3B_PAGEFILE_STATE;
 
+typedef struct _H3B_PAGEFILE_OBJECT
+{
+    PFILE_OBJECT FileObject;
+    ULONG IdentityIndex;
+    ULONG Reserved;
+} H3B_PAGEFILE_OBJECT, *PH3B_PAGEFILE_OBJECT;
+
 PFLT_FILTER g_Filter;
 PFLT_PORT g_ServerPort;
 PFLT_PORT g_ClientPort;
 
 KSPIN_LOCK g_PagefileLock;
-H3B_PAGEFILE_STATE g_Pagefiles[H3B_MAX_PAGEFILES];
+H3B_PAGEFILE_STATE g_PagefileIdentities[H3B_MAX_PAGEFILE_IDENTITIES];
+H3B_PAGEFILE_OBJECT g_PagefileObjects[H3B_MAX_PAGEFILE_OBJECTS];
 
 KSPIN_LOCK g_ShadowLock;
 PH3B_SHADOW_ENTRY g_ShadowTable;
@@ -113,6 +130,12 @@ volatile LONG64 g_HistoryExpired;
 volatile LONG64 g_HistoryRecordDrops;
 volatile LONG64 g_KnownPagefiles;
 volatile LONG64 g_PagefileTableFull;
+volatile LONG64 g_PagefileIdentitiesCount;
+volatile LONG64 g_PagefileAliases;
+volatile LONG64 g_ReadNewSystemBuffers;
+volatile LONG64 g_CrossObjectComparisons;
+volatile LONG64 g_CrossObjectMatches;
+volatile LONG64 g_CrossObjectMismatches;
 
 DRIVER_INITIALIZE DriverEntry;
 
