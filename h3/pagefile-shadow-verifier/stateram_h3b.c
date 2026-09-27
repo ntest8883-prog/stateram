@@ -155,6 +155,7 @@ volatile LONG64 g_DynamicPagefileDiscoveries;
 volatile LONG64 g_ConcurrentOverlapSkips;
 volatile LONG64 g_DroppedInflightRecords;
 volatile LONG64 g_DroppedInflightOutstanding;
+volatile LONG g_TrackingCompromised;
 
 DRIVER_INITIALIZE DriverEntry;
 
@@ -354,6 +355,7 @@ H3BRememberPagefile (
 
     if (objectSlot == H3B_MAX_PAGEFILE_OBJECTS)
     {
+        InterlockedExchange(&g_TrackingCompromised, 1);
         InterlockedIncrement64(&g_PagefileTableFull);
         KeReleaseSpinLock(&g_PagefileLock, oldIrql);
         return FALSE;
@@ -375,6 +377,7 @@ H3BRememberPagefile (
 
         if (identitySlot == H3B_MAX_PAGEFILE_IDENTITIES)
         {
+            InterlockedExchange(&g_TrackingCompromised, 1);
             InterlockedIncrement64(&g_PagefileTableFull);
             KeReleaseSpinLock(&g_PagefileLock, oldIrql);
             return FALSE;
@@ -754,7 +757,11 @@ H3BHistoryAllowsPublish (
     ownState = 0;
     ownFlags = 0;
 
-    if (IdentityIndex >= H3B_MAX_PAGEFILE_IDENTITIES)
+    if ((IdentityIndex >= H3B_MAX_PAGEFILE_IDENTITIES) ||
+        (InterlockedCompareExchange(
+            &g_TrackingCompromised,
+            0,
+            0) != 0))
     {
         return FALSE;
     }
@@ -877,7 +884,11 @@ H3BHistoryAllowsVerify (
     ownGeneration = 0;
     ownState = 0;
 
-    if (IdentityIndex >= H3B_MAX_PAGEFILE_IDENTITIES)
+    if ((IdentityIndex >= H3B_MAX_PAGEFILE_IDENTITIES) ||
+        (InterlockedCompareExchange(
+            &g_TrackingCompromised,
+            0,
+            0) != 0))
     {
         return FALSE;
     }
@@ -1888,6 +1899,7 @@ DriverEntry (
     g_ShadowTable = NULL;
     g_ShadowGeneration = 1;
     g_WriteSequence = 1;
+    g_TrackingCompromised = 0;
 
     RtlZeroMemory(
         g_PagefileIdentities,
