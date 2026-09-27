@@ -44,6 +44,7 @@ typedef struct _H3B_COUNTERS
     LONG64 HistoryRecordDrops;
     LONG64 KnownPagefiles;
     LONG64 HistoryCapacity;
+    LONG64 PagefileTableFull;
 } H3B_COUNTERS, *PH3B_COUNTERS;
 
 typedef struct _H3B_SHADOW_ENTRY
@@ -108,6 +109,7 @@ volatile LONG64 g_ShadowVerifyInvalidated;
 volatile LONG64 g_HistoryExpired;
 volatile LONG64 g_HistoryRecordDrops;
 volatile LONG64 g_KnownPagefiles;
+volatile LONG64 g_PagefileTableFull;
 
 DRIVER_INITIALIZE DriverEntry;
 
@@ -148,6 +150,7 @@ H3BResetCounters (
     InterlockedExchange64(&g_ShadowVerifyInvalidated, 0);
     InterlockedExchange64(&g_HistoryExpired, 0);
     InterlockedExchange64(&g_HistoryRecordDrops, 0);
+    InterlockedExchange64(&g_PagefileTableFull, 0);
 
     generation = InterlockedIncrement(&g_ShadowGeneration);
 
@@ -237,6 +240,10 @@ H3BRememberPagefile (
         g_Pagefiles[freeSlot].FileObject = FileObject;
         InterlockedIncrement64(&g_PagingFileCreates);
         InterlockedIncrement64(&g_KnownPagefiles);
+    }
+    else
+    {
+        InterlockedIncrement64(&g_PagefileTableFull);
     }
 
     KeReleaseSpinLock(&g_PagefileLock, oldIrql);
@@ -497,7 +504,7 @@ H3BShadowIndex (
 }
 
 static
-VOID
+BOOLEAN
 H3BStoreShadow (
     _In_ PFILE_OBJECT FileObject,
     _In_ ULONGLONG Offset,
@@ -518,7 +525,7 @@ H3BStoreShadow (
 
     if ((ULONG)generation != WriteGeneration)
     {
-        return;
+        return FALSE;
     }
 
     KeAcquireSpinLock(&g_ShadowLock, &oldIrql);
@@ -544,6 +551,7 @@ H3BStoreShadow (
     entry->WriteSequence = WriteSequence;
 
     KeReleaseSpinLock(&g_ShadowLock, oldIrql);
+    return TRUE;
 }
 
 static
@@ -769,15 +777,20 @@ H3BShadowCompletedWrite (
                 continue;
             }
 
-            H3BStoreShadow(
-                Data->Iopb->TargetFileObject,
-                offset,
-                hash1,
-                hash2,
-                WriteSequence,
-                writeGeneration);
-
-            InterlockedIncrement64(&g_ShadowWritePages);
+            if (H3BStoreShadow(
+                    Data->Iopb->TargetFileObject,
+                    offset,
+                    hash1,
+                    hash2,
+                    WriteSequence,
+                    writeGeneration))
+            {
+                InterlockedIncrement64(&g_ShadowWritePages);
+            }
+            else
+            {
+                InterlockedIncrement64(&g_ShadowPublishSkipped);
+            }
         }
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -1197,6 +1210,7 @@ H3BMessage (
     reply->HistoryRecordDrops = H3BReadCounter(&g_HistoryRecordDrops);
     reply->KnownPagefiles = H3BReadCounter(&g_KnownPagefiles);
     reply->HistoryCapacity = H3B_WRITE_HISTORY_SLOTS;
+    reply->PagefileTableFull = H3BReadCounter(&g_PagefileTableFull);
 
     *ReturnOutputBufferLength = sizeof(*reply);
     return STATUS_SUCCESS;
