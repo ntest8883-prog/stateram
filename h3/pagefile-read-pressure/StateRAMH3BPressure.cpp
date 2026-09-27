@@ -6,13 +6,15 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
 
 static const wchar_t* kPortName = L"\\StateRAMH3BPort";
 static const uint32_t kProtocolVersion = 3;
 static const uint32_t kCommandQuery = 1;
 static const SIZE_T kMiB = 1024ull * 1024ull;
 static const SIZE_T kPressureChunk = 32ull * kMiB;
-static const SIZE_T kTargetMiB = 96;
+static const SIZE_T kTargetMiB = 256;
 static const SIZE_T kMinPressureMiB = 512;
 static const SIZE_T kMaxPressureMiB = 1280;
 static const SIZE_T kEmergencyAvailMiB = 256;
@@ -20,8 +22,11 @@ static const SIZE_T kCommitReserveMiB = 1024;
 static const DWORD kTargetReadyWaitMs = 180000;
 static const DWORD kTargetGoWaitMs = 300000;
 static const DWORD kTargetVerifyWaitMs = 300000;
-static const int64_t kEvidenceShadowPages = 32;
-static const int64_t kEvidencePagefileWrites = 8;
+static const DWORD kResidencyPollMs = 100;
+static const SIZE_T kResidencySampleStridePages = 16;
+static const ULONG kColdPercent = 10;
+static const int64_t kEvidenceShadowPages = 16;
+static const int64_t kEvidencePagefileWrites = 4;
 
 #pragma pack(push, 8)
 struct H3B_COMMAND
@@ -247,6 +252,58 @@ static void PrintDelta(const H3B_COUNTERS& before, const H3B_COUNTERS& after)
         after.PagefileTableFull);
 }
 
+static bool GetSampledResidency(
+    const void* base,
+    SIZE_T bytes,
+    SIZE_T& residentSamples,
+    SIZE_T& totalSamples)
+{
+    const SIZE_T pageSize = 4096;
+    const SIZE_T totalPages = bytes / pageSize;
+    const SIZE_T samples =
+        (totalPages + kResidencySampleStridePages - 1) /
+        kResidencySampleStridePages;
+
+    if (samples == 0 || samples > (MAXDWORD / sizeof(PSAPI_WORKING_SET_EX_INFORMATION)))
+    {
+        return false;
+    }
+
+    std::vector<PSAPI_WORKING_SET_EX_INFORMATION> info(samples);
+    SIZE_T index = 0;
+
+    for (SIZE_T page = 0;
+         page < totalPages && index < samples;
+         page += kResidencySampleStridePages, ++index)
+    {
+        info[index].VirtualAddress =
+            const_cast<BYTE*>(
+                static_cast<const BYTE*>(base) + (page * pageSize));
+    }
+
+    if (!QueryWorkingSetEx(
+            GetCurrentProcess(),
+            info.data(),
+            static_cast<DWORD>(
+                info.size() * sizeof(info[0]))))
+    {
+        return false;
+    }
+
+    residentSamples = 0;
+    totalSamples = info.size();
+
+    for (const auto& entry : info)
+    {
+        if (entry.VirtualAttributes.Valid)
+        {
+            ++residentSamples;
+        }
+    }
+
+    return true;
+}
+
 static std::wstring EventName(DWORD parentPid, const wchar_t* suffix)
 {
     wchar_t buffer[128] = {};
@@ -263,17 +320,20 @@ static std::wstring EventName(DWORD parentPid, const wchar_t* suffix)
 static int TargetMode(DWORD parentPid, SIZE_T targetMiB)
 {
     std::wstring readyName = EventName(parentPid, L"ready");
+    std::wstring coldName = EventName(parentPid, L"cold");
     std::wstring goName = EventName(parentPid, L"go");
     std::wstring doneName = EventName(parentPid, L"done");
 
     HANDLE ready = OpenEventW(EVENT_MODIFY_STATE, FALSE, readyName.c_str());
+    HANDLE cold = OpenEventW(EVENT_MODIFY_STATE, FALSE, coldName.c_str());
     HANDLE go = OpenEventW(SYNCHRONIZE, FALSE, goName.c_str());
     HANDLE done = OpenEventW(EVENT_MODIFY_STATE, FALSE, doneName.c_str());
 
-    if (!ready || !go || !done)
+    if (!ready || !cold || !go || !done)
     {
         fwprintf(stderr, L"TARGET_ERROR open events=%lu\n", GetLastError());
         if (ready) CloseHandle(ready);
+        if (cold) CloseHandle(cold);
         if (go) CloseHandle(go);
         if (done) CloseHandle(done);
         return 20;
@@ -325,6 +385,7 @@ static int TargetMode(DWORD parentPid, SIZE_T targetMiB)
         fwprintf(stderr, L"TARGET_ERROR VirtualAlloc(%zu MiB)=%lu\n",
             targetMiB, GetLastError());
         CloseHandle(ready);
+        CloseHandle(cold);
         CloseHandle(go);
         CloseHandle(done);
         return 21;
@@ -341,6 +402,7 @@ static int TargetMode(DWORD parentPid, SIZE_T targetMiB)
         fwprintf(stderr, L"TARGET_ERROR working-set trim=%lu\n", GetLastError());
         VirtualFree(target, 0, MEM_RELEASE);
         CloseHandle(ready);
+        CloseHandle(cold);
         CloseHandle(go);
         CloseHandle(done);
         return 22;
@@ -352,20 +414,85 @@ static int TargetMode(DWORD parentPid, SIZE_T targetMiB)
         fwprintf(stderr, L"TARGET_ERROR signal-ready=%lu\n", GetLastError());
         VirtualFree(target, 0, MEM_RELEASE);
         CloseHandle(ready);
+        CloseHandle(cold);
         CloseHandle(go);
         CloseHandle(done);
         return 25;
     }
 
-    DWORD wait = WaitForSingleObject(go, kTargetGoWaitMs);
-    if (wait != WAIT_OBJECT_0)
+    ULONGLONG waitStart = GetTickCount64();
+    bool coldSignaled = false;
+    DWORD wait = WAIT_TIMEOUT;
+
+    for (;;)
     {
-        fwprintf(stderr, L"TARGET_ERROR wait-go=%lu\n", wait);
-        VirtualFree(target, 0, MEM_RELEASE);
-        CloseHandle(ready);
-        CloseHandle(go);
-        CloseHandle(done);
-        return 23;
+        wait = WaitForSingleObject(go, kResidencyPollMs);
+
+        if (wait == WAIT_OBJECT_0)
+        {
+            break;
+        }
+
+        if (wait != WAIT_TIMEOUT)
+        {
+            fwprintf(stderr, L"TARGET_ERROR wait-go=%lu\n", wait);
+            VirtualFree(target, 0, MEM_RELEASE);
+            CloseHandle(ready);
+            CloseHandle(cold);
+            CloseHandle(go);
+            CloseHandle(done);
+            return 23;
+        }
+
+        SIZE_T residentSamples = 0;
+        SIZE_T totalSamples = 0;
+
+        if (GetSampledResidency(
+                target,
+                bytes,
+                residentSamples,
+                totalSamples))
+        {
+            const ULONG residentPercent =
+                totalSamples == 0 ? 100 :
+                static_cast<ULONG>(
+                    (residentSamples * 100) / totalSamples);
+
+            if (!coldSignaled &&
+                residentPercent <= kColdPercent)
+            {
+                if (!SetEvent(cold))
+                {
+                    fwprintf(stderr,
+                        L"TARGET_ERROR signal-cold=%lu\n",
+                        GetLastError());
+                    VirtualFree(target, 0, MEM_RELEASE);
+                    CloseHandle(ready);
+                    CloseHandle(cold);
+                    CloseHandle(go);
+                    CloseHandle(done);
+                    return 27;
+                }
+
+                coldSignaled = true;
+                wprintf(L"TARGET_COLD residentSamples=%zu totalSamples=%zu "
+                        L"residentPercent=%lu\n",
+                    residentSamples,
+                    totalSamples,
+                    static_cast<unsigned long>(residentPercent));
+            }
+        }
+
+        if ((GetTickCount64() - waitStart) >= kTargetGoWaitMs)
+        {
+            fwprintf(stderr, L"TARGET_ERROR wait-go=TIMEOUT\n");
+            VirtualFree(target, 0, MEM_RELEASE);
+            CloseHandle(ready);
+            CloseHandle(cold);
+            CloseHandle(go);
+            CloseHandle(done);
+            return 23;
+        }
     }
 
     wprintf(L"TARGET_VERIFY_BEGIN\n");
@@ -377,6 +504,7 @@ static int TargetMode(DWORD parentPid, SIZE_T targetMiB)
         fwprintf(stderr, L"TARGET_ERROR signal-done=%lu\n", GetLastError());
         VirtualFree(target, 0, MEM_RELEASE);
         CloseHandle(ready);
+        CloseHandle(cold);
         CloseHandle(go);
         CloseHandle(done);
         return 26;
@@ -384,6 +512,7 @@ static int TargetMode(DWORD parentPid, SIZE_T targetMiB)
 
     VirtualFree(target, 0, MEM_RELEASE);
     CloseHandle(ready);
+    CloseHandle(cold);
     CloseHandle(go);
     CloseHandle(done);
 
@@ -636,17 +765,20 @@ static int ParentMode()
 
     DWORD parentPid = GetCurrentProcessId();
     std::wstring readyName = EventName(parentPid, L"ready");
+    std::wstring coldName = EventName(parentPid, L"cold");
     std::wstring goName = EventName(parentPid, L"go");
     std::wstring doneName = EventName(parentPid, L"done");
 
     HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, readyName.c_str());
+    HANDLE cold = CreateEventW(nullptr, TRUE, FALSE, coldName.c_str());
     HANDLE go = CreateEventW(nullptr, TRUE, FALSE, goName.c_str());
     HANDLE done = CreateEventW(nullptr, TRUE, FALSE, doneName.c_str());
 
-    if (!ready || !go || !done)
+    if (!ready || !cold || !go || !done)
     {
         fwprintf(stderr, L"RESULT=ABORT reason=CREATE_EVENTS error=%lu\n", GetLastError());
         if (ready) CloseHandle(ready);
+        if (cold) CloseHandle(cold);
         if (go) CloseHandle(go);
         if (done) CloseHandle(done);
         return 36;
@@ -657,6 +789,7 @@ static int ParentMode()
     {
         fwprintf(stderr, L"RESULT=ABORT reason=GET_EXE error=%lu\n", GetLastError());
         CloseHandle(ready);
+        CloseHandle(cold);
         CloseHandle(go);
         CloseHandle(done);
         return 37;
@@ -690,6 +823,7 @@ static int ParentMode()
     {
         fwprintf(stderr, L"RESULT=ABORT reason=CREATE_TARGET error=%lu\n", GetLastError());
         CloseHandle(ready);
+        CloseHandle(cold);
         CloseHandle(go);
         CloseHandle(done);
         return 38;
@@ -762,6 +896,7 @@ static int ParentMode()
         uint64_t blockNumber = 0;
         bool stopForEvidence = false;
         bool stopForMismatch = false;
+        bool targetCold = false;
         H3B_COUNTERS mid = before;
 
         /*
@@ -815,7 +950,7 @@ static int ParentMode()
             allocatedMiB += kPressureChunk / kMiB;
             ++blockNumber;
 
-            if ((allocatedMiB % 64) == 0)
+            if ((allocatedMiB % 32) == 0)
             {
                 H3B_COUNTERS probe = {};
                 if (!QueryH3B(probe))
@@ -825,6 +960,8 @@ static int ParentMode()
                 }
 
                 mid = probe;
+                targetCold =
+                    (WaitForSingleObject(cold, 0) == WAIT_OBJECT_0);
 
                 if (probe.ShadowMismatches != before.ShadowMismatches)
                 {
@@ -881,11 +1018,12 @@ static int ParentMode()
                     break;
                 }
 
-                if ((allocatedMiB >= 256) &&
+                if (targetCold &&
+                    (allocatedMiB >= 256) &&
                     (writeDelta >= kEvidencePagefileWrites) &&
                     (shadowDelta >= kEvidenceShadowPages))
                 {
-                    wprintf(L"PRESSURE_STOP reason=FRESH_PAGEFILE_EVIDENCE "
+                    wprintf(L"PRESSURE_STOP reason=TARGET_COLD_AND_PAGEFILE_EVIDENCE "
                             L"writes=%lld shadowPages=%lld allocated=%llu MiB\n",
                         writeDelta,
                         shadowDelta,
@@ -996,6 +1134,12 @@ static int ParentMode()
                 mid.HistoryRecordDrops - before.HistoryRecordDrops);
         }
 
+        targetCold =
+            (WaitForSingleObject(cold, 0) == WAIT_OBJECT_0);
+
+        wprintf(L"TARGET_COLD_BEFORE_READ=%s\n",
+            targetCold ? L"YES" : L"NO");
+
         SetEvent(go);
 
         HANDLE verifyWaitHandles[2] = { done, pi.hProcess };
@@ -1095,6 +1239,7 @@ static int ParentMode()
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     CloseHandle(ready);
+    CloseHandle(cold);
     CloseHandle(go);
     CloseHandle(done);
 
