@@ -38,6 +38,19 @@ Environment:
 #define H1D_CPUID_RESET_LEAF        0x53524431
 #define H1D_CPUID_RESET_OK          0x53524F4B
 
+//
+// H2-A controlled compressed-backing geometry.
+// Eight logical 4KB pages are represented by three 4KB compressed-store
+// pages plus one 4KB hot cache page. This is a 16KB retained backing working
+// set versus 32KB for eight full uncompressed backing pages.
+//
+#define H2A_PAGE_COUNT              H1D_PAGE_COUNT
+#define H2A_SLOT_SIZE               1536
+#define H2A_STORE_PAGE_COUNT        3
+#define H2A_ROUNDS                  64
+#define H2A_CPUID_FLUSH_LEAF        0x53524332
+#define H2A_CPUID_FLUSH_OK          0x5352464B
+
 struct _SHV_CALLBACK_CONTEXT;
 
 typedef
@@ -93,6 +106,7 @@ typedef struct _SHV_VP_DATA
             UINT32 H1TargetPteIndex[H1D_PAGE_COUNT];
             UINT32 H1Phase[H1D_PAGE_COUNT];
             UINT32 H1RegionCount;
+            INT32 H2ResidentTarget;
             UINT32 EptControls;
         };
     };
@@ -158,3 +172,16 @@ extern volatile long ShvH1DResetCount;
 extern volatile long ShvH1DInveptCount;
 extern volatile long ShvH1DInveptFailureCount;
 extern volatile long ShvH1DCompletedCycles;
+
+extern UINT64 ShvH2CachePageVirtualAddress;
+extern UINT64 ShvH2CachePagePhysicalAddress;
+extern UINT64 ShvH2StorePageVirtualAddresses[H2A_STORE_PAGE_COUNT];
+extern UINT32 ShvH2CompressedLength[H2A_PAGE_COUNT];
+extern UINT64 ShvH2PageHash[H2A_PAGE_COUNT];
+extern volatile long ShvH2PageInCount;
+extern volatile long ShvH2EvictionCount;
+extern volatile long ShvH2CompressionCount;
+extern volatile long ShvH2DecompressionCount;
+extern volatile long ShvH2HashFailureCount;
+extern volatile long ShvH2CompletedTouches;
+extern volatile long ShvH2FlushCount;
