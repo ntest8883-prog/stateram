@@ -397,8 +397,24 @@ def main() -> None:
     h.complete_write("D", d2, {0: page(5)})
     assert h.read("D", 0, page(5)) == "match"
 
+    # 19. If the ring evicts an in-flight writer exactly when a new
+    # overlapping write arrives, the new writer retains a persistent
+    # concurrency flag. Clearing the dropped-write barrier later must not make
+    # that overlapping sample publishable.
+    e = Model(history_slots=2)
+    e_old = e.begin_write("C", 0, PAGE)
+    filler = e.begin_write("C", 10 * PAGE, PAGE)
+    e.complete_write("C", filler, {10 * PAGE: page(4)})
+    e_new = e.begin_write("C", 0, PAGE)
+    assert e.dropped_inflight["C"] == 1
+    e.complete_write("C", e_old, {0: page(1)})
+    assert e.dropped_inflight["C"] == 0
+    e.complete_write("C", e_new, {0: page(2)})
+    assert e.read("C", 0, page(1)) == "untracked"
+    assert e.read("C", 0, page(2)) == "untracked"
+
     print("H3B_HISTORY_MODEL=PASS")
-    print("cases=18")
+    print("cases=19")
 
 
 if __name__ == "__main__":
