@@ -8,7 +8,7 @@
 #include <algorithm>
 
 static const wchar_t* kPortName = L"\\StateRAMH3BPort";
-static const uint32_t kProtocolVersion = 2;
+static const uint32_t kProtocolVersion = 3;
 static const uint32_t kCommandQuery = 1;
 static const SIZE_T kMiB = 1024ull * 1024ull;
 static const SIZE_T kPressureChunk = 32ull * kMiB;
@@ -59,11 +59,23 @@ struct H3B_COUNTERS
     int64_t KnownPagefiles;
     int64_t HistoryCapacity;
     int64_t PagefileTableFull;
+    int64_t PagefileIdentities;
+    int64_t PagefileAliases;
+    int64_t ReadNewSystemBuffers;
+    int64_t CrossObjectComparisons;
+    int64_t CrossObjectMatches;
+    int64_t CrossObjectMismatches;
+    int64_t NewSystemBufferComparisons;
+    int64_t NewSystemBufferMismatches;
+    int64_t DynamicPagefileDiscoveries;
+    int64_t ConcurrentOverlapSkips;
+    int64_t DroppedInflightRecords;
+    int64_t DroppedInflightOutstanding;
 };
 #pragma pack(pop)
 
 static_assert(sizeof(H3B_COMMAND) == 8, "H3B command ABI drift");
-static_assert(sizeof(H3B_COUNTERS) == 192, "H3B counter ABI drift");
+static_assert(sizeof(H3B_COUNTERS) == 288, "H3B counter ABI drift");
 
 typedef HRESULT (WINAPI *PFN_FILTER_CONNECT_COMMUNICATION_PORT)(
     LPCWSTR, DWORD, LPVOID, WORD, LPSECURITY_ATTRIBUTES, HANDLE*);
@@ -217,7 +229,8 @@ static void PrintDelta(const H3B_COUNTERS& before, const H3B_COUNTERS& after)
             L"ShadowMatches=%lld ShadowMismatches=%lld "
             L"ShadowUntracked=%lld HistoryExpired=%lld "
             L"HistoryRecordDrops=%lld PublishSkipped=%lld "
-            L"VerifyInvalidated=%lld\n",
+            L"VerifyInvalidated=%lld ConcurrentOverlapSkips=%lld "
+            L"DroppedInflightOutstanding=%lld PagefileTableFull=%lld\n",
         after.PagefileWrites - before.PagefileWrites,
         after.PagefileReads - before.PagefileReads,
         after.ShadowWritePages - before.ShadowWritePages,
@@ -228,7 +241,10 @@ static void PrintDelta(const H3B_COUNTERS& before, const H3B_COUNTERS& after)
         after.HistoryExpired - before.HistoryExpired,
         after.HistoryRecordDrops - before.HistoryRecordDrops,
         after.ShadowPublishSkipped - before.ShadowPublishSkipped,
-        after.ShadowVerifyInvalidated - before.ShadowVerifyInvalidated);
+        after.ShadowVerifyInvalidated - before.ShadowVerifyInvalidated,
+        after.ConcurrentOverlapSkips - before.ConcurrentOverlapSkips,
+        after.DroppedInflightOutstanding,
+        after.PagefileTableFull);
 }
 
 static std::wstring EventName(DWORD parentPid, const wchar_t* suffix)
@@ -376,7 +392,7 @@ static int TargetMode(DWORD parentPid, SIZE_T targetMiB)
 
 static int SelfTest()
 {
-    if ((sizeof(H3B_COMMAND) != 8) || (sizeof(H3B_COUNTERS) != 192))
+    if ((sizeof(H3B_COMMAND) != 8) || (sizeof(H3B_COUNTERS) != 288))
     {
         fwprintf(stderr, L"SELFTEST=FAIL ABI\n");
         return 2;
@@ -447,14 +463,19 @@ static int MachinePreflight()
     }
 
     if ((counters.KnownPagefiles <= 0) ||
+        (counters.PagefileIdentities <= 0) ||
         (counters.PagingFileCreates <= 0) ||
-        (counters.PagefileTableFull != 0))
+        (counters.PagefileTableFull != 0) ||
+        (counters.DroppedInflightOutstanding != 0))
     {
         fwprintf(stderr,
-            L"PREFLIGHT=FAIL reason=PAGEFILE_STATE known=%lld creates=%lld tableFull=%lld\n",
+            L"PREFLIGHT=FAIL reason=PAGEFILE_STATE objects=%lld identities=%lld "
+            L"creates=%lld tableFull=%lld droppedInflightOutstanding=%lld\n",
             counters.KnownPagefiles,
+            counters.PagefileIdentities,
             counters.PagingFileCreates,
-            counters.PagefileTableFull);
+            counters.PagefileTableFull,
+            counters.DroppedInflightOutstanding);
         return 72;
     }
 
@@ -521,13 +542,16 @@ static int MachinePreflight()
 
     wprintf(L"PREFLIGHT=PASS totalPhys=%llu MiB available=%llu MiB "
             L"commitAvailable=%llu MiB memoryPriorityApi=%s "
-            L"knownPagefiles=%lld historyDrops=%lld\n",
+            L"pagefileObjects=%lld identities=%lld historyDrops=%lld "
+            L"droppedInflightOutstanding=%lld\n",
         static_cast<unsigned long long>(memory.totalPhysMiB),
         static_cast<unsigned long long>(memory.availPhysMiB),
         static_cast<unsigned long long>(memory.availCommitMiB),
         hasMemoryPriority ? L"YES" : L"NO",
         after.KnownPagefiles,
-        after.HistoryRecordDrops);
+        after.PagefileIdentities,
+        after.HistoryRecordDrops,
+        after.DroppedInflightOutstanding);
 
     return 0;
 }
@@ -549,11 +573,14 @@ static int ParentMode()
         return 31;
     }
 
-    if (before.KnownPagefiles <= 0 || before.PagingFileCreates <= 0)
+    if (before.KnownPagefiles <= 0 ||
+        before.PagefileIdentities <= 0 ||
+        before.PagingFileCreates <= 0)
     {
         fwprintf(stderr,
-            L"RESULT=ABORT reason=PAGEFILES_NOT_OBSERVED known=%lld creates=%lld\n",
+            L"RESULT=ABORT reason=PAGEFILES_NOT_OBSERVED objects=%lld identities=%lld creates=%lld\n",
             before.KnownPagefiles,
+            before.PagefileIdentities,
             before.PagingFileCreates);
         return 32;
     }
@@ -566,6 +593,14 @@ static int ParentMode()
         return 33;
     }
 
+    if (before.DroppedInflightOutstanding != 0)
+    {
+        fwprintf(stderr,
+            L"RESULT=ABORT reason=DROPPED_INFLIGHT_OUTSTANDING value=%lld\n",
+            before.DroppedInflightOutstanding);
+        return 44;
+    }
+
     MemSnapshot initial = {};
     if (!GetMemorySnapshot(initial))
     {
@@ -573,16 +608,18 @@ static int ParentMode()
         return 34;
     }
 
-    wprintf(L"BASELINE knownPagefiles=%lld creates=%lld shadowWrites=%lld "
+    wprintf(L"BASELINE pagefileObjects=%lld identities=%lld creates=%lld shadowWrites=%lld "
             L"shadowReads=%lld matches=%lld mismatches=%lld "
-            L"historyDrops=%lld\n",
+            L"historyDrops=%lld concurrentOverlapSkips=%lld\n",
         before.KnownPagefiles,
+        before.PagefileIdentities,
         before.PagingFileCreates,
         before.ShadowWritePages,
         before.ShadowReadPages,
         before.ShadowMatches,
         before.ShadowMismatches,
-        before.HistoryRecordDrops);
+        before.HistoryRecordDrops,
+        before.ConcurrentOverlapSkips);
 
     wprintf(L"MEMORY_INITIAL total=%llu MiB available=%llu MiB commitAvailable=%llu MiB\n",
         static_cast<unsigned long long>(initial.totalPhysMiB),
@@ -795,6 +832,25 @@ static int ParentMode()
                     break;
                 }
 
+                if (probe.PagefileTableFull != 0)
+                {
+                    fwprintf(stderr,
+                        L"PRESSURE_STOP reason=PAGEFILE_TABLE_FULL value=%lld\n",
+                        probe.PagefileTableFull);
+                    stopForMismatch = true;
+                    break;
+                }
+
+                if (probe.DroppedInflightOutstanding != 0)
+                {
+                    wprintf(L"PRESSURE_STOP reason=DROPPED_INFLIGHT_OUTSTANDING "
+                            L"value=%lld allocated=%llu MiB\n",
+                        probe.DroppedInflightOutstanding,
+                        static_cast<unsigned long long>(allocatedMiB));
+                    stopForEvidence = true;
+                    break;
+                }
+
                 const int64_t writeDelta =
                     probe.PagefileWrites - before.PagefileWrites;
                 const int64_t shadowDelta =
@@ -888,6 +944,51 @@ static int ParentMode()
             break;
         }
 
+        if (mid.PagefileTableFull != 0)
+        {
+            fwprintf(stderr,
+                L"RESULT=ABORT reason=PAGEFILE_TABLE_FULL_BEFORE_READ value=%lld\n",
+                mid.PagefileTableFull);
+            result = 45;
+            break;
+        }
+
+        if (mid.DroppedInflightOutstanding != 0)
+        {
+            /*
+             * H3-B5 deliberately suppresses verification while a dropped
+             * in-flight range is unresolved.  Give already-issued writes a
+             * short chance to complete while keeping pressure resident.
+             */
+            for (int settle = 0;
+                 settle < 20 && mid.DroppedInflightOutstanding != 0;
+                 ++settle)
+            {
+                Sleep(25);
+                if (!QueryH3B(mid))
+                {
+                    fwprintf(stderr,
+                        L"RESULT=ABORT reason=SETTLE_QUERY_FAILED\n");
+                    result = 46;
+                    break;
+                }
+            }
+
+            if (result == 46)
+            {
+                break;
+            }
+
+            if (mid.DroppedInflightOutstanding != 0)
+            {
+                fwprintf(stderr,
+                    L"RESULT=ABORT reason=DROPPED_INFLIGHT_STUCK value=%lld\n",
+                    mid.DroppedInflightOutstanding);
+                result = 47;
+                break;
+            }
+        }
+
         if (mid.HistoryRecordDrops != before.HistoryRecordDrops)
         {
             wprintf(L"NOTICE history-ring-drops-before-read=%lld; "
@@ -942,6 +1043,15 @@ static int ParentMode()
                 L"RESULT=STOP_MISMATCH delta=%lld\n",
                 after.ShadowMismatches - before.ShadowMismatches);
             result = 42;
+            break;
+        }
+
+        if (after.PagefileTableFull != 0)
+        {
+            fwprintf(stderr,
+                L"RESULT=ABORT reason=PAGEFILE_TABLE_FULL_FINAL value=%lld\n",
+                after.PagefileTableFull);
+            result = 48;
             break;
         }
 
