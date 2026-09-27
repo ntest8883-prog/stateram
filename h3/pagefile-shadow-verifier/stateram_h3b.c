@@ -177,6 +177,10 @@ H3BResetCounters (
     InterlockedExchange64(&g_HistoryExpired, 0);
     InterlockedExchange64(&g_HistoryRecordDrops, 0);
     InterlockedExchange64(&g_PagefileTableFull, 0);
+    InterlockedExchange64(&g_ReadNewSystemBuffers, 0);
+    InterlockedExchange64(&g_CrossObjectComparisons, 0);
+    InterlockedExchange64(&g_CrossObjectMatches, 0);
+    InterlockedExchange64(&g_CrossObjectMismatches, 0);
 
     generation = InterlockedIncrement(&g_ShadowGeneration);
 
@@ -195,15 +199,34 @@ H3BResetCounters (
 
 static
 LONG
-H3BFindPagefileIndexLocked (
+H3BFindPagefileObjectIndexLocked (
     _In_ PFILE_OBJECT FileObject
     )
 {
     ULONG i;
 
-    for (i = 0; i < H3B_MAX_PAGEFILES; i++)
+    for (i = 0; i < H3B_MAX_PAGEFILE_OBJECTS; i++)
     {
-        if (g_Pagefiles[i].FileObject == FileObject)
+        if (g_PagefileObjects[i].FileObject == FileObject)
+        {
+            return (LONG)i;
+        }
+    }
+
+    return -1;
+}
+
+static
+LONG
+H3BFindPagefileIdentityIndexLocked (
+    _In_ PFLT_INSTANCE Instance
+    )
+{
+    ULONG i;
+
+    for (i = 0; i < H3B_MAX_PAGEFILE_IDENTITIES; i++)
+    {
+        if (g_PagefileIdentities[i].Instance == Instance)
         {
             return (LONG)i;
         }
@@ -214,62 +237,150 @@ H3BFindPagefileIndexLocked (
 
 static
 BOOLEAN
-H3BIsKnownPagefile (
-    _In_ PFILE_OBJECT FileObject
+H3BGetIdentityIndexForObjectLocked (
+    _In_ PFILE_OBJECT FileObject,
+    _Out_ PULONG IdentityIndex
+    )
+{
+    LONG objectIndex;
+
+    objectIndex = H3BFindPagefileObjectIndexLocked(FileObject);
+
+    if (objectIndex < 0)
+    {
+        return FALSE;
+    }
+
+    if (g_PagefileObjects[objectIndex].IdentityIndex >=
+        H3B_MAX_PAGEFILE_IDENTITIES)
+    {
+        return FALSE;
+    }
+
+    *IdentityIndex = g_PagefileObjects[objectIndex].IdentityIndex;
+    return TRUE;
+}
+
+static
+BOOLEAN
+H3BGetPagefileIdentityIndex (
+    _In_ PFILE_OBJECT FileObject,
+    _Out_ PULONG IdentityIndex
     )
 {
     KIRQL oldIrql;
     BOOLEAN found;
 
     KeAcquireSpinLock(&g_PagefileLock, &oldIrql);
-    found = (H3BFindPagefileIndexLocked(FileObject) >= 0) ? TRUE : FALSE;
+    found = H3BGetIdentityIndexForObjectLocked(
+        FileObject,
+        IdentityIndex);
     KeReleaseSpinLock(&g_PagefileLock, oldIrql);
 
     return found;
 }
 
 static
-VOID
-H3BRememberPagefile (
+BOOLEAN
+H3BIsKnownPagefile (
     _In_ PFILE_OBJECT FileObject
     )
 {
-    KIRQL oldIrql;
-    ULONG i;
-    ULONG freeSlot;
+    ULONG identityIndex;
 
-    freeSlot = H3B_MAX_PAGEFILES;
+    return H3BGetPagefileIdentityIndex(
+        FileObject,
+        &identityIndex);
+}
+
+static
+VOID
+H3BRememberPagefile (
+    _In_ PFILE_OBJECT FileObject,
+    _In_ PFLT_INSTANCE Instance
+    )
+{
+    KIRQL oldIrql;
+    LONG identityIndex;
+    ULONG objectSlot;
+    ULONG identitySlot;
+    BOOLEAN newIdentity;
+
+    objectSlot = H3B_MAX_PAGEFILE_OBJECTS;
+    identitySlot = H3B_MAX_PAGEFILE_IDENTITIES;
+    newIdentity = FALSE;
 
     KeAcquireSpinLock(&g_PagefileLock, &oldIrql);
 
-    if (H3BFindPagefileIndexLocked(FileObject) >= 0)
+    if (H3BFindPagefileObjectIndexLocked(FileObject) >= 0)
     {
         KeReleaseSpinLock(&g_PagefileLock, oldIrql);
         return;
     }
 
-    for (i = 0; i < H3B_MAX_PAGEFILES; i++)
+    for (objectSlot = 0;
+         objectSlot < H3B_MAX_PAGEFILE_OBJECTS;
+         objectSlot++)
     {
-        if (g_Pagefiles[i].FileObject == NULL)
+        if (g_PagefileObjects[objectSlot].FileObject == NULL)
         {
-            freeSlot = i;
             break;
         }
     }
 
-    if (freeSlot < H3B_MAX_PAGEFILES)
+    if (objectSlot == H3B_MAX_PAGEFILE_OBJECTS)
     {
-        ObReferenceObject(FileObject);
+        InterlockedIncrement64(&g_PagefileTableFull);
+        KeReleaseSpinLock(&g_PagefileLock, oldIrql);
+        return;
+    }
+
+    identityIndex = H3BFindPagefileIdentityIndexLocked(Instance);
+
+    if (identityIndex < 0)
+    {
+        for (identitySlot = 0;
+             identitySlot < H3B_MAX_PAGEFILE_IDENTITIES;
+             identitySlot++)
+        {
+            if (g_PagefileIdentities[identitySlot].Instance == NULL)
+            {
+                break;
+            }
+        }
+
+        if (identitySlot == H3B_MAX_PAGEFILE_IDENTITIES)
+        {
+            InterlockedIncrement64(&g_PagefileTableFull);
+            KeReleaseSpinLock(&g_PagefileLock, oldIrql);
+            return;
+        }
+
         RtlZeroMemory(
-            &g_Pagefiles[freeSlot],
-            sizeof(g_Pagefiles[freeSlot]));
-        g_Pagefiles[freeSlot].FileObject = FileObject;
-        InterlockedIncrement64(&g_PagingFileCreates);
-        InterlockedIncrement64(&g_KnownPagefiles);
+            &g_PagefileIdentities[identitySlot],
+            sizeof(g_PagefileIdentities[identitySlot]));
+
+        g_PagefileIdentities[identitySlot].Instance = Instance;
+        identityIndex = (LONG)identitySlot;
+        newIdentity = TRUE;
+    }
+
+    ObReferenceObject(FileObject);
+
+    g_PagefileObjects[objectSlot].FileObject = FileObject;
+    g_PagefileObjects[objectSlot].IdentityIndex = (ULONG)identityIndex;
+    g_PagefileObjects[objectSlot].Reserved = 0;
+
+    InterlockedIncrement64(&g_PagingFileCreates);
+    InterlockedIncrement64(&g_KnownPagefiles);
+
+    if (newIdentity)
+    {
+        InterlockedIncrement64(&g_PagefileIdentitiesCount);
     }
     else
     {
-        InterlockedIncrement64(&g_PagefileTableFull);
+        InterlockedIncrement64(&g_PagefileAliases);
     }
 
     KeReleaseSpinLock(&g_PagefileLock, oldIrql);
@@ -283,22 +394,31 @@ H3BReleasePagefiles (
 {
     KIRQL oldIrql;
     ULONG i;
-    PFILE_OBJECT objects[H3B_MAX_PAGEFILES];
+    PFILE_OBJECT objects[H3B_MAX_PAGEFILE_OBJECTS];
 
     RtlZeroMemory(objects, sizeof(objects));
 
     KeAcquireSpinLock(&g_PagefileLock, &oldIrql);
 
-    for (i = 0; i < H3B_MAX_PAGEFILES; i++)
+    for (i = 0; i < H3B_MAX_PAGEFILE_OBJECTS; i++)
     {
-        objects[i] = g_Pagefiles[i].FileObject;
-        RtlZeroMemory(&g_Pagefiles[i], sizeof(g_Pagefiles[i]));
+        objects[i] = g_PagefileObjects[i].FileObject;
+        RtlZeroMemory(
+            &g_PagefileObjects[i],
+            sizeof(g_PagefileObjects[i]));
     }
 
+    RtlZeroMemory(
+        g_PagefileIdentities,
+        sizeof(g_PagefileIdentities));
+
     InterlockedExchange64(&g_KnownPagefiles, 0);
+    InterlockedExchange64(&g_PagefileIdentitiesCount, 0);
+    InterlockedExchange64(&g_PagefileAliases, 0);
+
     KeReleaseSpinLock(&g_PagefileLock, oldIrql);
 
-    for (i = 0; i < H3B_MAX_PAGEFILES; i++)
+    for (i = 0; i < H3B_MAX_PAGEFILE_OBJECTS; i++)
     {
         if (objects[i] != NULL)
         {
