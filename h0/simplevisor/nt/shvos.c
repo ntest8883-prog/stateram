@@ -25,6 +25,7 @@ Environment:
 #include "..\shv_x.h"
 #pragma warning(disable:4221)
 #pragma warning(disable:4204)
+#pragma warning(disable:4996) // ExAllocatePoolWithTag required for Windows 10 1909 target
 
 NTKERNELAPI
 _IRQL_requires_max_(APC_LEVEL)
@@ -92,11 +93,20 @@ ShvOsGetPhysicalAddress (
     _In_ PVOID BaseAddress
     );
 
+VOID
+ShvOsDebugPrint (
+    _In_ PCCH Format,
+    ...
+    );
+
 PVOID g_PowerCallbackRegistration;
 PVOID g_H1TargetPages[H1D_PAGE_COUNT];
 PVOID g_H1BackingPages[H1D_PAGE_COUNT];
 
 #define H1D_WRITE_XOR 0x5A
+#define H1R_POOL_TAG   'R1HS'
+#define H1R_ATTEMPTS   8
+#define H1R_WRITE_XOR  0x6D
 
 VOID
 ShvH1FreePages (
@@ -387,6 +397,343 @@ ShvH1DRunCycles (
     }
 
     return result;
+}
+
+
+VOID
+ShvH1RFreeMdl (
+    _Inout_ PMDL* Mdl
+    )
+{
+    if ((Mdl != NULL) && (*Mdl != NULL))
+    {
+        MmFreePagesFromMdl(*Mdl);
+        ExFreePool(*Mdl);
+        *Mdl = NULL;
+    }
+}
+
+BOOLEAN
+ShvH1RRunRealReclaim (
+    VOID
+    )
+{
+    ULONG attempt;
+    ULONG i;
+    BOOLEAN success;
+    PVOID mappingAddress;
+    PVOID mappedAddress;
+    PUCHAR backup;
+    PMDL mdlA;
+    PMDL mdlB;
+    PMDL mdlReuse;
+    PHYSICAL_ADDRESS low;
+    PHYSICAL_ADDRESS high;
+    PHYSICAL_ADDRESS skip;
+    PHYSICAL_ADDRESS mappedPhysical;
+    PFN_NUMBER pfnA;
+    PFN_NUMBER pfnB;
+    PFN_NUMBER pfnReuse;
+    UCHAR oldByte;
+    UCHAR newByte;
+    SIZE_T matched;
+
+    success = FALSE;
+
+    for (attempt = 0; attempt < H1R_ATTEMPTS; attempt++)
+    {
+        mappingAddress = NULL;
+        mappedAddress = NULL;
+        backup = NULL;
+        mdlA = NULL;
+        mdlB = NULL;
+        mdlReuse = NULL;
+
+        mappingAddress =
+            MmAllocateMappingAddress(PAGE_SIZE, H1R_POOL_TAG);
+        if (mappingAddress == NULL)
+        {
+            continue;
+        }
+
+        backup =
+            (PUCHAR)ExAllocatePoolWithTag(NonPagedPoolNx,
+                                         PAGE_SIZE,
+                                         H1R_POOL_TAG);
+        if (backup == NULL)
+        {
+            MmFreeMappingAddress(mappingAddress, H1R_POOL_TAG);
+            continue;
+        }
+
+        low.QuadPart = 0;
+        high.QuadPart = -1;
+        skip.QuadPart = 0;
+
+        mdlA =
+            MmAllocatePagesForMdlEx(low,
+                                    high,
+                                    skip,
+                                    PAGE_SIZE,
+                                    MmCached,
+                                    0);
+        if ((mdlA == NULL) ||
+            (MmGetMdlByteCount(mdlA) < PAGE_SIZE))
+        {
+            ShvH1RFreeMdl(&mdlA);
+            ExFreePool(backup);
+            MmFreeMappingAddress(mappingAddress, H1R_POOL_TAG);
+            continue;
+        }
+
+        pfnA = MmGetMdlPfnArray(mdlA)[0];
+
+        mappedAddress =
+            MmMapLockedPagesWithReservedMapping(mappingAddress,
+                                                H1R_POOL_TAG,
+                                                mdlA,
+                                                MmCached);
+        if (mappedAddress != mappingAddress)
+        {
+            if (mappedAddress != NULL)
+            {
+                MmUnmapReservedMapping(mappedAddress,
+                                       H1R_POOL_TAG,
+                                       mdlA);
+            }
+            ShvH1RFreeMdl(&mdlA);
+            ExFreePool(backup);
+            MmFreeMappingAddress(mappingAddress, H1R_POOL_TAG);
+            continue;
+        }
+
+        for (i = 0; i < PAGE_SIZE; i++)
+        {
+            ((PUCHAR)mappedAddress)[i] =
+                (UCHAR)(((i * 131u) +
+                         (attempt * 17u) +
+                         0xA7u) & 0xFFu);
+            backup[i] = ((PUCHAR)mappedAddress)[i];
+        }
+
+        MmUnmapReservedMapping(mappedAddress,
+                               H1R_POOL_TAG,
+                               mdlA);
+        mappedAddress = NULL;
+
+        //
+        // Allocate replacement HPA B while A is still owned by mdlA. This
+        // guarantees the replacement frame is physically different from A.
+        //
+        mdlB =
+            MmAllocatePagesForMdlEx(low,
+                                    high,
+                                    skip,
+                                    PAGE_SIZE,
+                                    MmCached,
+                                    0);
+        if ((mdlB == NULL) ||
+            (MmGetMdlByteCount(mdlB) < PAGE_SIZE))
+        {
+            ShvH1RFreeMdl(&mdlB);
+            ShvH1RFreeMdl(&mdlA);
+            ExFreePool(backup);
+            MmFreeMappingAddress(mappingAddress, H1R_POOL_TAG);
+            continue;
+        }
+
+        pfnB = MmGetMdlPfnArray(mdlB)[0];
+        if (pfnB == pfnA)
+        {
+            ShvH1RFreeMdl(&mdlB);
+            ShvH1RFreeMdl(&mdlA);
+            ExFreePool(backup);
+            MmFreeMappingAddress(mappingAddress, H1R_POOL_TAG);
+            continue;
+        }
+
+        //
+        // Critical H1-C completion point: return physical frame A to the
+        // Windows memory manager. There is no remaining VA mapping to A.
+        //
+        ShvH1RFreeMdl(&mdlA);
+
+        //
+        // Ask Windows for exactly that physical frame again. Success proves
+        // the frame was genuinely returned to the allocator and can be handed
+        // out as a new allocation, rather than merely hidden by EPT.
+        //
+        low.QuadPart = ((LONGLONG)pfnA) << PAGE_SHIFT;
+        high.QuadPart = low.QuadPart + PAGE_SIZE - 1;
+        skip.QuadPart = 0;
+
+        mdlReuse =
+            MmAllocatePagesForMdlEx(low,
+                                    high,
+                                    skip,
+                                    PAGE_SIZE,
+                                    MmCached,
+                                    0);
+        if ((mdlReuse == NULL) ||
+            (MmGetMdlByteCount(mdlReuse) < PAGE_SIZE))
+        {
+            ShvH1RFreeMdl(&mdlReuse);
+            ShvH1RFreeMdl(&mdlB);
+            ExFreePool(backup);
+            MmFreeMappingAddress(mappingAddress, H1R_POOL_TAG);
+            continue;
+        }
+
+        pfnReuse = MmGetMdlPfnArray(mdlReuse)[0];
+        if (pfnReuse != pfnA)
+        {
+            ShvH1RFreeMdl(&mdlReuse);
+            ShvH1RFreeMdl(&mdlB);
+            ExFreePool(backup);
+            MmFreeMappingAddress(mappingAddress, H1R_POOL_TAG);
+            continue;
+        }
+
+        mappedAddress =
+            MmMapLockedPagesWithReservedMapping(mappingAddress,
+                                                H1R_POOL_TAG,
+                                                mdlReuse,
+                                                MmCached);
+        if (mappedAddress != mappingAddress)
+        {
+            if (mappedAddress != NULL)
+            {
+                MmUnmapReservedMapping(mappedAddress,
+                                       H1R_POOL_TAG,
+                                       mdlReuse);
+            }
+            ShvH1RFreeMdl(&mdlReuse);
+            ShvH1RFreeMdl(&mdlB);
+            ExFreePool(backup);
+            MmFreeMappingAddress(mappingAddress, H1R_POOL_TAG);
+            continue;
+        }
+
+        RtlFillMemory(mappedAddress, PAGE_SIZE, 0xD3);
+        for (i = 0; i < PAGE_SIZE; i++)
+        {
+            if (((PUCHAR)mappedAddress)[i] != 0xD3)
+            {
+                break;
+            }
+        }
+
+        if (i != PAGE_SIZE)
+        {
+            MmUnmapReservedMapping(mappedAddress,
+                                   H1R_POOL_TAG,
+                                   mdlReuse);
+            mappedAddress = NULL;
+            ShvH1RFreeMdl(&mdlReuse);
+            ShvH1RFreeMdl(&mdlB);
+            ExFreePool(backup);
+            MmFreeMappingAddress(mappingAddress, H1R_POOL_TAG);
+            continue;
+        }
+
+        MmUnmapReservedMapping(mappedAddress,
+                               H1R_POOL_TAG,
+                               mdlReuse);
+        mappedAddress = NULL;
+        ShvH1RFreeMdl(&mdlReuse);
+
+        //
+        // Restore the logical page at the exact same reserved virtual address,
+        // but now backed by the distinct physical frame B.
+        //
+        mappedAddress =
+            MmMapLockedPagesWithReservedMapping(mappingAddress,
+                                                H1R_POOL_TAG,
+                                                mdlB,
+                                                MmCached);
+        if (mappedAddress != mappingAddress)
+        {
+            if (mappedAddress != NULL)
+            {
+                MmUnmapReservedMapping(mappedAddress,
+                                       H1R_POOL_TAG,
+                                       mdlB);
+            }
+            ShvH1RFreeMdl(&mdlB);
+            ExFreePool(backup);
+            MmFreeMappingAddress(mappingAddress, H1R_POOL_TAG);
+            continue;
+        }
+
+        RtlCopyMemory(mappedAddress, backup, PAGE_SIZE);
+
+        matched =
+            RtlCompareMemory(mappedAddress, backup, PAGE_SIZE);
+        if (matched != PAGE_SIZE)
+        {
+            MmUnmapReservedMapping(mappedAddress,
+                                   H1R_POOL_TAG,
+                                   mdlB);
+            mappedAddress = NULL;
+            ShvH1RFreeMdl(&mdlB);
+            ExFreePool(backup);
+            MmFreeMappingAddress(mappingAddress, H1R_POOL_TAG);
+            continue;
+        }
+
+        mappedPhysical = MmGetPhysicalAddress(mappedAddress);
+        if ((PFN_NUMBER)(mappedPhysical.QuadPart >> PAGE_SHIFT) != pfnB)
+        {
+            MmUnmapReservedMapping(mappedAddress,
+                                   H1R_POOL_TAG,
+                                   mdlB);
+            mappedAddress = NULL;
+            ShvH1RFreeMdl(&mdlB);
+            ExFreePool(backup);
+            MmFreeMappingAddress(mappingAddress, H1R_POOL_TAG);
+            continue;
+        }
+
+        //
+        // Verify that ordinary writes after restoration affect the replacement
+        // frame and remain readable through the stable logical VA.
+        //
+        i = ((attempt * 977u) + 1379u) & (PAGE_SIZE - 1);
+        oldByte = backup[i];
+        newByte = oldByte ^ H1R_WRITE_XOR;
+        *(volatile UCHAR*)((PUCHAR)mappedAddress + i) = newByte;
+
+        if (((PUCHAR)mappedAddress)[i] != newByte)
+        {
+            MmUnmapReservedMapping(mappedAddress,
+                                   H1R_POOL_TAG,
+                                   mdlB);
+            mappedAddress = NULL;
+            ShvH1RFreeMdl(&mdlB);
+            ExFreePool(backup);
+            MmFreeMappingAddress(mappingAddress, H1R_POOL_TAG);
+            continue;
+        }
+
+        ShvOsDebugPrint("H1 REAL RECLAIM PASS: attempt=%lu VA=%p released_reacquired_PFN=0x%llX replacement_PFN=0x%llX\n",
+                        attempt + 1,
+                        mappingAddress,
+                        (UINT64)pfnA,
+                        (UINT64)pfnB);
+
+        MmUnmapReservedMapping(mappedAddress,
+                               H1R_POOL_TAG,
+                               mdlB);
+        mappedAddress = NULL;
+        ShvH1RFreeMdl(&mdlB);
+        ExFreePool(backup);
+        MmFreeMappingAddress(mappingAddress, H1R_POOL_TAG);
+
+        success = TRUE;
+        break;
+    }
+
+    return success;
 }
 
 
@@ -780,6 +1127,22 @@ DriverEntry (
                     ShvH1DInveptFailureCount,
                     ShvH0LastGuestPhysicalAddress,
                     ShvH0LastExitQualification);
+
+    //
+    // H1-C completion: use documented Windows MDL + reserved-mapping APIs to
+    // unmap a logical page, genuinely return its physical frame to the Windows
+    // allocator, reacquire that exact PFN as a new allocation, then restore the
+    // logical contents at the same VA on a distinct replacement PFN.
+    //
+    if (ShvH1RRunRealReclaim() == FALSE)
+    {
+        ShvOsDebugPrint("H1 REAL RECLAIM FAILED after %u attempts\n",
+                        H1R_ATTEMPTS);
+        ShvUnload();
+        ExUnregisterCallback(g_PowerCallbackRegistration);
+        ShvH1FreePages();
+        return STATUS_UNSUCCESSFUL;
+    }
 
     return STATUS_SUCCESS;
 }
