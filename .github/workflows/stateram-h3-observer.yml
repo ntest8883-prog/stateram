@@ -1,0 +1,70 @@
+name: StateRAM H3 page-I/O observer build
+
+on:
+  push:
+    branches:
+      - h3-pageio-observer
+    paths:
+      - "h3/pageio-observer/**"
+      - ".github/workflows/stateram-h3-observer.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Add NuGet to PATH
+        uses: NuGet/setup-nuget@v2
+
+      - name: Restore WDK packages
+        shell: pwsh
+        run: |
+          nuget restore h3/pageio-observer/packages.config `
+            -PackagesDirectory h3/pageio-observer/packages `
+            -NonInteractive
+
+      - name: Build x64 minifilter
+        shell: pwsh
+        run: |
+          msbuild h3/pageio-observer/StateRAMH3.vcxproj `
+            /m `
+            /t:Build `
+            /p:Configuration=NT `
+            /p:Platform=x64 `
+            /p:SignMode=Off
+
+      - name: Verify and hash
+        shell: pwsh
+        run: |
+          $driver = "h3/pageio-observer/x64/NT/StateRAMH3.sys"
+          if (-not (Test-Path $driver)) { throw "Expected driver was not produced: $driver" }
+          $item = Get-Item $driver
+          $hash = (Get-FileHash -Algorithm SHA256 $driver).Hash
+          Write-Host ("Driver: {0} ({1} bytes)" -f $item.FullName, $item.Length)
+          Write-Host "H3_OBSERVER_SHA256=$hash"
+          "H3_OBSERVER_SHA256=$hash" | Out-File "h3/pageio-observer/StateRAMH3-SHA256.txt" -Encoding ascii
+
+      - name: Upload unsigned H3 observer
+        uses: actions/upload-artifact@v4
+        with:
+          name: StateRAM-H3-pageio-observer-unsigned
+          path: |
+            h3/pageio-observer/x64/NT/StateRAMH3.sys
+            h3/pageio-observer/x64/NT/StateRAMH3.pdb
+            h3/pageio-observer/Install-StateRAMH3.ps1
+            h3/pageio-observer/Start-StateRAMH3.ps1
+            h3/pageio-observer/Stop-StateRAMH3.ps1
+            h3/pageio-observer/Query-StateRAMH3.ps1
+            h3/pageio-observer/StateRAMH3-SHA256.txt
+            h3/pageio-observer/README.md
+          if-no-files-found: error
