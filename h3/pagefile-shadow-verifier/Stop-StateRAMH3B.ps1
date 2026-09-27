@@ -5,9 +5,14 @@ function Test-StateRAMH3BLoaded {
     return [bool]($lines | Select-String -Pattern '^\s*StateRAMH3B\s')
 }
 
+if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "Run this script from Administrator PowerShell."
+}
+
 if (-not (Test-StateRAMH3BLoaded)) {
     Write-Host "StateRAMH3B is already unloaded."
-    exit 0
+    return
 }
 
 & fltmc detach StateRAMH3B D: 2>$null | Out-Null
