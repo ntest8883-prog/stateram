@@ -13,6 +13,7 @@ class Range:
     seq: int
     generation: int
     state: str
+    concurrent_overlap: bool = False
 
 
 @dataclass
@@ -54,13 +55,26 @@ class Model:
             if dropped.state == INFLIGHT:
                 self.dropped_inflight[pf] += 1
 
+        new_end = start + length
+        concurrent = False
+
+        for existing in hist:
+            if (
+                existing.state == INFLIGHT
+                and existing.start < new_end
+                and existing.end > start
+            ):
+                existing.concurrent_overlap = True
+                concurrent = True
+
         hist.append(
             Range(
                 start,
-                start + length,
+                new_end,
                 seq,
                 self.generation,
                 INFLIGHT,
+                concurrent,
             )
         )
         return seq
@@ -107,6 +121,7 @@ class Model:
             own is None
             or own.state != COMPLETED
             or own.generation != self.generation
+            or own.concurrent_overlap
         ):
             return None
 
@@ -303,7 +318,18 @@ def main() -> None:
     r.complete_write("C", stable, {0: page(3)})
     assert r.read("C", 0, page(3)) == "match"
 
-    # 13. Multiple FILE_OBJECT aliases for one pagefile share write history.
+    # 13. The inverse callback order is also untracked.  The old write
+    # completes first, but both writes overlapped while in flight, so callback
+    # ordering cannot be used as proof of final storage order.
+    r2 = Model()
+    old2 = r2.begin_write("C", 0, PAGE)
+    new2 = r2.begin_write("C", 0, PAGE)
+    r2.complete_write("C", old2, {0: page(1)})
+    r2.complete_write("C", new2, {0: page(2)})
+    assert r2.read("C", 0, page(1)) == "untracked"
+    assert r2.read("C", 0, page(2)) == "untracked"
+
+    # 14. Multiple FILE_OBJECT aliases for one pagefile share write history.
     aliases = AliasModel()
     aliases.alias("C-object-1", "C-pagefile")
     aliases.alias("C-object-2", "C-pagefile")
@@ -314,7 +340,7 @@ def main() -> None:
     aliases.complete_write_handle("C-object-2", cb, {0: page(2)})
     assert aliases.read_handle("C-object-1", 0, page(2)) == "match"
 
-    # 14. Non-overlap alias writes preserve unrelated samples.
+    # 15. Non-overlap alias writes preserve unrelated samples.
     keep = aliases.begin_write_handle("C-object-1", 8 * PAGE, PAGE)
     aliases.complete_write_handle(
         "C-object-1",
@@ -333,14 +359,14 @@ def main() -> None:
         page(3),
     ) == "match"
 
-    # 15. Aliases on different canonical identities remain independent.
+    # 16. Aliases on different canonical identities remain independent.
     aliases.alias("D-object-1", "D-pagefile")
     d = aliases.begin_write_handle("D-object-1", 0, PAGE)
     aliases.complete_write_handle("D-object-1", d, {0: page(9)})
     assert aliases.read_handle("D-object-1", 0, page(9)) == "match"
     assert aliases.read_handle("C-object-1", 0, page(2)) == "match"
 
-    # 16. If an in-flight record falls out of the bounded ring, all publication
+    # 17. If an in-flight record falls out of the bounded ring, all publication
     # is blocked until that unknown write finally completes.
     h = Model(history_slots=4)
     very_old = h.begin_write("C", 0, PAGE)
@@ -363,13 +389,13 @@ def main() -> None:
     h.complete_write("C", after_barrier, {60 * PAGE: page(6)})
     assert h.read("C", 60 * PAGE, page(6)) == "match"
 
-    # 17. A dropped in-flight write on C must not block independent D tracking.
+    # 18. A dropped in-flight write on C must not block independent D tracking.
     d2 = h.begin_write("D", 0, PAGE)
     h.complete_write("D", d2, {0: page(5)})
     assert h.read("D", 0, page(5)) == "match"
 
     print("H3B_HISTORY_MODEL=PASS")
-    print("cases=17")
+    print("cases=18")
 
 
 if __name__ == "__main__":
