@@ -188,12 +188,15 @@ bool CompressAndDecommit(SIZE_T index,
         return false;
     }
 
-    if (needed == 0 || needed >= (g_page_size - 128)) {
-        *skipped_incompressible = true;
+    if (needed == 0) {
         InterlockedExchange(&meta.state, PAGE_RESIDENT);
-        return true;
+        return false;
     }
 
+    // The zero-sized probe returns the buffer size required to guarantee
+    // compression succeeds, not the final compressed payload size. Allocate
+    // that buffer first, then decide whether the actual result is worth
+    // decommitting the source page.
     void* buffer = HeapAlloc(GetProcessHeap(), 0, needed);
     if (buffer == nullptr) {
         InterlockedExchange(&meta.state, PAGE_RESIDENT);
