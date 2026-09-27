@@ -62,3 +62,24 @@ To keep elevated-IRQL work bounded on the target's dual-core Celeron, H3-B2
 fingerprints at most four 4 KiB pages per completed I/O. This is a sampled
 integrity verifier, not a performance implementation. ShadowMismatches > 0
 remains a stop condition.
+
+
+## H3-B3 stale-sample protection
+
+The H3-B2 target run proved DISPATCH_LEVEL hashing works, but produced two
+mismatches. Because H3-B2 sampled only the first four pages of a completed
+write, an older fingerprint outside that sampled subset could survive a later
+large write and be compared against newer pagefile data.
+
+H3-B3 makes the verifier deliberately conservative. Each known pagefile file
+object has an epoch. Every observed pagefile write advances that pagefile's
+epoch before the write is sent down the stack. A sampled fingerprint is valid
+only for the same epoch. Reads capture the current epoch in pre-operation and
+are verified only if that epoch is still current in post-operation and after
+hashing. Thus any intervening write invalidates older samples rather than
+turning stale verifier state into a false mismatch.
+
+This reduces match coverage under heavy concurrent pagefile writes, which is
+acceptable for this correctness gate. A mismatch remains a stop condition.
+The Windows pagefile remains authoritative and H3-B3 still does not modify,
+suppress, redirect, complete, or compress pagefile I/O.
