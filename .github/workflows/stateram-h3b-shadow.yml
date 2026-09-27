@@ -5,6 +5,7 @@ on:
     branches:
       - h3-pagefile-shadow-verify
       - h3-pagefile-shadow-dispatch
+      - h3-pagefile-shadow-history
     paths:
       - "h3/pagefile-shadow-verifier/**"
       - ".github/workflows/stateram-h3b-shadow.yml"
@@ -33,6 +34,11 @@ jobs:
           nuget restore h3/pagefile-shadow-verifier/packages.config `
             -PackagesDirectory h3/pagefile-shadow-verifier/packages `
             -NonInteractive
+
+      - name: Run H3-B shadow history model tests
+        shell: pwsh
+        run: |
+          python h3/pagefile-shadow-verifier/shadow_history_model_test.py
 
       - name: Build x64 minifilter
         shell: pwsh
