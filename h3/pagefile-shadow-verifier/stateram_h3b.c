@@ -10,6 +10,8 @@
 #define H3B_SHADOW_SLOTS     32768
 #define H3B_POOL_TAG         'B3HS'
 #define H3B_MAX_HASH_PAGES_PER_IO 4
+#define H3B_WRITE_STATE_INFLIGHT  1
+#define H3B_WRITE_STATE_COMPLETED 2
 
 typedef struct _H3B_COMMAND
 {
@@ -55,10 +57,13 @@ typedef struct _H3B_COUNTERS
     LONG64 NewSystemBufferComparisons;
     LONG64 NewSystemBufferMismatches;
     LONG64 DynamicPagefileDiscoveries;
+    LONG64 ConcurrentOverlapSkips;
+    LONG64 DroppedInflightRecords;
+    LONG64 DroppedInflightOutstanding;
 } H3B_COUNTERS, *PH3B_COUNTERS;
 
 C_ASSERT(sizeof(H3B_COMMAND) == 8);
-C_ASSERT(sizeof(H3B_COUNTERS) == 264);
+C_ASSERT(sizeof(H3B_COUNTERS) == 288);
 
 typedef struct _H3B_SHADOW_ENTRY
 {
@@ -79,7 +84,7 @@ typedef struct _H3B_WRITE_RANGE
     ULONGLONG EndExclusive;
     ULONGLONG Sequence;
     ULONG Generation;
-    ULONG Reserved;
+    ULONG State;
 } H3B_WRITE_RANGE, *PH3B_WRITE_RANGE;
 
 typedef struct _H3B_PAGEFILE_STATE
@@ -87,6 +92,8 @@ typedef struct _H3B_PAGEFILE_STATE
     PFLT_INSTANCE Instance;
     ULONG HistoryHead;
     ULONG HistoryCount;
+    ULONG DroppedInflightCount;
+    ULONG Reserved;
     ULONGLONG HistoryFloor;
     H3B_WRITE_RANGE History[H3B_WRITE_HISTORY_SLOTS];
 } H3B_PAGEFILE_STATE, *PH3B_PAGEFILE_STATE;
@@ -142,6 +149,9 @@ volatile LONG64 g_CrossObjectMismatches;
 volatile LONG64 g_NewSystemBufferComparisons;
 volatile LONG64 g_NewSystemBufferMismatches;
 volatile LONG64 g_DynamicPagefileDiscoveries;
+volatile LONG64 g_ConcurrentOverlapSkips;
+volatile LONG64 g_DroppedInflightRecords;
+volatile LONG64 g_DroppedInflightOutstanding;
 
 DRIVER_INITIALIZE DriverEntry;
 
@@ -190,6 +200,8 @@ H3BResetCounters (
     InterlockedExchange64(&g_NewSystemBufferComparisons, 0);
     InterlockedExchange64(&g_NewSystemBufferMismatches, 0);
     InterlockedExchange64(&g_DynamicPagefileDiscoveries, 0);
+    InterlockedExchange64(&g_ConcurrentOverlapSkips, 0);
+    InterlockedExchange64(&g_DroppedInflightRecords, 0);
 
     generation = InterlockedIncrement(&g_ShadowGeneration);
 
@@ -425,6 +437,7 @@ H3BReleasePagefiles (
     InterlockedExchange64(&g_KnownPagefiles, 0);
     InterlockedExchange64(&g_PagefileIdentitiesCount, 0);
     InterlockedExchange64(&g_PagefileAliases, 0);
+    InterlockedExchange64(&g_DroppedInflightOutstanding, 0);
 
     KeReleaseSpinLock(&g_PagefileLock, oldIrql);
 
@@ -560,6 +573,13 @@ H3BRecordWriteRange (
     {
         record = &state->History[state->HistoryHead];
 
+        if (record->State == H3B_WRITE_STATE_INFLIGHT)
+        {
+            state->DroppedInflightCount++;
+            InterlockedIncrement64(&g_DroppedInflightRecords);
+            InterlockedIncrement64(&g_DroppedInflightOutstanding);
+        }
+
         if (record->Sequence > state->HistoryFloor)
         {
             state->HistoryFloor = record->Sequence;
@@ -577,7 +597,7 @@ H3BRecordWriteRange (
     record->EndExclusive = endExclusive;
     record->Sequence = sequence;
     record->Generation = generation;
-    record->Reserved = 0;
+    record->State = H3B_WRITE_STATE_INFLIGHT;
 
     state->HistoryHead =
         (state->HistoryHead + 1) % H3B_WRITE_HISTORY_SLOTS;
