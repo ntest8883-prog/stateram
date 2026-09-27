@@ -39,6 +39,12 @@ public static class StateRAMH3BNative
         public Int64 ShadowHighIrqlSkips;
         public Int64 ShadowTableEntries;
         public Int64 ShadowTableCapacity;
+        public Int64 ShadowPublishSkipped;
+        public Int64 ShadowVerifyInvalidated;
+        public Int64 HistoryExpired;
+        public Int64 HistoryRecordDrops;
+        public Int64 KnownPagefiles;
+        public Int64 HistoryCapacity;
     }
 
     [DllImport("fltlib.dll", CharSet = CharSet.Unicode)]
@@ -83,7 +89,7 @@ if ($hr -ne 0) {
 
 try {
     $cmd = New-Object StateRAMH3BNative+Command
-    $cmd.Version = 1
+    $cmd.Version = 2
     $cmd.CommandId = if ($Command -eq "reset") { 2 } else { 1 }
 
     $reply = New-Object StateRAMH3BNative+Counters
@@ -120,6 +126,12 @@ try {
         ShadowHighIrqlSkips     = $reply.ShadowHighIrqlSkips
         ShadowTableEntries      = $reply.ShadowTableEntries
         ShadowTableCapacity     = $reply.ShadowTableCapacity
+        ShadowPublishSkipped    = $reply.ShadowPublishSkipped
+        ShadowVerifyInvalidated = $reply.ShadowVerifyInvalidated
+        HistoryExpired          = $reply.HistoryExpired
+        HistoryRecordDrops      = $reply.HistoryRecordDrops
+        KnownPagefiles          = $reply.KnownPagefiles
+        HistoryCapacity         = $reply.HistoryCapacity
     } | Format-List
 }
 finally {
