@@ -171,11 +171,12 @@ ShvVmxEptInitialize (
     }
 
     //
-    // H1-D: arm eight independent target GPAs. A target may share a 2MB
-    // region with another target, so build at most one 4KB leaf table per
-    // unique 2MB region and let all targets in that region share it.
+    // H2-A: arm eight controlled logical GPAs. Their original HPAs contain
+    // poison after setup; demand faults restore the logical contents from the
+    // compressed store into one shared hot cache frame.
     //
     VpData->H1RegionCount = 0;
+    VpData->H2ResidentTarget = -1;
 
     for (t = 0; t < H1D_PAGE_COUNT; t++)
     {
@@ -309,8 +310,8 @@ ShvVmxEnterRootModeOnVp (
         ((VpData->MsrData[12].QuadPart & VMX_EPT_EXTENT_CONTEXT_BIT) != 0))
     {
         //
-        // H1-D requires single-context INVEPT because it repeatedly changes
-        // EPT physical-address and permission fields while the VM is live.
+        // H2-A requires single-context INVEPT because cache eviction/page-in
+        // repeatedly changes EPT physical-address and permission fields live.
         //
         VpData->EptControls =
             SECONDARY_EXEC_ENABLE_EPT | SECONDARY_EXEC_ENABLE_VPID;
