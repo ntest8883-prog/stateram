@@ -1,0 +1,65 @@
+name: StateRAM Windows true reclamation
+
+on:
+  push:
+    branches:
+      - real-reclaim-runtime
+    paths:
+      - "windows/true-reclaim/**"
+      - ".github/workflows/stateram-true-reclaim.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-selftest:
+    runs-on: windows-2025-vs2026
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure x64 Release
+        shell: pwsh
+        run: |
+          cmake -S windows/true-reclaim `
+                -B build/true-reclaim `
+                -A x64
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --build build/true-reclaim `
+                --config Release `
+                --parallel
+
+      - name: Run controlled 64 MiB self-test
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path "build/true-reclaim/Release/StateRAMTrueReclaim.exe").Path
+          & $exe --mib 64 --sample 128 2>&1 |
+            Tee-Object "build/true-reclaim/StateRAMTrueReclaim-report.txt"
+          if ($LASTEXITCODE -ne 0) {
+            throw "StateRAMTrueReclaim self-test failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Hash artifact
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path "build/true-reclaim/Release/StateRAMTrueReclaim.exe").Path
+          $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash
+          Write-Host "TRUE_RECLAIM_SHA256=$hash"
+          "TRUE_RECLAIM_SHA256=$hash" |
+            Out-File "build/true-reclaim/StateRAMTrueReclaim-SHA256.txt" -Encoding ascii
+
+      - name: Upload Windows true-reclamation artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: StateRAM-Windows-True-Reclaim
+          path: |
+            build/true-reclaim/Release/StateRAMTrueReclaim.exe
+            build/true-reclaim/Release/StateRAMTrueReclaim.pdb
+            build/true-reclaim/StateRAMTrueReclaim-report.txt
+            build/true-reclaim/StateRAMTrueReclaim-SHA256.txt
+          if-no-files-found: error
