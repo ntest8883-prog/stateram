@@ -47,6 +47,9 @@ typedef struct _H3B_COUNTERS
     LONG64 PagefileTableFull;
 } H3B_COUNTERS, *PH3B_COUNTERS;
 
+C_ASSERT(sizeof(H3B_COMMAND) == 8);
+C_ASSERT(sizeof(H3B_COUNTERS) == 192);
+
 typedef struct _H3B_SHADOW_ENTRY
 {
     PFILE_OBJECT FileObject;
