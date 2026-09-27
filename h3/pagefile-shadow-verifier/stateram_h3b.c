@@ -610,7 +610,86 @@ H3BRecordWriteRange (
 
 static
 BOOLEAN
-H3BHistoryAllows (
+H3BMarkWriteComplete (
+    _In_ PFILE_OBJECT FileObject,
+    _In_ ULONGLONG Sequence,
+    _Out_opt_ PULONG IdentityIndex
+    )
+{
+    KIRQL oldIrql;
+    ULONG identityIndex;
+    PH3B_PAGEFILE_STATE state;
+    ULONG i;
+    BOOLEAN found;
+
+    found = FALSE;
+    identityIndex = H3B_MAX_PAGEFILE_IDENTITIES;
+
+    KeAcquireSpinLock(&g_PagefileLock, &oldIrql);
+
+    if (!H3BGetIdentityIndexForObjectLocked(
+            FileObject,
+            &identityIndex))
+    {
+        KeReleaseSpinLock(&g_PagefileLock, oldIrql);
+        return FALSE;
+    }
+
+    state = &g_PagefileIdentities[identityIndex];
+
+    /*
+     * A sequence at/below the floor has already been evicted from the bounded
+     * history.  Because its post-write callback is only arriving now, that
+     * evicted record was necessarily still INFLIGHT when overwritten.
+     * Retire exactly one conservative unknown-write barrier.
+     */
+    if (Sequence <= state->HistoryFloor)
+    {
+        if (state->DroppedInflightCount != 0)
+        {
+            state->DroppedInflightCount--;
+            InterlockedDecrement64(&g_DroppedInflightOutstanding);
+        }
+
+        KeReleaseSpinLock(&g_PagefileLock, oldIrql);
+
+        if (IdentityIndex != NULL)
+        {
+            *IdentityIndex = identityIndex;
+        }
+
+        return FALSE;
+    }
+
+    for (i = 0; i < state->HistoryCount; i++)
+    {
+        PH3B_WRITE_RANGE record = &state->History[i];
+
+        if (record->Sequence == Sequence)
+        {
+            if (record->State == H3B_WRITE_STATE_INFLIGHT)
+            {
+                record->State = H3B_WRITE_STATE_COMPLETED;
+            }
+
+            found = TRUE;
+            break;
+        }
+    }
+
+    KeReleaseSpinLock(&g_PagefileLock, oldIrql);
+
+    if (IdentityIndex != NULL)
+    {
+        *IdentityIndex = identityIndex;
+    }
+
+    return found;
+}
+
+static
+BOOLEAN
+H3BHistoryAllowsPublish (
     _In_ ULONG IdentityIndex,
     _In_ ULONGLONG PageOffset,
     _In_ ULONGLONG Sequence,
@@ -622,11 +701,15 @@ H3BHistoryAllows (
     ULONG i;
     BOOLEAN foundOwn;
     BOOLEAN newerOverlap;
+    BOOLEAN olderInflightOverlap;
     ULONG ownGeneration;
+    ULONG ownState;
 
     foundOwn = FALSE;
     newerOverlap = FALSE;
+    olderInflightOverlap = FALSE;
     ownGeneration = 0;
+    ownState = 0;
 
     if (IdentityIndex >= H3B_MAX_PAGEFILE_IDENTITIES)
     {
@@ -638,6 +721,136 @@ H3BHistoryAllows (
     state = &g_PagefileIdentities[IdentityIndex];
 
     if (state->Instance == NULL)
+    {
+        KeReleaseSpinLock(&g_PagefileLock, oldIrql);
+        return FALSE;
+    }
+
+    /*
+     * If any INFLIGHT record was dropped from this identity's bounded history,
+     * its range is no longer known.  Until that write completes we cannot prove
+     * that a candidate page will stay current, so publishing any new sample
+     * would be unsafe.
+     */
+    if (state->DroppedInflightCount != 0)
+    {
+        InterlockedIncrement64(&g_ConcurrentOverlapSkips);
+        KeReleaseSpinLock(&g_PagefileLock, oldIrql);
+        return FALSE;
+    }
+
+    if (Sequence <= state->HistoryFloor)
+    {
+        InterlockedIncrement64(&g_HistoryExpired);
+        KeReleaseSpinLock(&g_PagefileLock, oldIrql);
+        return FALSE;
+    }
+
+    for (i = 0; i < state->HistoryCount; i++)
+    {
+        const H3B_WRITE_RANGE* record = &state->History[i];
+
+        if (record->Sequence == Sequence)
+        {
+            foundOwn = TRUE;
+            ownGeneration = record->Generation;
+            ownState = record->State;
+        }
+        else if (H3BRangeOverlapsPage(record, PageOffset))
+        {
+            if (record->Sequence > Sequence)
+            {
+                /*
+                 * Any newer overlapping pre-write conservatively invalidates
+                 * this candidate, whether that newer I/O has completed or not.
+                 */
+                newerOverlap = TRUE;
+            }
+            else if ((record->Sequence < Sequence) &&
+                     (record->State == H3B_WRITE_STATE_INFLIGHT))
+            {
+                /*
+                 * This is the out-of-order completion case H3-B4 missed:
+                 * an older overlapping write is still in flight.  It can finish
+                 * after this write and become the final storage contents.
+                 */
+                olderInflightOverlap = TRUE;
+            }
+        }
+    }
+
+    KeReleaseSpinLock(&g_PagefileLock, oldIrql);
+
+    if (!foundOwn ||
+        (ownState != H3B_WRITE_STATE_COMPLETED) ||
+        newerOverlap ||
+        olderInflightOverlap)
+    {
+        if (olderInflightOverlap)
+        {
+            InterlockedIncrement64(&g_ConcurrentOverlapSkips);
+        }
+
+        return FALSE;
+    }
+
+    if ((ULONG)InterlockedCompareExchange(
+            &g_ShadowGeneration,
+            0,
+            0) != ownGeneration)
+    {
+        return FALSE;
+    }
+
+    if (Generation != NULL)
+    {
+        *Generation = ownGeneration;
+    }
+
+    return TRUE;
+}
+
+static
+BOOLEAN
+H3BHistoryAllowsVerify (
+    _In_ ULONG IdentityIndex,
+    _In_ ULONGLONG PageOffset,
+    _In_ ULONGLONG Sequence
+    )
+{
+    KIRQL oldIrql;
+    PH3B_PAGEFILE_STATE state;
+    ULONG i;
+    BOOLEAN foundOwn;
+    BOOLEAN newerOverlap;
+    ULONG ownGeneration;
+    ULONG ownState;
+
+    foundOwn = FALSE;
+    newerOverlap = FALSE;
+    ownGeneration = 0;
+    ownState = 0;
+
+    if (IdentityIndex >= H3B_MAX_PAGEFILE_IDENTITIES)
+    {
+        return FALSE;
+    }
+
+    KeAcquireSpinLock(&g_PagefileLock, &oldIrql);
+
+    state = &g_PagefileIdentities[IdentityIndex];
+
+    if (state->Instance == NULL)
+    {
+        KeReleaseSpinLock(&g_PagefileLock, oldIrql);
+        return FALSE;
+    }
+
+    /*
+     * A dropped INFLIGHT range is an unknown overlapping-write possibility.
+     * Refuse comparisons until its post-write completion retires the barrier.
+     */
+    if (state->DroppedInflightCount != 0)
     {
         KeReleaseSpinLock(&g_PagefileLock, oldIrql);
         return FALSE;
@@ -658,6 +871,7 @@ H3BHistoryAllows (
         {
             foundOwn = TRUE;
             ownGeneration = record->Generation;
+            ownState = record->State;
         }
         else if ((record->Sequence > Sequence) &&
                  H3BRangeOverlapsPage(record, PageOffset))
@@ -668,7 +882,9 @@ H3BHistoryAllows (
 
     KeReleaseSpinLock(&g_PagefileLock, oldIrql);
 
-    if (!foundOwn || newerOverlap)
+    if (!foundOwn ||
+        (ownState != H3B_WRITE_STATE_COMPLETED) ||
+        newerOverlap)
     {
         return FALSE;
     }
@@ -679,11 +895,6 @@ H3BHistoryAllows (
             0) != ownGeneration)
     {
         return FALSE;
-    }
-
-    if (Generation != NULL)
-    {
-        *Generation = ownGeneration;
     }
 
     return TRUE;
@@ -962,7 +1173,7 @@ H3BShadowCompletedWrite (
         return;
     }
 
-    if (!H3BHistoryAllows(
+    if (!H3BHistoryAllowsPublish(
             identityIndex,
             baseOffset,
             WriteSequence,
@@ -1013,7 +1224,7 @@ H3BShadowCompletedWrite (
 
             offset = baseOffset + ((ULONGLONG)i * PAGE_SIZE);
 
-            if (!H3BHistoryAllows(
+            if (!H3BHistoryAllowsPublish(
                     identityIndex,
                     offset,
                     WriteSequence,
@@ -1158,11 +1369,10 @@ H3BVerifyCompletedRead (
                 bytes + ((SIZE_T)i * PAGE_SIZE),
                 0xD6E8FEB86659FD93ULL);
 
-            if (!H3BHistoryAllows(
+            if (!H3BHistoryAllowsVerify(
                     identityIndex,
                     offset,
-                    writeSequence,
-                    NULL))
+                    writeSequence))
             {
                 InterlockedIncrement64(&g_ShadowVerifyInvalidated);
                 InterlockedIncrement64(&g_ShadowUntracked);
@@ -1318,6 +1528,24 @@ H3BPostWrite (
 
     if (FlagOn(Flags, FLTFL_POST_OPERATION_DRAINING))
     {
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+
+    if (!H3BMarkWriteComplete(
+            Data->Iopb->TargetFileObject,
+            writeSequence,
+            NULL))
+    {
+        /*
+         * The bounded history no longer retains this write (or its pagefile
+         * identity vanished).  It cannot safely publish a sample.
+         */
+        if (NT_SUCCESS(Data->IoStatus.Status) &&
+            (Data->IoStatus.Information != 0))
+        {
+            InterlockedIncrement64(&g_ShadowPublishSkipped);
+        }
+
         return FLT_POSTOP_FINISHED_PROCESSING;
     }
 
@@ -1512,6 +1740,9 @@ H3BMessage (
     reply->NewSystemBufferComparisons = H3BReadCounter(&g_NewSystemBufferComparisons);
     reply->NewSystemBufferMismatches = H3BReadCounter(&g_NewSystemBufferMismatches);
     reply->DynamicPagefileDiscoveries = H3BReadCounter(&g_DynamicPagefileDiscoveries);
+    reply->ConcurrentOverlapSkips = H3BReadCounter(&g_ConcurrentOverlapSkips);
+    reply->DroppedInflightRecords = H3BReadCounter(&g_DroppedInflightRecords);
+    reply->DroppedInflightOutstanding = H3BReadCounter(&g_DroppedInflightOutstanding);
 
     *ReturnOutputBufferLength = sizeof(*reply);
     return STATUS_SUCCESS;
