@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - h3-pagefile-shadow-history
+      - h3-pagefile-shadow-canonical
     paths:
       - "h3/pagefile-read-pressure/**"
       - ".github/workflows/stateram-h3b-pressure.yml"
