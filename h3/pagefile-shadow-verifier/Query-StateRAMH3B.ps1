@@ -47,6 +47,12 @@ public static class StateRAMH3BNative
         public Int64 KnownPagefiles;
         public Int64 HistoryCapacity;
         public Int64 PagefileTableFull;
+        public Int64 PagefileIdentities;
+        public Int64 PagefileAliases;
+        public Int64 ReadNewSystemBuffers;
+        public Int64 CrossObjectComparisons;
+        public Int64 CrossObjectMatches;
+        public Int64 CrossObjectMismatches;
     }
 
     [DllImport("fltlib.dll", CharSet = CharSet.Unicode)]
@@ -84,11 +90,11 @@ if ($SelfTest) {
         throw "Protocol self-test failed: Command size is $commandSize, expected 8."
     }
 
-    if ($counterSize -ne 192) {
-        throw "Protocol self-test failed: Counters size is $counterSize, expected 192."
+    if ($counterSize -ne 240) {
+        throw "Protocol self-test failed: Counters size is $counterSize, expected 240."
     }
 
-    Write-Host "StateRAMH3B query protocol self-test: PASS (Command=8, Counters=192)"
+    Write-Host "StateRAMH3B query protocol self-test: PASS (Command=8, Counters=240)"
     exit 0
 }
 
@@ -107,7 +113,7 @@ if ($hr -ne 0) {
 
 try {
     $cmd = New-Object StateRAMH3BNative+Command
-    $cmd.Version = 2
+    $cmd.Version = 3
     $cmd.CommandId = if ($Command -eq "reset") { 2 } else { 1 }
 
     $reply = New-Object StateRAMH3BNative+Counters
@@ -148,9 +154,15 @@ try {
         ShadowVerifyInvalidated = $reply.ShadowVerifyInvalidated
         HistoryExpired          = $reply.HistoryExpired
         HistoryRecordDrops      = $reply.HistoryRecordDrops
-        KnownPagefiles          = $reply.KnownPagefiles
+        KnownPagefileObjects    = $reply.KnownPagefiles
         HistoryCapacity         = $reply.HistoryCapacity
         PagefileTableFull       = $reply.PagefileTableFull
+        PagefileIdentities      = $reply.PagefileIdentities
+        PagefileAliases         = $reply.PagefileAliases
+        ReadNewSystemBuffers    = $reply.ReadNewSystemBuffers
+        CrossObjectComparisons  = $reply.CrossObjectComparisons
+        CrossObjectMatches      = $reply.CrossObjectMatches
+        CrossObjectMismatches   = $reply.CrossObjectMismatches
     } | Format-List
 }
 finally {
