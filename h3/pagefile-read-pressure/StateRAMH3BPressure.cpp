@@ -15,8 +15,13 @@ static const SIZE_T kPressureChunk = 32ull * kMiB;
 static const SIZE_T kTargetMiB = 96;
 static const SIZE_T kMinPressureMiB = 512;
 static const SIZE_T kMaxPressureMiB = 1280;
-static const SIZE_T kEmergencyAvailMiB = 160;
-static const SIZE_T kCommitReserveMiB = 768;
+static const SIZE_T kEmergencyAvailMiB = 256;
+static const SIZE_T kCommitReserveMiB = 1024;
+static const DWORD kTargetReadyWaitMs = 180000;
+static const DWORD kTargetGoWaitMs = 300000;
+static const DWORD kTargetVerifyWaitMs = 300000;
+static const int64_t kEvidenceShadowPages = 32;
+static const int64_t kEvidencePagefileWrites = 8;
 
 #pragma pack(push, 8)
 struct H3B_COMMAND
@@ -261,25 +266,11 @@ static int TargetMode(DWORD parentPid, SIZE_T targetMiB)
     const SIZE_T bytes = targetMiB * kMiB;
     const uint64_t seed = 0x535441544552414Dull ^ parentPid;
 
-    void* target = VirtualAlloc(
-        nullptr,
-        bytes,
-        MEM_RESERVE | MEM_COMMIT,
-        PAGE_READWRITE);
-
-    if (!target)
-    {
-        fwprintf(stderr, L"TARGET_ERROR VirtualAlloc(%zu MiB)=%lu\n",
-            targetMiB, GetLastError());
-        CloseHandle(ready);
-        CloseHandle(go);
-        CloseHandle(done);
-        return 21;
-    }
-
-    wprintf(L"TARGET_ALLOCATED=%zu MiB\n", targetMiB);
-    FillRegion(target, bytes, seed);
-
+    /*
+     * Set the child memory priority BEFORE committing/filling its target.
+     * This avoids depending on whether a later priority change is applied
+     * retroactively to pages that were already faulted in.
+     */
     HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
     auto setProcessInformation =
         reinterpret_cast<PFN_SET_PROCESS_INFORMATION_LOCAL>(
@@ -307,6 +298,25 @@ static int TargetMode(DWORD parentPid, SIZE_T targetMiB)
         wprintf(L"TARGET_MEMORY_PRIORITY=API_UNAVAILABLE\n");
     }
 
+    void* target = VirtualAlloc(
+        nullptr,
+        bytes,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE);
+
+    if (!target)
+    {
+        fwprintf(stderr, L"TARGET_ERROR VirtualAlloc(%zu MiB)=%lu\n",
+            targetMiB, GetLastError());
+        CloseHandle(ready);
+        CloseHandle(go);
+        CloseHandle(done);
+        return 21;
+    }
+
+    wprintf(L"TARGET_ALLOCATED=%zu MiB\n", targetMiB);
+    FillRegion(target, bytes, seed);
+
     if (!SetProcessWorkingSetSize(
             GetCurrentProcess(),
             static_cast<SIZE_T>(-1),
@@ -323,7 +333,7 @@ static int TargetMode(DWORD parentPid, SIZE_T targetMiB)
     wprintf(L"TARGET_TRIMMED=YES\n");
     SetEvent(ready);
 
-    DWORD wait = WaitForSingleObject(go, 60000);
+    DWORD wait = WaitForSingleObject(go, kTargetGoWaitMs);
     if (wait != WAIT_OBJECT_0)
     {
         fwprintf(stderr, L"TARGET_ERROR wait-go=%lu\n", wait);
@@ -534,7 +544,7 @@ static int ParentMode()
 
     do
     {
-        DWORD wait = WaitForSingleObject(ready, 60000);
+        DWORD wait = WaitForSingleObject(ready, kTargetReadyWaitMs);
         if (wait != WAIT_OBJECT_0)
         {
             fwprintf(stderr, L"RESULT=ABORT reason=TARGET_READY_TIMEOUT wait=%lu\n", wait);
@@ -578,7 +588,16 @@ static int ParentMode()
 
         uint64_t allocatedMiB = 0;
         uint64_t blockNumber = 0;
+        bool stopForEvidence = false;
+        bool stopForMismatch = false;
+        H3B_COUNTERS mid = before;
 
+        /*
+         * Do not blindly allocate all pressure and then inspect the verifier.
+         * Check it every 64 MiB once meaningful pressure exists.  This lets us
+         * trigger the target read while fresh write history is still available,
+         * instead of discovering history-ring expiry after the fact.
+         */
         while (allocatedMiB + (kPressureChunk / kMiB) <= desiredPressureMiB)
         {
             MemSnapshot now = {};
@@ -589,7 +608,7 @@ static int ParentMode()
             }
 
             if ((now.availPhysMiB <= kEmergencyAvailMiB) &&
-                (allocatedMiB >= kMinPressureMiB))
+                (allocatedMiB >= 256))
             {
                 wprintf(L"PRESSURE_STOP reason=PHYSICAL_SAFETY available=%llu MiB\n",
                     static_cast<unsigned long long>(now.availPhysMiB));
@@ -623,6 +642,67 @@ static int ParentMode()
             pressure.push_back(block);
             allocatedMiB += kPressureChunk / kMiB;
             ++blockNumber;
+
+            if ((allocatedMiB >= 256) &&
+                ((allocatedMiB % 64) == 0))
+            {
+                H3B_COUNTERS probe = {};
+                if (!QueryH3B(probe))
+                {
+                    fwprintf(stderr, L"PRESSURE_STOP reason=H3B_QUERY_FAILED\n");
+                    break;
+                }
+
+                mid = probe;
+
+                if (probe.ShadowMismatches != before.ShadowMismatches)
+                {
+                    stopForMismatch = true;
+                    break;
+                }
+
+                const int64_t writeDelta =
+                    probe.PagefileWrites - before.PagefileWrites;
+                const int64_t shadowDelta =
+                    probe.ShadowWritePages - before.ShadowWritePages;
+                const int64_t readDelta =
+                    probe.ShadowReadPages - before.ShadowReadPages;
+                const int64_t matchDelta =
+                    probe.ShadowMatches - before.ShadowMatches;
+                const int64_t historyDropDelta =
+                    probe.HistoryRecordDrops - before.HistoryRecordDrops;
+
+                if ((readDelta > 0) && (matchDelta > 0))
+                {
+                    wprintf(L"PRESSURE_STOP reason=VERIFIER_ALREADY_MATCHED "
+                            L"allocated=%llu MiB\n",
+                        static_cast<unsigned long long>(allocatedMiB));
+                    stopForEvidence = true;
+                    break;
+                }
+
+                if (historyDropDelta > 0)
+                {
+                    wprintf(L"PRESSURE_STOP reason=HISTORY_PRESSURE "
+                            L"drops=%lld allocated=%llu MiB\n",
+                        historyDropDelta,
+                        static_cast<unsigned long long>(allocatedMiB));
+                    stopForEvidence = true;
+                    break;
+                }
+
+                if ((writeDelta >= kEvidencePagefileWrites) &&
+                    (shadowDelta >= kEvidenceShadowPages))
+                {
+                    wprintf(L"PRESSURE_STOP reason=FRESH_PAGEFILE_EVIDENCE "
+                            L"writes=%lld shadowPages=%lld allocated=%llu MiB\n",
+                        writeDelta,
+                        shadowDelta,
+                        static_cast<unsigned long long>(allocatedMiB));
+                    stopForEvidence = true;
+                    break;
+                }
+            }
         }
 
         MemSnapshot pressurePeak = {};
@@ -632,6 +712,13 @@ static int ParentMode()
             static_cast<unsigned long long>(allocatedMiB),
             static_cast<unsigned long long>(pressurePeak.availPhysMiB));
 
+        if (stopForMismatch)
+        {
+            fwprintf(stderr, L"RESULT=STOP_MISMATCH phase=pressure\n");
+            result = 40;
+            break;
+        }
+
         if (allocatedMiB < 256)
         {
             fwprintf(stderr,
@@ -640,9 +727,15 @@ static int ParentMode()
             break;
         }
 
-        Sleep(4000);
+        /*
+         * One short settling interval is enough.  A four-second blind wait can
+         * create extra pagefile writes and evict the very history we need.
+         */
+        if (!stopForEvidence)
+        {
+            Sleep(750);
+        }
 
-        H3B_COUNTERS mid = {};
         if (!QueryH3B(mid))
         {
             fwprintf(stderr, L"RESULT=ABORT reason=MID_QUERY_FAILED\n");
@@ -669,14 +762,14 @@ static int ParentMode()
 
         SetEvent(go);
 
-        wait = WaitForSingleObject(done, 60000);
+        wait = WaitForSingleObject(done, kTargetVerifyWaitMs);
         if (wait != WAIT_OBJECT_0)
         {
             fwprintf(stderr, L"RESULT=ABORT reason=TARGET_VERIFY_TIMEOUT wait=%lu\n", wait);
             break;
         }
 
-        WaitForSingleObject(pi.hProcess, 10000);
+        WaitForSingleObject(pi.hProcess, 30000);
 
         DWORD childCode = STILL_ACTIVE;
         GetExitCodeProcess(pi.hProcess, &childCode);
