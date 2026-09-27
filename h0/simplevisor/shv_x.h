@@ -33,6 +33,11 @@ Environment:
 #define _1GB                        (1 * 1024 * 1024 * 1024)
 #define _2MB                        (2 * 1024 * 1024)
 
+#define H1D_PAGE_COUNT              8
+#define H1D_CYCLES_PER_CPU          512
+#define H1D_CPUID_RESET_LEAF        0x53524431
+#define H1D_CPUID_RESET_OK          0x53524F4B
+
 struct _SHV_CALLBACK_CONTEXT;
 
 typedef
@@ -80,11 +85,15 @@ typedef struct _SHV_VP_DATA
             UINT64 VmcsPhysicalAddress;
             UINT64 MsrBitmapPhysicalAddress;
             UINT64 EptPml4PhysicalAddress;
-            UINT64 H0TestPagePhysicalAddress;
-            PVMX_PTE H0EptPt;
-            UINT32 H0TestPteIndex;
+            UINT64 EptPointer;
+            UINT64 H1TargetPagePhysicalAddress[H1D_PAGE_COUNT];
+            PVMX_PTE H1EptPt[H1D_PAGE_COUNT];
+            UINT64 H1RegionBase[H1D_PAGE_COUNT];
+            UINT32 H1TargetRegionIndex[H1D_PAGE_COUNT];
+            UINT32 H1TargetPteIndex[H1D_PAGE_COUNT];
+            UINT32 H1Phase[H1D_PAGE_COUNT];
+            UINT32 H1RegionCount;
             UINT32 EptControls;
-            UINT32 H1Phase;
         };
     };
 
@@ -135,13 +144,17 @@ ShvUnload (
     VOID
     );
 
-extern UINT64 ShvH0TestPagePhysicalAddress;
+extern UINT64 ShvH1TargetPageVirtualAddresses[H1D_PAGE_COUNT];
+extern UINT64 ShvH1BackingPageVirtualAddresses[H1D_PAGE_COUNT];
+extern UINT64 ShvH1TargetPagePhysicalAddresses[H1D_PAGE_COUNT];
+extern UINT64 ShvH1BackingPagePhysicalAddresses[H1D_PAGE_COUNT];
 extern volatile long ShvH0EptTrapCount;
 extern volatile UINT64 ShvH0LastGuestPhysicalAddress;
 extern volatile UINT64 ShvH0LastExitQualification;
-extern UINT64 ShvH1TestPageVirtualAddress;
-extern UINT64 ShvH1BackingPageVirtualAddress;
-extern UINT64 ShvH1BackingPagePhysicalAddress;
 extern volatile long ShvH1RemapCount;
 extern volatile long ShvH1WriteTrapCount;
 extern volatile long ShvH1DetachedFrameVerifiedCount;
+extern volatile long ShvH1DResetCount;
+extern volatile long ShvH1DInveptCount;
+extern volatile long ShvH1DInveptFailureCount;
+extern volatile long ShvH1DCompletedCycles;
