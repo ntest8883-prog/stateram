@@ -62,3 +62,29 @@ To keep elevated-IRQL work bounded on the target's dual-core Celeron, H3-B2
 fingerprints at most four 4 KiB pages per completed I/O. This is a sampled
 integrity verifier, not a performance implementation. ShadowMismatches > 0
 remains a stop condition.
+
+
+## H3-B4 range-scoped stale-fingerprint protection
+
+H3-B3 removed the H3-B2 mismatches by invalidating all fingerprints on a
+pagefile whenever any write began, but this was too conservative: the target
+run produced no actual write-to-read comparisons.
+
+H3-B4 invalidates only the page offsets covered by a newer write. Before a
+pagefile write is sent down the stack, every affected 4 KiB page is marked as
+pending with a monotonically increasing write sequence. A completed write may
+publish a sampled fingerprint only if its page is still pending for that exact
+sequence. This prevents an older completion from reviving stale state after a
+newer overlapping write.
+
+A completed read obtains both the fingerprint and its write sequence, hashes
+the returned page, then rechecks that the same fingerprint/sequence is still
+current before counting a match or mismatch. If an overlapping write raced
+with the read, the sample is treated as untracked rather than as a mismatch.
+
+To keep elevated-IRQL work bounded, normal writes invalidate at most 2048
+individual 4 KiB pages (8 MiB). Larger or abnormal ranges conservatively
+invalidate the whole verifier generation, then only the small sampled prefix
+is eligible to be repopulated. The real Windows pagefile remains authoritative;
+H3-B4 still never modifies, redirects, suppresses, completes, or compresses
+pagefile I/O.
