@@ -53,6 +53,8 @@ public static class StateRAMH3BNative
         public Int64 CrossObjectComparisons;
         public Int64 CrossObjectMatches;
         public Int64 CrossObjectMismatches;
+        public Int64 NewSystemBufferComparisons;
+        public Int64 NewSystemBufferMismatches;
     }
 
     [DllImport("fltlib.dll", CharSet = CharSet.Unicode)]
@@ -90,11 +92,11 @@ if ($SelfTest) {
         throw "Protocol self-test failed: Command size is $commandSize, expected 8."
     }
 
-    if ($counterSize -ne 240) {
-        throw "Protocol self-test failed: Counters size is $counterSize, expected 240."
+    if ($counterSize -ne 256) {
+        throw "Protocol self-test failed: Counters size is $counterSize, expected 256."
     }
 
-    Write-Host "StateRAMH3B query protocol self-test: PASS (Command=8, Counters=240)"
+    Write-Host "StateRAMH3B query protocol self-test: PASS (Command=8, Counters=256)"
     exit 0
 }
 
@@ -163,6 +165,8 @@ try {
         CrossObjectComparisons  = $reply.CrossObjectComparisons
         CrossObjectMatches      = $reply.CrossObjectMatches
         CrossObjectMismatches   = $reply.CrossObjectMismatches
+        NewSystemBufComparisons = $reply.NewSystemBufferComparisons
+        NewSystemBufMismatches  = $reply.NewSystemBufferMismatches
     } | Format-List
 }
 finally {
