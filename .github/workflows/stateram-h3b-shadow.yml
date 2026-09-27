@@ -6,6 +6,7 @@ on:
       - h3-pagefile-shadow-verify
       - h3-pagefile-shadow-dispatch
       - h3-pagefile-shadow-history
+      - h3-pagefile-shadow-canonical
     paths:
       - "h3/pagefile-shadow-verifier/**"
       - ".github/workflows/stateram-h3b-shadow.yml"
