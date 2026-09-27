@@ -12,6 +12,7 @@
 #define H3B_MAX_HASH_PAGES_PER_IO 4
 #define H3B_WRITE_STATE_INFLIGHT  1
 #define H3B_WRITE_STATE_COMPLETED 2
+#define H3B_WRITE_FLAG_CONCURRENT_OVERLAP 0x00000001UL
 
 typedef struct _H3B_COMMAND
 {
@@ -85,6 +86,8 @@ typedef struct _H3B_WRITE_RANGE
     ULONGLONG Sequence;
     ULONG Generation;
     ULONG State;
+    ULONG Flags;
+    ULONG Reserved;
 } H3B_WRITE_RANGE, *PH3B_WRITE_RANGE;
 
 typedef struct _H3B_PAGEFILE_STATE
@@ -518,6 +521,18 @@ H3BRangeOverlapsPage (
 
 static
 BOOLEAN
+H3BRangeOverlapsRange (
+    _In_ const H3B_WRITE_RANGE* Range,
+    _In_ ULONGLONG Start,
+    _In_ ULONGLONG EndExclusive
+    )
+{
+    return ((Range->Start < EndExclusive) &&
+            (Range->EndExclusive > Start)) ? TRUE : FALSE;
+}
+
+static
+BOOLEAN
 H3BRecordWriteRange (
     _In_ PFILE_OBJECT FileObject,
     _In_ LONGLONG ByteOffset,
@@ -533,7 +548,10 @@ H3BRecordWriteRange (
     ULONGLONG endExclusive;
     ULONGLONG sequence;
     ULONG generation;
+    ULONG i;
+    ULONG newFlags;
 
+    newFlags = 0;
     sequence = (ULONGLONG)InterlockedIncrement64(&g_WriteSequence);
     if (sequence == 0)
     {
@@ -569,6 +587,27 @@ H3BRecordWriteRange (
 
     state = &g_PagefileIdentities[identityIndex];
 
+    /*
+     * Remember that two overlapping writes existed concurrently.  Callback
+     * execution order alone cannot be used to infer which completed bytes are
+     * the final storage contents on a multi-CPU system, so neither member of
+     * such a pair is allowed to publish a fingerprint.
+     */
+    for (i = 0; i < state->HistoryCount; i++)
+    {
+        PH3B_WRITE_RANGE existing = &state->History[i];
+
+        if ((existing->State == H3B_WRITE_STATE_INFLIGHT) &&
+            H3BRangeOverlapsRange(
+                existing,
+                start,
+                endExclusive))
+        {
+            existing->Flags |= H3B_WRITE_FLAG_CONCURRENT_OVERLAP;
+            newFlags |= H3B_WRITE_FLAG_CONCURRENT_OVERLAP;
+        }
+    }
+
     if (state->HistoryCount == H3B_WRITE_HISTORY_SLOTS)
     {
         record = &state->History[state->HistoryHead];
@@ -598,6 +637,8 @@ H3BRecordWriteRange (
     record->Sequence = sequence;
     record->Generation = generation;
     record->State = H3B_WRITE_STATE_INFLIGHT;
+    record->Flags = newFlags;
+    record->Reserved = 0;
 
     state->HistoryHead =
         (state->HistoryHead + 1) % H3B_WRITE_HISTORY_SLOTS;
@@ -704,12 +745,14 @@ H3BHistoryAllowsPublish (
     BOOLEAN olderInflightOverlap;
     ULONG ownGeneration;
     ULONG ownState;
+    ULONG ownFlags;
 
     foundOwn = FALSE;
     newerOverlap = FALSE;
     olderInflightOverlap = FALSE;
     ownGeneration = 0;
     ownState = 0;
+    ownFlags = 0;
 
     if (IdentityIndex >= H3B_MAX_PAGEFILE_IDENTITIES)
     {
@@ -755,6 +798,7 @@ H3BHistoryAllowsPublish (
             foundOwn = TRUE;
             ownGeneration = record->Generation;
             ownState = record->State;
+            ownFlags = record->Flags;
         }
         else if (H3BRangeOverlapsPage(record, PageOffset))
         {
@@ -783,10 +827,12 @@ H3BHistoryAllowsPublish (
 
     if (!foundOwn ||
         (ownState != H3B_WRITE_STATE_COMPLETED) ||
+        FlagOn(ownFlags, H3B_WRITE_FLAG_CONCURRENT_OVERLAP) ||
         newerOverlap ||
         olderInflightOverlap)
     {
-        if (olderInflightOverlap)
+        if (FlagOn(ownFlags, H3B_WRITE_FLAG_CONCURRENT_OVERLAP) ||
+            olderInflightOverlap)
         {
             InterlockedIncrement64(&g_ConcurrentOverlapSkips);
         }
