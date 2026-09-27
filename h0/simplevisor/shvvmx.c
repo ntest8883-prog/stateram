@@ -118,33 +118,33 @@ ShvVmxEptInitialize (
     _In_ PSHV_VP_DATA VpData
     )
 {
-    UINT32 i, j, k;
-    UINT32 h0PdptIndex, h0PdeIndex, h0PteIndex;
-    UINT64 h0LargePageBase;
+    UINT32 i, j, k, t, r;
+    UINT32 pdptIndex, pdeIndex, pteIndex;
+    UINT64 targetPhysicalAddress;
+    UINT64 largePageBase;
     VMX_PDPTE tempEpdpte;
     VMX_LARGE_PDE tempEpde;
     VMX_PTE tempEpte;
 
     //
-    // Fill out the EPML4E which covers the first 512GB of RAM
+    // Fill out the EPML4E which covers the first 512GB of RAM.
     //
     VpData->Epml4[0].Read = 1;
     VpData->Epml4[0].Write = 1;
     VpData->Epml4[0].Execute = 1;
-    VpData->Epml4[0].PageFrameNumber = ShvOsGetPhysicalAddress(&VpData->Epdpt) / PAGE_SIZE;
+    VpData->Epml4[0].PageFrameNumber =
+        ShvOsGetPhysicalAddress(&VpData->Epdpt) / PAGE_SIZE;
 
-    //
-    // Fill out a RWX PDPTE
-    //
     tempEpdpte.AsUlonglong = 0;
     tempEpdpte.Read = tempEpdpte.Write = tempEpdpte.Execute = 1;
 
     //
-    // Construct the EPT hierarchy for every 1GB range. H1-C stores each
-    // 512-entry PDE table in its own independent 4KB physical page, so no
-    // multi-megabyte contiguous allocation is required.
+    // H1-C/H1-D allocator hardening: each PDE table is an independent 4KB
+    // physical page rather than part of one multi-megabyte contiguous block.
     //
-    __stosq((UINT64*)VpData->Epdpt, tempEpdpte.AsUlonglong, PDPTE_ENTRY_COUNT);
+    __stosq((UINT64*)VpData->Epdpt,
+            tempEpdpte.AsUlonglong,
+            PDPTE_ENTRY_COUNT);
 
     tempEpde.AsUlonglong = 0;
     tempEpde.Read = tempEpde.Write = tempEpde.Execute = 1;
@@ -171,53 +171,100 @@ ShvVmxEptInitialize (
     }
 
     //
-    // H0-C: split only the 2MB identity mapping that contains our private
-    // test page into 4KB leaves, then remove access from exactly one 4KB leaf.
-    // All other mappings remain identical to the proven H0-B baseline.
+    // H1-D: arm eight independent target GPAs. A target may share a 2MB
+    // region with another target, so build at most one 4KB leaf table per
+    // unique 2MB region and let all targets in that region share it.
     //
-    if (ShvH0TestPagePhysicalAddress != 0)
+    VpData->H1RegionCount = 0;
+
+    for (t = 0; t < H1D_PAGE_COUNT; t++)
     {
-        h0PdptIndex = (UINT32)((ShvH0TestPagePhysicalAddress >> 30) & 0x1FF);
-        h0PdeIndex = (UINT32)((ShvH0TestPagePhysicalAddress >> 21) & 0x1FF);
-        h0PteIndex = (UINT32)((ShvH0TestPagePhysicalAddress >> 12) & 0x1FF);
-        h0LargePageBase = ShvH0TestPagePhysicalAddress & ~((UINT64)_2MB - 1);
-
-        VpData->H0TestPagePhysicalAddress = ShvH0TestPagePhysicalAddress;
-        VpData->H0TestPteIndex = h0PteIndex;
-
-        tempEpte.AsUlonglong = 0;
-        tempEpte.Read = tempEpte.Write = tempEpte.Execute = 1;
-        tempEpte.Type = VpData->Epde[h0PdptIndex][h0PdeIndex].Type;
-
-        __stosq((UINT64*)VpData->H0EptPt,
-                tempEpte.AsUlonglong,
-                PDE_ENTRY_COUNT);
-
-        for (k = 0; k < PDE_ENTRY_COUNT; k++)
+        targetPhysicalAddress = ShvH1TargetPagePhysicalAddresses[t];
+        if (targetPhysicalAddress == 0)
         {
-            VpData->H0EptPt[k].PageFrameNumber =
-                (h0LargePageBase / PAGE_SIZE) + k;
+            continue;
         }
 
-        //
-        // Arm the controlled trap: no guest read/write/execute access until
-        // the VM-exit handler observes the page and restores its permissions.
-        //
-        VpData->H0EptPt[h0PteIndex].Read = 0;
-        VpData->H0EptPt[h0PteIndex].Write = 0;
-        VpData->H0EptPt[h0PteIndex].Execute = 0;
+        pdptIndex =
+            (UINT32)((targetPhysicalAddress >> 30) & 0x1FF);
+        pdeIndex =
+            (UINT32)((targetPhysicalAddress >> 21) & 0x1FF);
+        pteIndex =
+            (UINT32)((targetPhysicalAddress >> 12) & 0x1FF);
+        largePageBase =
+            targetPhysicalAddress & ~((UINT64)_2MB - 1);
+
+        VpData->H1TargetPagePhysicalAddress[t] =
+            targetPhysicalAddress;
+        VpData->H1TargetPteIndex[t] = pteIndex;
+        VpData->H1Phase[t] = 0;
 
         //
-        // Replace the original 2MB leaf PDE with a non-leaf PDE pointing to
-        // the private 4KB page table above.
+        // Reuse an already-created split if another target lives in this
+        // same 2MB identity-mapped region.
         //
-        tempEpdpte.AsUlonglong = 0;
-        tempEpdpte.Read = tempEpdpte.Write = tempEpdpte.Execute = 1;
-        tempEpdpte.PageFrameNumber =
-            ShvOsGetPhysicalAddress(VpData->H0EptPt) / PAGE_SIZE;
+        for (r = 0; r < VpData->H1RegionCount; r++)
+        {
+            if (VpData->H1RegionBase[r] == largePageBase)
+            {
+                break;
+            }
+        }
 
-        VpData->Epde[h0PdptIndex][h0PdeIndex].AsUlonglong =
-            tempEpdpte.AsUlonglong;
+        if (r == VpData->H1RegionCount)
+        {
+            //
+            // There can never be more unique regions than target pages.
+            //
+            if (VpData->H1RegionCount >= H1D_PAGE_COUNT)
+            {
+                continue;
+            }
+
+            VpData->H1RegionBase[r] = largePageBase;
+
+            tempEpte.AsUlonglong = 0;
+            tempEpte.Read = tempEpte.Write = tempEpte.Execute = 1;
+            tempEpte.Type =
+                VpData->Epde[pdptIndex][pdeIndex].Type;
+
+            __stosq((UINT64*)VpData->H1EptPt[r],
+                    tempEpte.AsUlonglong,
+                    PDE_ENTRY_COUNT);
+
+            for (k = 0; k < PDE_ENTRY_COUNT; k++)
+            {
+                VpData->H1EptPt[r][k].PageFrameNumber =
+                    (largePageBase / PAGE_SIZE) + k;
+            }
+
+            //
+            // Replace this 2MB leaf PDE with a non-leaf PDE pointing to the
+            // independently allocated 4KB PTE page.
+            //
+            tempEpdpte.AsUlonglong = 0;
+            tempEpdpte.Read =
+                tempEpdpte.Write =
+                tempEpdpte.Execute = 1;
+            tempEpdpte.PageFrameNumber =
+                ShvOsGetPhysicalAddress(VpData->H1EptPt[r]) /
+                PAGE_SIZE;
+
+            VpData->Epde[pdptIndex][pdeIndex].AsUlonglong =
+                tempEpdpte.AsUlonglong;
+
+            VpData->H1RegionCount++;
+        }
+
+        VpData->H1TargetRegionIndex[t] = r;
+
+        //
+        // Start each target inaccessible. The first controlled access will
+        // fault and be redirected to its corresponding backing HPA.
+        //
+        VpData->H1EptPt[r][pteIndex].Read = 0;
+        VpData->H1EptPt[r][pteIndex].Write = 0;
+        VpData->H1EptPt[r][pteIndex].Execute = 0;
     }
 }
 
@@ -257,12 +304,20 @@ ShvVmxEnterRootModeOnVp (
     //
     if (((VpData->MsrData[12].QuadPart & VMX_EPT_PAGE_WALK_4_BIT) != 0) &&
         ((VpData->MsrData[12].QuadPart & VMX_EPTP_WB_BIT) != 0) &&
-        ((VpData->MsrData[12].QuadPart & VMX_EPT_2MB_PAGE_BIT) != 0))
+        ((VpData->MsrData[12].QuadPart & VMX_EPT_2MB_PAGE_BIT) != 0) &&
+        ((VpData->MsrData[12].QuadPart & VMX_EPT_INVEPT_BIT) != 0) &&
+        ((VpData->MsrData[12].QuadPart & VMX_EPT_EXTENT_CONTEXT_BIT) != 0))
     {
         //
-        // Enable EPT if these features are supported
+        // H1-D requires single-context INVEPT because it repeatedly changes
+        // EPT physical-address and permission fields while the VM is live.
         //
-        VpData->EptControls = SECONDARY_EXEC_ENABLE_EPT | SECONDARY_EXEC_ENABLE_VPID;
+        VpData->EptControls =
+            SECONDARY_EXEC_ENABLE_EPT | SECONDARY_EXEC_ENABLE_VPID;
+    }
+    else if (ShvH1TargetPagePhysicalAddresses[0] != 0)
+    {
+        return FALSE;
     }
 
     //
@@ -358,8 +413,11 @@ ShvVmxSetupVmcsForVp (
         vmxEptp.PageFrameNumber = VpData->EptPml4PhysicalAddress / PAGE_SIZE;
 
         //
-        // Load EPT Root Pointer
+        // Save the exact EPTP value as well as loading it into the VMCS.
+        // H1-D uses this value in the 128-bit single-context INVEPT
+        // descriptor after each live EPT remap.
         //
+        VpData->EptPointer = vmxEptp.AsUlonglong;
         __vmx_vmwrite(EPT_POINTER, vmxEptp.AsUlonglong);
 
         //

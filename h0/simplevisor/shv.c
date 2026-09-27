@@ -22,16 +22,20 @@ Environment:
 
 #include "shv.h"
 
-UINT64 ShvH0TestPagePhysicalAddress;
+UINT64 ShvH1TargetPageVirtualAddresses[H1D_PAGE_COUNT];
+UINT64 ShvH1BackingPageVirtualAddresses[H1D_PAGE_COUNT];
+UINT64 ShvH1TargetPagePhysicalAddresses[H1D_PAGE_COUNT];
+UINT64 ShvH1BackingPagePhysicalAddresses[H1D_PAGE_COUNT];
 volatile long ShvH0EptTrapCount;
 volatile UINT64 ShvH0LastGuestPhysicalAddress;
 volatile UINT64 ShvH0LastExitQualification;
-UINT64 ShvH1TestPageVirtualAddress;
-UINT64 ShvH1BackingPageVirtualAddress;
-UINT64 ShvH1BackingPagePhysicalAddress;
 volatile long ShvH1RemapCount;
 volatile long ShvH1WriteTrapCount;
 volatile long ShvH1DetachedFrameVerifiedCount;
+volatile long ShvH1DResetCount;
+volatile long ShvH1DInveptCount;
+volatile long ShvH1DInveptFailureCount;
+volatile long ShvH1DCompletedCycles;
 
 VOID
 ShvUnload (

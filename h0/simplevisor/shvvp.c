@@ -225,18 +225,26 @@ ShvVpAllocateData (
     }
 
     //
-    // The controlled target's 4KB EPT leaf table remains separate as well.
+    // H1-D may split up to H1D_PAGE_COUNT distinct 2MB regions. Allocate each
+    // 4KB EPT leaf page independently so fragmentation never requires a large
+    // physically-contiguous leaf-table block.
     //
-    if (ShvH0TestPagePhysicalAddress != 0)
+    if (ShvH1TargetPagePhysicalAddresses[0] != 0)
     {
-        data->H0EptPt = ShvOsAllocateContigousAlignedMemory(PAGE_SIZE);
-        if (data->H0EptPt == NULL)
+        for (i = 0; i < H1D_PAGE_COUNT; i++)
         {
-            ShvVpFreeData(data, CpuCount);
-            return NULL;
-        }
+            data->H1EptPt[i] =
+                ShvOsAllocateContigousAlignedMemory(PAGE_SIZE);
+            if (data->H1EptPt[i] == NULL)
+            {
+                ShvVpFreeData(data, CpuCount);
+                return NULL;
+            }
 
-        __stosq((UINT64*)data->H0EptPt, 0, PAGE_SIZE / sizeof(UINT64));
+            __stosq((UINT64*)data->H1EptPt[i],
+                    0,
+                    PAGE_SIZE / sizeof(UINT64));
+        }
     }
 
     return data;
@@ -255,10 +263,13 @@ ShvVpFreeData (
         return;
     }
 
-    if (Data->H0EptPt != NULL)
+    for (i = 0; i < H1D_PAGE_COUNT; i++)
     {
-        ShvOsFreeContiguousAlignedMemory(Data->H0EptPt, PAGE_SIZE);
-        Data->H0EptPt = NULL;
+        if (Data->H1EptPt[i] != NULL)
+        {
+            ShvOsFreeContiguousAlignedMemory(Data->H1EptPt[i], PAGE_SIZE);
+            Data->H1EptPt[i] = NULL;
+        }
     }
 
     for (i = 0; i < PDPTE_ENTRY_COUNT; i++)

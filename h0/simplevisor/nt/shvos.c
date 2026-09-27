@@ -93,34 +93,37 @@ ShvOsGetPhysicalAddress (
     );
 
 PVOID g_PowerCallbackRegistration;
-PVOID g_H1TestPage;
-PVOID g_H1BackingPage;
+PVOID g_H1TargetPages[H1D_PAGE_COUNT];
+PVOID g_H1BackingPages[H1D_PAGE_COUNT];
 
-#define H1_POISON_BYTE 0xCC
-#define H1_WRITE_OFFSET 1379
-#define H1_WRITE_XOR    0x5A
+#define H1D_WRITE_XOR 0x5A
 
 VOID
 ShvH1FreePages (
     VOID
     )
 {
-    if (g_H1BackingPage != NULL)
-    {
-        ShvOsFreeContiguousAlignedMemory(g_H1BackingPage);
-        g_H1BackingPage = NULL;
-    }
+    ULONG i;
 
-    if (g_H1TestPage != NULL)
+    for (i = 0; i < H1D_PAGE_COUNT; i++)
     {
-        ShvOsFreeContiguousAlignedMemory(g_H1TestPage);
-        g_H1TestPage = NULL;
-    }
+        if (g_H1BackingPages[i] != NULL)
+        {
+            ShvOsFreeContiguousAlignedMemory(g_H1BackingPages[i]);
+            g_H1BackingPages[i] = NULL;
+        }
 
-    ShvH0TestPagePhysicalAddress = 0;
-    ShvH1TestPageVirtualAddress = 0;
-    ShvH1BackingPageVirtualAddress = 0;
-    ShvH1BackingPagePhysicalAddress = 0;
+        if (g_H1TargetPages[i] != NULL)
+        {
+            ShvOsFreeContiguousAlignedMemory(g_H1TargetPages[i]);
+            g_H1TargetPages[i] = NULL;
+        }
+
+        ShvH1TargetPageVirtualAddresses[i] = 0;
+        ShvH1BackingPageVirtualAddresses[i] = 0;
+        ShvH1TargetPagePhysicalAddresses[i] = 0;
+        ShvH1BackingPagePhysicalAddresses[i] = 0;
+    }
 }
 
 NTSTATUS
@@ -129,36 +132,56 @@ ShvH1PreparePages (
     )
 {
     ULONG i;
-    PUCHAR testBytes;
+    ULONG j;
+    PUCHAR targetBytes;
     PUCHAR backingBytes;
 
-    g_H1TestPage = ShvOsAllocateContigousAlignedMemory(PAGE_SIZE);
-    if (g_H1TestPage == NULL)
+    for (i = 0; i < H1D_PAGE_COUNT; i++)
     {
-        return STATUS_INSUFFICIENT_RESOURCES;
+        g_H1TargetPages[i] =
+            ShvOsAllocateContigousAlignedMemory(PAGE_SIZE);
+        if (g_H1TargetPages[i] == NULL)
+        {
+            ShvH1FreePages();
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        g_H1BackingPages[i] =
+            ShvOsAllocateContigousAlignedMemory(PAGE_SIZE);
+        if (g_H1BackingPages[i] == NULL)
+        {
+            ShvH1FreePages();
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        targetBytes = (PUCHAR)g_H1TargetPages[i];
+        backingBytes = (PUCHAR)g_H1BackingPages[i];
+
+        for (j = 0; j < PAGE_SIZE; j++)
+        {
+            targetBytes[j] =
+                (UCHAR)(((j * 131u) + (i * 29u) + 0x5Du) & 0xFFu);
+            backingBytes[j] = targetBytes[j];
+        }
+
+        ShvH1TargetPageVirtualAddresses[i] =
+            (UINT64)(ULONG_PTR)g_H1TargetPages[i];
+        ShvH1BackingPageVirtualAddresses[i] =
+            (UINT64)(ULONG_PTR)g_H1BackingPages[i];
+        ShvH1TargetPagePhysicalAddresses[i] =
+            ShvOsGetPhysicalAddress(g_H1TargetPages[i]);
+        ShvH1BackingPagePhysicalAddresses[i] =
+            ShvOsGetPhysicalAddress(g_H1BackingPages[i]);
+
+        if ((ShvH1TargetPagePhysicalAddresses[i] == 0) ||
+            (ShvH1BackingPagePhysicalAddresses[i] == 0) ||
+            (ShvH1TargetPagePhysicalAddresses[i] ==
+             ShvH1BackingPagePhysicalAddresses[i]))
+        {
+            ShvH1FreePages();
+            return STATUS_UNSUCCESSFUL;
+        }
     }
-
-    g_H1BackingPage = ShvOsAllocateContigousAlignedMemory(PAGE_SIZE);
-    if (g_H1BackingPage == NULL)
-    {
-        ShvH1FreePages();
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    testBytes = (PUCHAR)g_H1TestPage;
-    backingBytes = (PUCHAR)g_H1BackingPage;
-
-    for (i = 0; i < PAGE_SIZE; i++)
-    {
-        testBytes[i] = (UCHAR)(((i * 131u) + 17u) & 0xFFu);
-        backingBytes[i] = testBytes[i];
-    }
-
-    //
-    // The original 4KB payload is intentionally destroyed here. The backing
-    // page is now the only copy of the expected payload before VMX starts.
-    //
-    RtlFillMemory(g_H1TestPage, PAGE_SIZE, H1_POISON_BYTE);
 
     ShvH0EptTrapCount = 0;
     ShvH0LastGuestPhysicalAddress = 0;
@@ -166,104 +189,206 @@ ShvH1PreparePages (
     ShvH1RemapCount = 0;
     ShvH1WriteTrapCount = 0;
     ShvH1DetachedFrameVerifiedCount = 0;
-
-    ShvH0TestPagePhysicalAddress = ShvOsGetPhysicalAddress(g_H1TestPage);
-    ShvH1BackingPagePhysicalAddress = ShvOsGetPhysicalAddress(g_H1BackingPage);
-    ShvH1TestPageVirtualAddress = (UINT64)(ULONG_PTR)g_H1TestPage;
-    ShvH1BackingPageVirtualAddress = (UINT64)(ULONG_PTR)g_H1BackingPage;
-
-    if ((ShvH0TestPagePhysicalAddress == 0) ||
-        (ShvH1BackingPagePhysicalAddress == 0) ||
-        (ShvH0TestPagePhysicalAddress == ShvH1BackingPagePhysicalAddress))
-    {
-        ShvH1FreePages();
-        return STATUS_UNSUCCESSFUL;
-    }
+    ShvH1DResetCount = 0;
+    ShvH1DInveptCount = 0;
+    ShvH1DInveptFailureCount = 0;
+    ShvH1DCompletedCycles = 0;
 
     return STATUS_SUCCESS;
 }
 
 BOOLEAN
-ShvH1TriggerAndVerifyReclaim (
+ShvH1DRunCycles (
     VOID
     )
 {
+    BOOLEAN result;
+    INT32 cpuInfo[4];
+    INT32 cpuCount;
+    INT32 cpu;
+    ULONG cycle;
+    ULONG sequence;
+    ULONG targetIndex;
+    ULONG offset;
+    ULONG offset2;
     SIZE_T matched;
-    volatile UCHAR firstByte;
+    KAFFINITY previousAffinity;
     UCHAR oldByte;
     UCHAR newByte;
+    UCHAR oldByte2;
+    UCHAR newByte2;
+    long trapBefore;
+    long remapBefore;
+    long writeBefore;
+    long detachedBefore;
+    long failureBefore;
 
-    //
-    // Phase 1: first access must be transparently redirected from the target
-    // GPA to the alternate physical backing page.
-    //
-    firstByte = *(volatile UCHAR*)g_H1TestPage;
+    result = TRUE;
+    cpuCount = (INT32)KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
 
-    if (firstByte != *(PUCHAR)g_H1BackingPage)
-    {
-        return FALSE;
-    }
-
-    if ((ShvH0EptTrapCount < 1) || (ShvH1RemapCount < 1))
-    {
-        return FALSE;
-    }
-
-    if ((ShvH0LastGuestPhysicalAddress & ~((UINT64)PAGE_SIZE - 1)) !=
-        ShvH0TestPagePhysicalAddress)
-    {
-        return FALSE;
-    }
-
-    matched = RtlCompareMemory(g_H1TestPage, g_H1BackingPage, PAGE_SIZE);
-    if (matched != PAGE_SIZE)
+    if ((cpuCount <= 0) ||
+        (cpuCount > (INT32)(sizeof(KAFFINITY) * 8)))
     {
         return FALSE;
     }
 
     //
-    // Phase 2: deliberately write through the target GPA. The EPT leaf is
-    // read-only after phase 1, so this causes a second controlled violation.
-    // Root mode then overwrites and verifies the now-detached original HPA as
-    // scratch space, proving that physical frame can be reused independently,
-    // while the guest write is retried against the alternate backing HPA.
+    // Exercise every logical processor separately. Each VP owns a distinct
+    // EPT hierarchy and EPTP, so every CPU must pass the live-remap path.
     //
-    oldByte = ((PUCHAR)g_H1BackingPage)[H1_WRITE_OFFSET];
-    newByte = oldByte ^ H1_WRITE_XOR;
-    *(volatile UCHAR*)((PUCHAR)g_H1TestPage + H1_WRITE_OFFSET) = newByte;
-
-    if (((PUCHAR)g_H1TestPage)[H1_WRITE_OFFSET] != newByte ||
-        ((PUCHAR)g_H1BackingPage)[H1_WRITE_OFFSET] != newByte)
+    for (cpu = 0; cpu < cpuCount; cpu++)
     {
-        return FALSE;
+        previousAffinity =
+            KeSetSystemAffinityThreadEx(((KAFFINITY)1) << cpu);
+
+        for (cycle = 0; cycle < H1D_CYCLES_PER_CPU; cycle++)
+        {
+            sequence =
+                ((ULONG)cpu * H1D_CYCLES_PER_CPU) + cycle;
+
+            trapBefore = ShvH0EptTrapCount;
+            remapBefore = ShvH1RemapCount;
+            writeBefore = ShvH1WriteTrapCount;
+            detachedBefore = ShvH1DetachedFrameVerifiedCount;
+            failureBefore = ShvH1DInveptFailureCount;
+
+            __cpuidex(cpuInfo,
+                      H1D_CPUID_RESET_LEAF,
+                      (INT32)sequence);
+
+            if ((UINT32)cpuInfo[0] != H1D_CPUID_RESET_OK)
+            {
+                result = FALSE;
+                break;
+            }
+
+            targetIndex = (ULONG)(UINT32)cpuInfo[1];
+            if (targetIndex >= H1D_PAGE_COUNT)
+            {
+                result = FALSE;
+                break;
+            }
+
+            //
+            // Full-page compare generates the first EPT violation, remaps the
+            // same GPA to backing HPA B, and then continues transparently.
+            //
+            matched =
+                RtlCompareMemory(g_H1TargetPages[targetIndex],
+                                 g_H1BackingPages[targetIndex],
+                                 PAGE_SIZE);
+            if (matched != PAGE_SIZE)
+            {
+                result = FALSE;
+                break;
+            }
+
+            //
+            // First write: second EPT violation. Root mode independently
+            // overwrites/verifies detached HPA A, then retries this write on B.
+            //
+            offset =
+                ((sequence * 977u) + 1379u) & (PAGE_SIZE - 1);
+            oldByte =
+                ((PUCHAR)g_H1BackingPages[targetIndex])[offset];
+            newByte = oldByte ^ H1D_WRITE_XOR;
+
+            *(volatile UCHAR*)
+                ((PUCHAR)g_H1TargetPages[targetIndex] + offset) =
+                    newByte;
+
+            if ((((PUCHAR)g_H1TargetPages[targetIndex])[offset] !=
+                 newByte) ||
+                (((PUCHAR)g_H1BackingPages[targetIndex])[offset] !=
+                 newByte))
+            {
+                result = FALSE;
+                break;
+            }
+
+            //
+            // Second write should require no new semantic phase transition and
+            // must remain coherent through the already-remapped writable leaf.
+            //
+            offset2 =
+                ((sequence * 313u) + 257u) & (PAGE_SIZE - 1);
+            if (offset2 == offset)
+            {
+                offset2 = (offset2 + 1) & (PAGE_SIZE - 1);
+            }
+
+            oldByte2 =
+                ((PUCHAR)g_H1BackingPages[targetIndex])[offset2];
+            newByte2 = oldByte2 ^ (H1D_WRITE_XOR + 1);
+
+            *(volatile UCHAR*)
+                ((PUCHAR)g_H1TargetPages[targetIndex] + offset2) =
+                    newByte2;
+
+            if ((((PUCHAR)g_H1TargetPages[targetIndex])[offset2] !=
+                 newByte2) ||
+                (((PUCHAR)g_H1BackingPages[targetIndex])[offset2] !=
+                 newByte2))
+            {
+                result = FALSE;
+                break;
+            }
+
+            matched =
+                RtlCompareMemory(g_H1TargetPages[targetIndex],
+                                 g_H1BackingPages[targetIndex],
+                                 PAGE_SIZE);
+            if (matched != PAGE_SIZE)
+            {
+                result = FALSE;
+                break;
+            }
+
+            if ((ShvH1RemapCount != (remapBefore + 1)) ||
+                (ShvH1WriteTrapCount != (writeBefore + 1)) ||
+                (ShvH1DetachedFrameVerifiedCount !=
+                 (detachedBefore + 1)) ||
+                (ShvH0EptTrapCount < (trapBefore + 2)) ||
+                (ShvH1DInveptFailureCount != failureBefore))
+            {
+                result = FALSE;
+                break;
+            }
+
+            _InterlockedIncrement(&ShvH1DCompletedCycles);
+        }
+
+        KeRevertToUserAffinityThreadEx(previousAffinity);
+
+        if (result == FALSE)
+        {
+            break;
+        }
     }
 
-    if ((ShvH0EptTrapCount < 2) ||
-        (ShvH1WriteTrapCount < 1) ||
-        (ShvH1DetachedFrameVerifiedCount < 1))
+    if (result != FALSE)
     {
-        return FALSE;
+        long expectedCycles;
+
+        expectedCycles =
+            ((long)cpuCount) * H1D_CYCLES_PER_CPU;
+
+        if ((ShvH1DCompletedCycles != expectedCycles) ||
+            (ShvH1DResetCount != expectedCycles) ||
+            (ShvH1RemapCount != expectedCycles) ||
+            (ShvH1WriteTrapCount != expectedCycles) ||
+            (ShvH1DetachedFrameVerifiedCount != expectedCycles) ||
+            (ShvH0EptTrapCount < (expectedCycles * 2)) ||
+            (ShvH1DInveptCount < (expectedCycles * 3)) ||
+            (ShvH1DInveptFailureCount != 0))
+        {
+            result = FALSE;
+        }
     }
 
-    matched = RtlCompareMemory(g_H1TestPage, g_H1BackingPage, PAGE_SIZE);
-    if (matched != PAGE_SIZE)
-    {
-        return FALSE;
-    }
-
-    //
-    // Restore the logical payload byte so unload sees the same logical data
-    // pattern the test started with. The original HPA remains detached/scratch.
-    //
-    *(volatile UCHAR*)((PUCHAR)g_H1TestPage + H1_WRITE_OFFSET) = oldByte;
-
-    if (((PUCHAR)g_H1BackingPage)[H1_WRITE_OFFSET] != oldByte)
-    {
-        return FALSE;
-    }
-
-    return TRUE;
+    return result;
 }
+
 
 NTSTATUS
 FORCEINLINE
@@ -544,7 +669,7 @@ DriverUnload (
     ExUnregisterCallback(g_PowerCallbackRegistration);
 
     //
-    // Unload the hypervisor before releasing the private H1-C pages.
+    // Unload the hypervisor before releasing the private H1-D page pool.
     //
     ShvUnload();
     ShvH1FreePages();
@@ -567,8 +692,9 @@ DriverEntry (
     UNREFERENCED_PARAMETER(RegistryPath);
 
     //
-    // H1-C owns exactly two private pages: a target GPA and an alternate
-    // physical backing page. No application or ordinary Windows page is used.
+    // H1-D owns eight private target pages plus eight private backing pages.
+    // All allocations are page-sized; no application or ordinary Windows page
+    // is used by this controlled repeated-reclamation milestone.
     //
     status = ShvH1PreparePages();
     if (!NT_SUCCESS(status))
@@ -631,11 +757,11 @@ DriverEntry (
     }
 
     //
-    // H1-C performs both a transparent remap and a second write-fault phase
-    // that reuses the detached original HPA as root-mode scratch space while
-    // the guest continues using the alternate backing page.
+    // H1-D runs hundreds of complete reset -> trap -> remap -> detached-frame
+    // reuse -> write -> verify cycles on every logical processor, rotating
+    // across eight independent target/backing page pairs.
     //
-    if (ShvH1TriggerAndVerifyReclaim() == FALSE)
+    if (ShvH1DRunCycles() == FALSE)
     {
         ShvUnload();
         ExUnregisterCallback(g_PowerCallbackRegistration);
@@ -643,13 +769,16 @@ DriverEntry (
         return STATUS_UNSUCCESSFUL;
     }
 
-    ShvOsDebugPrint("H1-C PASS: traps=%ld remaps=%ld write_traps=%ld detached_verified=%ld GPA=0x%llX backing=0x%llX qualification=0x%llX\n",
+    ShvOsDebugPrint("H1-D PASS: cycles=%ld resets=%ld traps=%ld remaps=%ld write_traps=%ld detached_verified=%ld invept=%ld invept_fail=%ld last_GPA=0x%llX qualification=0x%llX\n",
+                    ShvH1DCompletedCycles,
+                    ShvH1DResetCount,
                     ShvH0EptTrapCount,
                     ShvH1RemapCount,
                     ShvH1WriteTrapCount,
                     ShvH1DetachedFrameVerifiedCount,
+                    ShvH1DInveptCount,
+                    ShvH1DInveptFailureCount,
                     ShvH0LastGuestPhysicalAddress,
-                    ShvH1BackingPagePhysicalAddress,
                     ShvH0LastExitQualification);
 
     return STATUS_SUCCESS;
