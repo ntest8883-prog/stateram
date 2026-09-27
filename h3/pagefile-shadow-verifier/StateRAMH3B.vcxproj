@@ -15,6 +15,11 @@
   <Import Project="$(Configuration)\$(Configuration).default.props" />
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <Import Project="$(Configuration)\$(Configuration).props" />
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='NT|x64'">
+    <ClCompile>
+      <TreatWarningAsError>true</TreatWarningAsError>
+    </ClCompile>
+  </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <PropertyGroup>
     <TargetName>StateRAMH3B</TargetName>
