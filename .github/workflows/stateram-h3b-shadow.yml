@@ -5,6 +5,7 @@ on:
     branches:
       - h3-pagefile-shadow-verify
       - h3-pagefile-shadow-dispatch
+      - h3-pagefile-shadow-range-v2
     paths:
       - "h3/pagefile-shadow-verifier/**"
       - ".github/workflows/stateram-h3b-shadow.yml"
