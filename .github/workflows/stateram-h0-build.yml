@@ -8,6 +8,7 @@ on:
       - h1-restore
       - h1-ept-remap
       - h1-reclaim-harness
+      - h1-repeat-reclaim
     paths:
       - "h0/**"
       - ".github/workflows/stateram-h0-build.yml"
@@ -88,7 +89,7 @@ jobs:
       - name: Upload unsigned H0 baseline
         uses: actions/upload-artifact@v4
         with:
-          name: StateRAM-H1C-reclaim-harness-unsigned
+          name: StateRAM-H1D-repeat-reclaim-unsigned
           path: |
             h0/simplevisor/x64/NT/shv.sys
             h0/simplevisor/x64/NT/shv.pdb
