@@ -49,15 +49,12 @@ class Model:
         self.floor.setdefault(pf, 0)
         self.dropped_inflight.setdefault(pf, 0)
 
-        if len(hist) == self.history_slots:
-            dropped = hist.pop(0)
-            self.floor[pf] = max(self.floor[pf], dropped.seq)
-            if dropped.state == INFLIGHT:
-                self.dropped_inflight[pf] += 1
-
         new_end = start + length
         concurrent = False
 
+        # Detect overlap before ring eviction so a newly inserted write keeps
+        # the uncertainty bit even if the overlapping older in-flight record
+        # is the slot that must be dropped.
         for existing in hist:
             if (
                 existing.state == INFLIGHT
@@ -66,6 +63,12 @@ class Model:
             ):
                 existing.concurrent_overlap = True
                 concurrent = True
+
+        if len(hist) == self.history_slots:
+            dropped = hist.pop(0)
+            self.floor[pf] = max(self.floor[pf], dropped.seq)
+            if dropped.state == INFLIGHT:
+                self.dropped_inflight[pf] += 1
 
         hist.append(
             Range(
