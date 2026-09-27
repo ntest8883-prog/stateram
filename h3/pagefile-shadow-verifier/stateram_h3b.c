@@ -455,8 +455,7 @@ H3BRecordWriteRange (
     _In_ PFILE_OBJECT FileObject,
     _In_ LONGLONG ByteOffset,
     _In_ ULONG Length,
-    _Out_ PULONGLONG Sequence,
-    _Out_ PULONG IdentityIndex
+    _Out_ PULONGLONG Sequence
     )
 {
     KIRQL oldIrql;
@@ -532,7 +531,6 @@ H3BRecordWriteRange (
     KeReleaseSpinLock(&g_PagefileLock, oldIrql);
 
     *Sequence = sequence;
-    *IdentityIndex = identityIndex;
     return TRUE;
 }
 
@@ -858,10 +856,18 @@ H3BShadowCompletedWrite (
     ULONG pageCount;
     ULONG i;
     ULONG writeGeneration;
+    ULONG identityIndex;
 
     if (KeGetCurrentIrql() > DISPATCH_LEVEL)
     {
         InterlockedIncrement64(&g_ShadowHighIrqlSkips);
+        return;
+    }
+
+    if (!H3BGetPagefileIdentityIndex(
+            Data->Iopb->TargetFileObject,
+            &identityIndex))
+    {
         return;
     }
 
@@ -883,7 +889,7 @@ H3BShadowCompletedWrite (
     }
 
     if (!H3BHistoryAllows(
-            Data->Iopb->TargetFileObject,
+            identityIndex,
             baseOffset,
             WriteSequence,
             &writeGeneration))
@@ -910,10 +916,6 @@ H3BShadowCompletedWrite (
     bytes = (PUCHAR)mappedBuffer;
     pageCount = (ULONG)(completedBytes / PAGE_SIZE);
 
-    /*
-     * H3-B is a verifier, not the final data path. Bound work done in the
-     * completion callback so DISPATCH_LEVEL residence stays short.
-     */
     if (pageCount > H3B_MAX_HASH_PAGES_PER_IO)
     {
         pageCount = H3B_MAX_HASH_PAGES_PER_IO;
@@ -938,7 +940,7 @@ H3BShadowCompletedWrite (
             offset = baseOffset + ((ULONGLONG)i * PAGE_SIZE);
 
             if (!H3BHistoryAllows(
-                    Data->Iopb->TargetFileObject,
+                    identityIndex,
                     offset,
                     WriteSequence,
                     &writeGeneration))
@@ -948,6 +950,7 @@ H3BShadowCompletedWrite (
             }
 
             if (H3BStoreShadow(
+                    identityIndex,
                     Data->Iopb->TargetFileObject,
                     offset,
                     hash1,
@@ -981,10 +984,18 @@ H3BVerifyCompletedRead (
     ULONG_PTR completedBytes;
     ULONG pageCount;
     ULONG i;
+    ULONG identityIndex;
 
     if (KeGetCurrentIrql() > DISPATCH_LEVEL)
     {
         InterlockedIncrement64(&g_ShadowHighIrqlSkips);
+        return;
+    }
+
+    if (!H3BGetPagefileIdentityIndex(
+            Data->Iopb->TargetFileObject,
+            &identityIndex))
+    {
         return;
     }
 
@@ -1009,7 +1020,11 @@ H3BVerifyCompletedRead (
 
     if (mappedBuffer == NULL)
     {
-        if (KeGetCurrentIrql() > APC_LEVEL)
+        if (FlagOn(Data->Flags, FLTFL_CALLBACK_DATA_NEW_SYSTEM_BUFFER))
+        {
+            InterlockedIncrement64(&g_ShadowBufferUnavailable);
+        }
+        else if (KeGetCurrentIrql() > APC_LEVEL)
         {
             InterlockedIncrement64(&g_ShadowHighIrqlSkips);
         }
@@ -1023,10 +1038,6 @@ H3BVerifyCompletedRead (
     bytes = (PUCHAR)mappedBuffer;
     pageCount = (ULONG)(completedBytes / PAGE_SIZE);
 
-    /*
-     * Bound verifier work in the completion path. Matching is sampled, but a
-     * mismatch remains a stop condition.
-     */
     if (pageCount > H3B_MAX_HASH_PAGES_PER_IO)
     {
         pageCount = H3B_MAX_HASH_PAGES_PER_IO;
@@ -1042,15 +1053,19 @@ H3BVerifyCompletedRead (
             ULONGLONG actual2;
             ULONGLONG offset;
             ULONGLONG writeSequence;
+            PFILE_OBJECT writerFileObject;
+            BOOLEAN crossObject;
 
             offset = baseOffset + ((ULONGLONG)i * PAGE_SIZE);
+            writerFileObject = NULL;
 
             if (!H3BLookupShadow(
-                    Data->Iopb->TargetFileObject,
+                    identityIndex,
                     offset,
                     &expected1,
                     &expected2,
-                    &writeSequence))
+                    &writeSequence,
+                    &writerFileObject))
             {
                 InterlockedIncrement64(&g_ShadowUntracked);
                 continue;
@@ -1065,7 +1080,7 @@ H3BVerifyCompletedRead (
                 0xD6E8FEB86659FD93ULL);
 
             if (!H3BHistoryAllows(
-                    Data->Iopb->TargetFileObject,
+                    identityIndex,
                     offset,
                     writeSequence,
                     NULL))
@@ -1075,16 +1090,35 @@ H3BVerifyCompletedRead (
                 continue;
             }
 
+            crossObject =
+                (writerFileObject != Data->Iopb->TargetFileObject) ?
+                TRUE : FALSE;
+
+            if (crossObject)
+            {
+                InterlockedIncrement64(&g_CrossObjectComparisons);
+            }
+
             InterlockedIncrement64(&g_ShadowReadPages);
 
             if ((actual1 == expected1) &&
                 (actual2 == expected2))
             {
                 InterlockedIncrement64(&g_ShadowMatches);
+
+                if (crossObject)
+                {
+                    InterlockedIncrement64(&g_CrossObjectMatches);
+                }
             }
             else
             {
                 InterlockedIncrement64(&g_ShadowMismatches);
+
+                if (crossObject)
+                {
+                    InterlockedIncrement64(&g_CrossObjectMismatches);
+                }
             }
         }
     }
@@ -1229,7 +1263,9 @@ H3BPostCreate (
         FlagOn(Data->Iopb->OperationFlags, SL_OPEN_PAGING_FILE) &&
         (FltObjects->FileObject != NULL))
     {
-        H3BRememberPagefile(FltObjects->FileObject);
+        H3BRememberPagefile(
+            FltObjects->FileObject,
+            FltObjects->Instance);
     }
 
     return FLT_POSTOP_FINISHED_PROCESSING;
@@ -1381,6 +1417,12 @@ H3BMessage (
     reply->KnownPagefiles = H3BReadCounter(&g_KnownPagefiles);
     reply->HistoryCapacity = H3B_WRITE_HISTORY_SLOTS;
     reply->PagefileTableFull = H3BReadCounter(&g_PagefileTableFull);
+    reply->PagefileIdentities = H3BReadCounter(&g_PagefileIdentitiesCount);
+    reply->PagefileAliases = H3BReadCounter(&g_PagefileAliases);
+    reply->ReadNewSystemBuffers = H3BReadCounter(&g_ReadNewSystemBuffers);
+    reply->CrossObjectComparisons = H3BReadCounter(&g_CrossObjectComparisons);
+    reply->CrossObjectMatches = H3BReadCounter(&g_CrossObjectMatches);
+    reply->CrossObjectMismatches = H3BReadCounter(&g_CrossObjectMismatches);
 
     *ReturnOutputBufferLength = sizeof(*reply);
     return STATUS_SUCCESS;
@@ -1481,7 +1523,12 @@ DriverEntry (
     g_ShadowGeneration = 1;
     g_WriteSequence = 1;
 
-    RtlZeroMemory(g_Pagefiles, sizeof(g_Pagefiles));
+    RtlZeroMemory(
+        g_PagefileIdentities,
+        sizeof(g_PagefileIdentities));
+    RtlZeroMemory(
+        g_PagefileObjects,
+        sizeof(g_PagefileObjects));
 
     KeInitializeSpinLock(&g_PagefileLock);
     KeInitializeSpinLock(&g_ShadowLock);
