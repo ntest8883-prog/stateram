@@ -58,6 +58,12 @@ ShvVmxEntry (
     VOID
     );
 
+UINT8
+ShvVmxInvept (
+    _In_ UINT64 Type,
+    _In_ VOID* Descriptor
+    );
+
 INT32
 ShvVmxLaunchOnVp (
     _In_ PSHV_VP_DATA VpData
@@ -182,14 +188,18 @@ ShvOsRunCallbackOnProcessors (
 
 extern PSHV_VP_DATA* ShvGlobalData;
 
-extern UINT64 ShvH0TestPagePhysicalAddress;
+extern UINT64 ShvH1TargetPageVirtualAddresses[H1D_PAGE_COUNT];
+extern UINT64 ShvH1BackingPageVirtualAddresses[H1D_PAGE_COUNT];
+extern UINT64 ShvH1TargetPagePhysicalAddresses[H1D_PAGE_COUNT];
+extern UINT64 ShvH1BackingPagePhysicalAddresses[H1D_PAGE_COUNT];
 extern volatile long ShvH0EptTrapCount;
 extern volatile UINT64 ShvH0LastGuestPhysicalAddress;
 extern volatile UINT64 ShvH0LastExitQualification;
-extern UINT64 ShvH1TestPageVirtualAddress;
-extern UINT64 ShvH1BackingPageVirtualAddress;
-extern UINT64 ShvH1BackingPagePhysicalAddress;
 extern volatile long ShvH1RemapCount;
 extern volatile long ShvH1WriteTrapCount;
 extern volatile long ShvH1DetachedFrameVerifiedCount;
+extern volatile long ShvH1DResetCount;
+extern volatile long ShvH1DInveptCount;
+extern volatile long ShvH1DInveptFailureCount;
+extern volatile long ShvH1DCompletedCycles;
 
