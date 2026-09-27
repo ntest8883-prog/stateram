@@ -2,6 +2,9 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 PAGE = 4096
+INFLIGHT = "inflight"
+COMPLETED = "completed"
+
 
 @dataclass
 class Range:
@@ -9,6 +12,8 @@ class Range:
     end: int
     seq: int
     generation: int
+    state: str
+
 
 @dataclass
 class Shadow:
@@ -16,11 +21,22 @@ class Shadow:
     seq: int
     generation: int
 
+
 class Model:
+    """
+    Deterministic model of H3-B5's bounded per-pagefile write history.
+
+    The important safety rule is conservative publication:
+      * no newer overlapping write may exist;
+      * no older overlapping write may still be in flight;
+      * no unknown/dropped in-flight write may remain outstanding.
+    """
+
     def __init__(self, history_slots: int = 8):
         self.history_slots = history_slots
         self.history: Dict[str, List[Range]] = {}
         self.floor: Dict[str, int] = {}
+        self.dropped_inflight: Dict[str, int] = {}
         self.seq = 1
         self.generation = 1
         self.shadow: Dict[Tuple[str, int], Shadow] = {}
@@ -30,39 +46,134 @@ class Model:
         seq = self.seq
         hist = self.history.setdefault(pf, [])
         self.floor.setdefault(pf, 0)
+        self.dropped_inflight.setdefault(pf, 0)
+
         if len(hist) == self.history_slots:
             dropped = hist.pop(0)
             self.floor[pf] = max(self.floor[pf], dropped.seq)
-        hist.append(Range(start, start + length, seq, self.generation))
+            if dropped.state == INFLIGHT:
+                self.dropped_inflight[pf] += 1
+
+        hist.append(
+            Range(
+                start,
+                start + length,
+                seq,
+                self.generation,
+                INFLIGHT,
+            )
+        )
         return seq
 
-    def _allows(self, pf: str, offset: int, seq: int) -> Optional[int]:
+    def _find(self, pf: str, seq: int) -> Optional[Range]:
+        for r in self.history.get(pf, []):
+            if r.seq == seq:
+                return r
+        return None
+
+    @staticmethod
+    def _overlaps(r: Range, offset: int) -> bool:
+        return r.start < offset + PAGE and r.end > offset
+
+    def _mark_complete(self, pf: str, seq: int) -> bool:
+        if seq <= self.floor.get(pf, 0):
+            # A post-completion arriving after its history record was dropped
+            # retires one conservative unknown-write barrier.
+            if self.dropped_inflight.get(pf, 0) > 0:
+                self.dropped_inflight[pf] -= 1
+            return False
+
+        own = self._find(pf, seq)
+        if own is None:
+            return False
+
+        own.state = COMPLETED
+        return True
+
+    def _allows_publish(
+        self,
+        pf: str,
+        offset: int,
+        seq: int,
+    ) -> Optional[int]:
+        if self.dropped_inflight.get(pf, 0) != 0:
+            return None
+
         if seq <= self.floor.get(pf, 0):
             return None
-        hist = self.history.get(pf, [])
-        own = None
-        page_end = offset + PAGE
-        for r in hist:
-            if r.seq == seq:
-                own = r
-            elif r.seq > seq and r.start < page_end and r.end > offset:
-                return None
-        if own is None or own.generation != self.generation:
+
+        own = self._find(pf, seq)
+        if (
+            own is None
+            or own.state != COMPLETED
+            or own.generation != self.generation
+        ):
             return None
+
+        for r in self.history.get(pf, []):
+            if r.seq == seq or not self._overlaps(r, offset):
+                continue
+
+            if r.seq > seq:
+                return None
+
+            if r.seq < seq and r.state == INFLIGHT:
+                return None
+
         return own.generation
 
-    def complete_write(self, pf: str, seq: int, pages: Dict[int, bytes]) -> None:
+    def _allows_verify(self, pf: str, offset: int, seq: int) -> bool:
+        if self.dropped_inflight.get(pf, 0) != 0:
+            return False
+
+        if seq <= self.floor.get(pf, 0):
+            return False
+
+        own = self._find(pf, seq)
+        if (
+            own is None
+            or own.state != COMPLETED
+            or own.generation != self.generation
+        ):
+            return False
+
+        for r in self.history.get(pf, []):
+            if (
+                r.seq > seq
+                and self._overlaps(r, offset)
+            ):
+                return False
+
+        return True
+
+    def complete_write(
+        self,
+        pf: str,
+        seq: int,
+        pages: Dict[int, bytes],
+    ) -> None:
+        retained = self._mark_complete(pf, seq)
+        if not retained:
+            return
+
         for offset, value in pages.items():
-            gen = self._allows(pf, offset, seq)
+            gen = self._allows_publish(pf, offset, seq)
             if gen is not None:
                 self.shadow[(pf, offset)] = Shadow(value, seq, gen)
+
+    def complete_failed_write(self, pf: str, seq: int) -> None:
+        # Failed/short writes do not publish data, but their pre-write ranges
+        # remain a conservative invalidation boundary.
+        self._mark_complete(pf, seq)
 
     def read(self, pf: str, offset: int, actual: bytes) -> str:
         s = self.shadow.get((pf, offset))
         if s is None or s.generation != self.generation:
             return "untracked"
-        if self._allows(pf, offset, s.seq) is None:
+
+        if not self._allows_verify(pf, offset, s.seq):
             return "untracked"
+
         return "match" if actual == s.value else "mismatch"
 
     def reset(self) -> None:
@@ -70,9 +181,8 @@ class Model:
         self.shadow.clear()
 
 
-
 class AliasModel(Model):
-    """Models multiple FILE_OBJECT-like handles that name one paging file."""
+    """Multiple FILE_OBJECT-like handles mapped to canonical pagefile IDs."""
 
     def __init__(self, history_slots: int = 8):
         super().__init__(history_slots)
@@ -81,7 +191,12 @@ class AliasModel(Model):
     def alias(self, handle: str, paging_file: str) -> None:
         self.aliases[handle] = paging_file
 
-    def begin_write_handle(self, handle: str, start: int, length: int) -> int:
+    def begin_write_handle(
+        self,
+        handle: str,
+        start: int,
+        length: int,
+    ) -> int:
         return self.begin_write(self.aliases[handle], start, length)
 
     def complete_write_handle(
@@ -107,31 +222,32 @@ def main() -> None:
     m.complete_write("C", s1, {0: page(1)})
     assert m.read("C", 0, page(1)) == "match"
 
-    # 2. Non-overlapping newer write must not invalidate old sample.
+    # 2. Non-overlapping newer write must not invalidate an old sample.
     s2 = m.begin_write("C", 8 * PAGE, PAGE)
     m.complete_write("C", s2, {8 * PAGE: page(2)})
     assert m.read("C", 0, page(1)) == "match"
 
-    # 3. Newer overlapping write immediately invalidates older sample,
-    # even before the newer write completes.
+    # 3. Newer overlapping write immediately invalidates old sample.
     s3 = m.begin_write("C", 0, PAGE)
     assert m.read("C", 0, page(1)) == "untracked"
 
-    # 4. Older completion arriving after newer overlapping pre-write cannot republish.
+    # 4. Older completion after newer overlapping pre-write cannot republish.
     m.complete_write("C", s1, {0: page(1)})
     assert m.read("C", 0, page(1)) == "untracked"
 
-    # 5. Newest completed overlapping write becomes authoritative sample.
+    # 5. Newest completed overlapping write becomes a valid sample once the
+    # earlier writer is no longer in flight.
     m.complete_write("C", s3, {0: page(3)})
     assert m.read("C", 0, page(3)) == "match"
 
-    # 6. A later non-overlap write still preserves that match.
+    # 6. A later non-overlap write preserves that match.
     s4 = m.begin_write("C", 20 * PAGE, PAGE)
     m.complete_write("C", s4, {20 * PAGE: page(4)})
     assert m.read("C", 0, page(3)) == "match"
 
-    # 7. Failed/abandoned newer overlapping write conservatively invalidates.
-    _failed = m.begin_write("C", 0, PAGE)
+    # 7. Failed newer overlap conservatively invalidates old sample.
+    failed = m.begin_write("C", 0, PAGE)
+    m.complete_failed_write("C", failed)
     assert m.read("C", 0, page(3)) == "untracked"
 
     # 8. Different pagefiles are independent.
@@ -143,7 +259,7 @@ def main() -> None:
     m.reset()
     assert m.read("D", 0, page(7)) == "untracked"
 
-    # 10. History overflow never permits a stale match.
+    # 10. Completed history overflow never permits a stale match.
     n = Model(history_slots=4)
     a = n.begin_write("C", 0, PAGE)
     n.complete_write("C", a, {0: page(9)})
@@ -152,55 +268,109 @@ def main() -> None:
         n.complete_write("C", x, {(i + 10) * PAGE: page(i)})
     assert n.read("C", 0, page(9)) == "untracked"
 
-    # 11. Large newer write invalidates an old sampled offset anywhere in its range,
-    # without needing per-page invalidation work.
+    # 11. Large newer write invalidates a sampled offset anywhere in its range.
     q = Model()
     z1 = q.begin_write("C", 10 * PAGE, PAGE)
     q.complete_write("C", z1, {10 * PAGE: page(5)})
     z2 = q.begin_write("C", 0, 100 * PAGE)
     assert q.read("C", 10 * PAGE, page(5)) == "untracked"
-    q.complete_write("C", z2, {0: page(6), PAGE: page(6), 2 * PAGE: page(6), 3 * PAGE: page(6)})
+    q.complete_write(
+        "C",
+        z2,
+        {
+            0: page(6),
+            PAGE: page(6),
+            2 * PAGE: page(6),
+            3 * PAGE: page(6),
+        },
+    )
     assert q.read("C", 10 * PAGE, page(5)) == "untracked"
 
-    # 12. Out-of-order completion of overlapping writes stays conservative.
+    # 12. Out-of-order overlapping completions are deliberately untracked.
+    # Newer completes while older is still in flight -> newer cannot publish.
+    # Older then completes after a newer overlap exists -> older cannot publish.
     r = Model()
     old = r.begin_write("C", 0, PAGE)
     new = r.begin_write("C", 0, PAGE)
     r.complete_write("C", new, {0: page(2)})
+    assert r.read("C", 0, page(2)) == "untracked"
     r.complete_write("C", old, {0: page(1)})
-    assert r.read("C", 0, page(2)) == "match"
-    assert r.read("C", 0, page(1)) == "mismatch"
+    assert r.read("C", 0, page(1)) == "untracked"
+    assert r.read("C", 0, page(2)) == "untracked"
 
-    # 13. Multiple FILE_OBJECT aliases for one paging file must share history.
-    # A newer overlapping write through alias B invalidates the older sample
-    # originally published through alias A.
-    a = AliasModel()
-    a.alias("C-object-1", "C-pagefile")
-    a.alias("C-object-2", "C-pagefile")
-    old_alias = a.begin_write_handle("C-object-1", 0, PAGE)
-    a.complete_write_handle("C-object-1", old_alias, {0: page(1)})
-    newer_alias = a.begin_write_handle("C-object-2", 0, PAGE)
-    assert a.read_handle("C-object-1", 0, page(1)) == "untracked"
-    a.complete_write_handle("C-object-2", newer_alias, {0: page(2)})
-    assert a.read_handle("C-object-1", 0, page(2)) == "match"
+    # A later serialized write restores useful tracking.
+    stable = r.begin_write("C", 0, PAGE)
+    r.complete_write("C", stable, {0: page(3)})
+    assert r.read("C", 0, page(3)) == "match"
 
-    # 14. Non-overlapping writes through aliases of the same paging file do
-    # not invalidate an unrelated page.
-    keep = a.begin_write_handle("C-object-1", 8 * PAGE, PAGE)
-    a.complete_write_handle("C-object-1", keep, {8 * PAGE: page(3)})
-    other = a.begin_write_handle("C-object-2", 20 * PAGE, PAGE)
-    a.complete_write_handle("C-object-2", other, {20 * PAGE: page(4)})
-    assert a.read_handle("C-object-1", 8 * PAGE, page(3)) == "match"
+    # 13. Multiple FILE_OBJECT aliases for one pagefile share write history.
+    aliases = AliasModel()
+    aliases.alias("C-object-1", "C-pagefile")
+    aliases.alias("C-object-2", "C-pagefile")
+    ca = aliases.begin_write_handle("C-object-1", 0, PAGE)
+    aliases.complete_write_handle("C-object-1", ca, {0: page(1)})
+    cb = aliases.begin_write_handle("C-object-2", 0, PAGE)
+    assert aliases.read_handle("C-object-1", 0, page(1)) == "untracked"
+    aliases.complete_write_handle("C-object-2", cb, {0: page(2)})
+    assert aliases.read_handle("C-object-1", 0, page(2)) == "match"
 
-    # 15. Aliases from different paging-file identities remain independent.
-    a.alias("D-object-1", "D-pagefile")
-    d = a.begin_write_handle("D-object-1", 0, PAGE)
-    a.complete_write_handle("D-object-1", d, {0: page(9)})
-    assert a.read_handle("D-object-1", 0, page(9)) == "match"
-    assert a.read_handle("C-object-1", 0, page(2)) == "match"
+    # 14. Non-overlap alias writes preserve unrelated samples.
+    keep = aliases.begin_write_handle("C-object-1", 8 * PAGE, PAGE)
+    aliases.complete_write_handle(
+        "C-object-1",
+        keep,
+        {8 * PAGE: page(3)},
+    )
+    other = aliases.begin_write_handle("C-object-2", 20 * PAGE, PAGE)
+    aliases.complete_write_handle(
+        "C-object-2",
+        other,
+        {20 * PAGE: page(4)},
+    )
+    assert aliases.read_handle(
+        "C-object-1",
+        8 * PAGE,
+        page(3),
+    ) == "match"
+
+    # 15. Aliases on different canonical identities remain independent.
+    aliases.alias("D-object-1", "D-pagefile")
+    d = aliases.begin_write_handle("D-object-1", 0, PAGE)
+    aliases.complete_write_handle("D-object-1", d, {0: page(9)})
+    assert aliases.read_handle("D-object-1", 0, page(9)) == "match"
+    assert aliases.read_handle("C-object-1", 0, page(2)) == "match"
+
+    # 16. If an in-flight record falls out of the bounded ring, all publication
+    # is blocked until that unknown write finally completes.
+    h = Model(history_slots=4)
+    very_old = h.begin_write("C", 0, PAGE)
+    for i in range(4):
+        seq = h.begin_write("C", (10 + i) * PAGE, PAGE)
+        h.complete_write("C", seq, {(10 + i) * PAGE: page(i + 1)})
+    assert h.dropped_inflight["C"] == 1
+
+    blocked = h.begin_write("C", 50 * PAGE, PAGE)
+    h.complete_write("C", blocked, {50 * PAGE: page(8)})
+    assert h.read("C", 50 * PAGE, page(8)) == "untracked"
+
+    # The late completion retires the unknown-write barrier but cannot publish
+    # because its own history record is gone.
+    h.complete_write("C", very_old, {0: page(7)})
+    assert h.dropped_inflight["C"] == 0
+    assert h.read("C", 0, page(7)) == "untracked"
+
+    after_barrier = h.begin_write("C", 60 * PAGE, PAGE)
+    h.complete_write("C", after_barrier, {60 * PAGE: page(6)})
+    assert h.read("C", 60 * PAGE, page(6)) == "match"
+
+    # 17. A dropped in-flight write on C must not block independent D tracking.
+    h.aliases = {} if hasattr(h, "aliases") else None
+    d2 = h.begin_write("D", 0, PAGE)
+    h.complete_write("D", d2, {0: page(5)})
+    assert h.read("D", 0, page(5)) == "match"
 
     print("H3B_HISTORY_MODEL=PASS")
-    print("cases=15")
+    print("cases=17")
 
 
 if __name__ == "__main__":
