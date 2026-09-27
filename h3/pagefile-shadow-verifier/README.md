@@ -1,64 +1,80 @@
-# StateRAM H3-B: write-through pagefile shadow verifier
+# StateRAM H3-B5: canonical pagefile shadow verifier
 
-H3-B moves one step beyond the H3-A observer without changing paging semantics.
+H3-B5 is a write-through verifier. Windows' normal pagefiles remain authoritative.
+The minifilter does not block, redirect, suppress, complete, rewrite, compress, or
+otherwise alter pagefile I/O.
 
-The normal Windows pagefile remains authoritative. The minifilter does not block,
-redirect, suppress, complete, rewrite, or compress any pagefile I/O.
+## Why H3-B5 exists
 
-When a pagefile write completes successfully, H3-B fingerprints each full,
-4 KiB-aligned page using two independent 64-bit FNV-style fingerprints and stores
-only:
+The H3-B4 target run produced 1,396 tracked read comparisons: 1,363 matches and
+33 mismatches. The same run reported six distinct paging-file FILE_OBJECTs even
+though the target is configured with pagefiles on only two partitions.
 
-- pagefile file-object identity,
-- pagefile byte offset,
-- the two fingerprints.
+H3-B4 incorrectly treated FILE_OBJECT identity as pagefile identity. A newer
+overlapping write through another FILE_OBJECT for the same underlying pagefile
+could therefore escape the old object's write history and make a stale
+fingerprint look like a mismatch.
 
-No page contents are retained.
+H3-B5 separates:
 
-When a later pagefile read of a tracked offset completes successfully, H3-B
-fingerprints the returned 4 KiB page and compares it with the most recently
-completed tracked write for that same pagefile offset.
+- **paging-file object identity**: each observed FILE_OBJECT;
+- **canonical paging-file identity**: the minifilter instance/volume that owns
+  the paging file.
 
-## Bounded state
+Windows supports one Pagefile.sys per partition, so all paging-file FILE_OBJECTs
+observed by this minifilter instance on one volume are aliases of the same
+pagefile. History and shadow entries are keyed by that canonical identity plus
+byte offset, while FILE_OBJECTs remain tracked only so ordinary files on the
+same volume are never mistaken for the pagefile.
 
-The shadow table has 32,768 direct-mapped entries and is allocated from nonpaged
-pool. Collisions replace the old entry and increment ShadowReplacements.
-Reads whose current offset is not present increment ShadowUntracked.
+## Read-buffer correction
 
-Resetting telemetry advances a logical generation, so old entries are ignored
-without zeroing the whole table on the paging path.
+In a post-read callback, if Filter Manager sets
+`FLTFL_CALLBACK_DATA_NEW_SYSTEM_BUFFER`, the original pre-operation buffer is
+not necessarily the buffer containing the data returned by the file system.
+H3-B5 checks this flag and uses `FltGetNewSystemBufferAddress` before hashing.
 
-## Safety choices
+The verifier also records:
 
-- only NTFS volumes are attached;
-- the first install is DEMAND_START with automatic attachment suppressed;
-- an InstanceQueryTeardown callback allows explicit detach;
-- exact pagefile tracking still depends on seeing SL_OPEN_PAGING_FILE, so the
-  decisive verifier run is a single F7 boot-time experiment;
-- completed I/O is observed only; I/O status/data are never modified;
-- post-operation hashing is skipped above APC_LEVEL rather than doing expensive
-  work at unsafe IRQL;
-- MDL-backed buffers are mapped with MmGetSystemAddressForMdlSafe; unsupported
-  buffers are counted and skipped.
+- cross-FILE_OBJECT comparisons/matches/mismatches;
+- new-system-buffer reads/comparisons/mismatches;
+- canonical pagefile identities and FILE_OBJECT aliases;
+- dynamic pagefile discoveries;
+- history expiry/drop and race-invalidated samples.
 
-A ShadowMismatches value greater than zero is a stop condition for this
-experiment. H3-B is verification only and is not evidence of 4->8 performance.
+## Reboot avoidance
 
+Boot-time `SL_OPEN_PAGING_FILE` detection is retained, but H3-B5 adds a
+DEMAND_START fallback for an already-running Windows session. For an unknown
+FILE_OBJECT seen in an IRP-based paging read/write pre-operation callback,
+H3-B5 calls `FsRtlIsPagingFile` at IRQL <= APC_LEVEL. If Windows identifies the
+object as a paging file, the driver registers it and maps it to that volume's
+canonical identity.
 
-## H3-B2 DISPATCH-safe verifier
+This allows the verifier logic to be exercised after a manual load in the same
+Windows boot, rather than requiring another reboot merely to rediscover the
+already-open pagefiles.
 
-The first boot-time H3-B run on the target HP identified the real paging files
-and observed 559 pagefile reads plus 537 pagefile writes, but all 1,096
-completion callbacks arrived above APC_LEVEL. The original verifier therefore
-skipped every fingerprint operation.
+## Bounded verifier state
 
-H3-B2 keeps the I/O path write-through and observational, but permits bounded
-fingerprinting at DISPATCH_LEVEL only when the completed I/O buffer is backed by
-an MDL or a system buffer. MmGetSystemAddressForMdlSafe is documented for use
-through DISPATCH_LEVEL. Raw buffer fallbacks remain restricted to IRQL <=
-APC_LEVEL.
+- 32,768 direct-mapped shadow entries in nonpaged pool.
+- 256 write-history range records per canonical pagefile identity.
+- At most four 4 KiB pages fingerprinted per completed I/O.
+- Two independent 64-bit FNV-style page fingerprints.
+- History overflow/expiry makes a sample **untracked**, never a match.
+- Newer overlapping writes invalidate older samples before comparison.
 
-To keep elevated-IRQL work bounded on the target's dual-core Celeron, H3-B2
-fingerprints at most four 4 KiB pages per completed I/O. This is a sampled
-integrity verifier, not a performance implementation. ShadowMismatches > 0
-remains a stop condition.
+The history scan remains bounded and is verifier-stage code, not the eventual
+production data path.
+
+## Success rule
+
+`ShadowMismatches > 0` is still an immediate stop condition.
+
+A useful H3-B5 validation requires real pagefile writes, later tracked reads,
+positive matches, and zero mismatches. Cross-object and buffer-source telemetry
+is diagnostic; it does not lower the success criterion.
+
+H3-B5 still saves no RAM and is not evidence that 4 GB behaves like 8 GB. It
+only validates pagefile write-to-later-read semantics needed for the later H3
+integration work.
