@@ -40,4 +40,17 @@
                                 ; home space, which is true of release builds.
     ShvVmxEntry ENDP
 
+    ShvVmxInvept PROC
+    ; RCX = INVEPT type (1 = single-context)
+    ; RDX = pointer to 128-bit INVEPT descriptor
+    invept  rcx, OWORD PTR [rdx]
+    jbe     ShvVmxInveptFailed
+    mov     eax, 1
+    ret
+
+ShvVmxInveptFailed:
+    xor     eax, eax
+    ret
+    ShvVmxInvept ENDP
+
     end
