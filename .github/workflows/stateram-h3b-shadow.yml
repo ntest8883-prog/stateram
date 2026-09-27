@@ -40,6 +40,35 @@ jobs:
         run: |
           python h3/pagefile-shadow-verifier/shadow_history_model_test.py
 
+      - name: Parse PowerShell scripts
+        shell: pwsh
+        run: |
+          $root = "h3/pagefile-shadow-verifier"
+          $failed = $false
+          Get-ChildItem $root -Filter *.ps1 | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName,
+              [ref]$tokens,
+              [ref]$errors)
+            if ($errors.Count -ne 0) {
+              $failed = $true
+              Write-Host "PowerShell parse errors in $($_.Name):"
+              $errors | ForEach-Object { Write-Host $_.Message }
+            }
+          }
+          if ($failed) {
+            throw "PowerShell syntax preflight failed."
+          }
+
+      - name: Verify query protocol ABI
+        shell: pwsh
+        run: |
+          powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File h3/pagefile-shadow-verifier/Query-StateRAMH3B.ps1 `
+            -SelfTest
+
       - name: Build x64 minifilter
         shell: pwsh
         run: |
@@ -48,7 +77,8 @@ jobs:
             /t:Build `
             /p:Configuration=NT `
             /p:Platform=x64 `
-            /p:SignMode=Off
+            /p:SignMode=Off `
+            /p:TreatWarningAsError=true
 
       - name: Stage package and hash
         shell: pwsh
