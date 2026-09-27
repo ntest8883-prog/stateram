@@ -19,3 +19,9 @@ The harness:
 A verifier pass requires a positive ShadowReadPages delta, a positive ShadowMatches delta, and zero additional ShadowMismatches.
 
 The tool is intentionally single-pass so it cannot silently escalate into repeated thrashing. If it cannot generate a tracked read, the output is diagnostic rather than an automatic retry.
+
+Before the full pressure pass, run:
+
+`StateRAMH3BPressure.exe --preflight`
+
+This performs a no-pressure machine compatibility check: H3-B query, pagefile-state sanity, 8 MiB allocation/trim/re-read data verification, and confirms no new verifier mismatches were introduced.
