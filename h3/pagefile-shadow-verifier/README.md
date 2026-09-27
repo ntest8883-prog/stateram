@@ -43,3 +43,22 @@ without zeroing the whole table on the paging path.
 
 A ShadowMismatches value greater than zero is a stop condition for this
 experiment. H3-B is verification only and is not evidence of 4->8 performance.
+
+
+## H3-B2 DISPATCH-safe verifier
+
+The first boot-time H3-B run on the target HP identified the real paging files
+and observed 559 pagefile reads plus 537 pagefile writes, but all 1,096
+completion callbacks arrived above APC_LEVEL. The original verifier therefore
+skipped every fingerprint operation.
+
+H3-B2 keeps the I/O path write-through and observational, but permits bounded
+fingerprinting at DISPATCH_LEVEL only when the completed I/O buffer is backed by
+an MDL or a system buffer. MmGetSystemAddressForMdlSafe is documented for use
+through DISPATCH_LEVEL. Raw buffer fallbacks remain restricted to IRQL <=
+APC_LEVEL.
+
+To keep elevated-IRQL work bounded on the target's dual-core Celeron, H3-B2
+fingerprints at most four 4 KiB pages per completed I/O. This is a sampled
+integrity verifier, not a performance implementation. ShadowMismatches > 0
+remains a stop condition.
