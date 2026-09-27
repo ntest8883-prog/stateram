@@ -46,7 +46,7 @@ typedef struct _H3B_SHADOW_ENTRY
     ULONGLONG Hash1;
     ULONGLONG Hash2;
     ULONG Generation;
-    ULONG Reserved;
+    ULONG PagefileEpoch;
 } H3B_SHADOW_ENTRY, *PH3B_SHADOW_ENTRY;
 
 PFLT_FILTER g_Filter;
@@ -55,6 +55,7 @@ PFLT_PORT g_ClientPort;
 
 KSPIN_LOCK g_PagefileLock;
 PFILE_OBJECT g_PagefileObjects[H3B_MAX_PAGEFILES];
+volatile LONG g_PagefileEpochs[H3B_MAX_PAGEFILES];
 
 KSPIN_LOCK g_ShadowLock;
 PH3B_SHADOW_ENTRY g_ShadowTable;
@@ -156,6 +157,77 @@ H3BIsKnownPagefile (
 }
 
 static
+BOOLEAN
+H3BGetPagefileEpoch (
+    _In_ PFILE_OBJECT FileObject,
+    _Out_ PULONG Epoch
+    )
+{
+    KIRQL oldIrql;
+    ULONG i;
+    BOOLEAN found;
+
+    found = FALSE;
+    *Epoch = 0;
+
+    KeAcquireSpinLock(&g_PagefileLock, &oldIrql);
+
+    for (i = 0; i < H3B_MAX_PAGEFILES; i++)
+    {
+        if (g_PagefileObjects[i] == FileObject)
+        {
+            *Epoch = (ULONG)InterlockedCompareExchange(
+                &g_PagefileEpochs[i],
+                0,
+                0);
+            found = TRUE;
+            break;
+        }
+    }
+
+    KeReleaseSpinLock(&g_PagefileLock, oldIrql);
+    return found;
+}
+
+static
+BOOLEAN
+H3BAdvancePagefileEpoch (
+    _In_ PFILE_OBJECT FileObject,
+    _Out_ PULONG Epoch
+    )
+{
+    KIRQL oldIrql;
+    ULONG i;
+    LONG value;
+    BOOLEAN found;
+
+    found = FALSE;
+    *Epoch = 0;
+
+    KeAcquireSpinLock(&g_PagefileLock, &oldIrql);
+
+    for (i = 0; i < H3B_MAX_PAGEFILES; i++)
+    {
+        if (g_PagefileObjects[i] == FileObject)
+        {
+            value = InterlockedIncrement(&g_PagefileEpochs[i]);
+
+            if (value == 0)
+            {
+                value = InterlockedIncrement(&g_PagefileEpochs[i]);
+            }
+
+            *Epoch = (ULONG)value;
+            found = TRUE;
+            break;
+        }
+    }
+
+    KeReleaseSpinLock(&g_PagefileLock, oldIrql);
+    return found;
+}
+
+static
 VOID
 H3BRememberPagefile (
     _In_ PFILE_OBJECT FileObject
@@ -188,6 +260,7 @@ H3BRememberPagefile (
     {
         ObReferenceObject(FileObject);
         g_PagefileObjects[freeSlot] = FileObject;
+        InterlockedExchange(&g_PagefileEpochs[freeSlot], 1);
         InterlockedIncrement64(&g_PagingFileCreates);
     }
 
@@ -212,6 +285,7 @@ H3BReleasePagefiles (
     {
         objects[i] = g_PagefileObjects[i];
         g_PagefileObjects[i] = NULL;
+        InterlockedExchange(&g_PagefileEpochs[i], 0);
     }
 
     KeReleaseSpinLock(&g_PagefileLock, oldIrql);
@@ -269,7 +343,8 @@ H3BStoreShadow (
     _In_ PFILE_OBJECT FileObject,
     _In_ ULONGLONG Offset,
     _In_ ULONGLONG Hash1,
-    _In_ ULONGLONG Hash2
+    _In_ ULONGLONG Hash2,
+    _In_ ULONG PagefileEpoch
     )
 {
     KIRQL oldIrql;
@@ -301,6 +376,7 @@ H3BStoreShadow (
     entry->Hash1 = Hash1;
     entry->Hash2 = Hash2;
     entry->Generation = (ULONG)generation;
+    entry->PagefileEpoch = PagefileEpoch;
 
     KeReleaseSpinLock(&g_ShadowLock, oldIrql);
 }
@@ -310,6 +386,7 @@ BOOLEAN
 H3BLookupShadow (
     _In_ PFILE_OBJECT FileObject,
     _In_ ULONGLONG Offset,
+    _In_ ULONG PagefileEpoch,
     _Out_ PULONGLONG Hash1,
     _Out_ PULONGLONG Hash2
     )
@@ -330,7 +407,8 @@ H3BLookupShadow (
 
     if ((entry->Generation == (ULONG)generation) &&
         (entry->FileObject == FileObject) &&
-        (entry->Offset == Offset))
+        (entry->Offset == Offset) &&
+        (entry->PagefileEpoch == PagefileEpoch))
     {
         *Hash1 = entry->Hash1;
         *Hash2 = entry->Hash2;
@@ -426,7 +504,8 @@ H3BGetWriteBuffer (
 static
 VOID
 H3BShadowCompletedWrite (
-    _Inout_ PFLT_CALLBACK_DATA Data
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ ULONG WriteEpoch
     )
 {
     PVOID mappedBuffer;
@@ -435,10 +514,19 @@ H3BShadowCompletedWrite (
     ULONG_PTR completedBytes;
     ULONG pageCount;
     ULONG i;
+    ULONG currentEpoch;
 
     if (KeGetCurrentIrql() > DISPATCH_LEVEL)
     {
         InterlockedIncrement64(&g_ShadowHighIrqlSkips);
+        return;
+    }
+
+    if (!H3BGetPagefileEpoch(
+            Data->Iopb->TargetFileObject,
+            &currentEpoch) ||
+        (currentEpoch != WriteEpoch))
+    {
         return;
     }
 
@@ -508,7 +596,8 @@ H3BShadowCompletedWrite (
                 Data->Iopb->TargetFileObject,
                 offset,
                 hash1,
-                hash2);
+                hash2,
+                WriteEpoch);
 
             InterlockedIncrement64(&g_ShadowWritePages);
         }
@@ -522,7 +611,8 @@ H3BShadowCompletedWrite (
 static
 VOID
 H3BVerifyCompletedRead (
-    _Inout_ PFLT_CALLBACK_DATA Data
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ ULONG ReadEpoch
     )
 {
     PVOID mappedBuffer;
@@ -531,10 +621,20 @@ H3BVerifyCompletedRead (
     ULONG_PTR completedBytes;
     ULONG pageCount;
     ULONG i;
+    ULONG currentEpoch;
 
     if (KeGetCurrentIrql() > DISPATCH_LEVEL)
     {
         InterlockedIncrement64(&g_ShadowHighIrqlSkips);
+        return;
+    }
+
+    if (!H3BGetPagefileEpoch(
+            Data->Iopb->TargetFileObject,
+            &currentEpoch) ||
+        (currentEpoch != ReadEpoch))
+    {
+        InterlockedIncrement64(&g_ShadowUntracked);
         return;
     }
 
@@ -597,6 +697,7 @@ H3BVerifyCompletedRead (
             if (!H3BLookupShadow(
                     Data->Iopb->TargetFileObject,
                     offset,
+                    ReadEpoch,
                     &expected1,
                     &expected2))
             {
@@ -611,6 +712,15 @@ H3BVerifyCompletedRead (
             actual2 = H3BHashPage(
                 bytes + ((SIZE_T)i * PAGE_SIZE),
                 0xD6E8FEB86659FD93ULL);
+
+            if (!H3BGetPagefileEpoch(
+                    Data->Iopb->TargetFileObject,
+                    &currentEpoch) ||
+                (currentEpoch != ReadEpoch))
+            {
+                InterlockedIncrement64(&g_ShadowUntracked);
+                continue;
+            }
 
             InterlockedIncrement64(&g_ShadowReadPages);
 
@@ -639,15 +749,18 @@ H3BPreRead (
     )
 {
     ULONG length;
+    ULONG readEpoch;
 
     UNREFERENCED_PARAMETER(FltObjects);
-    UNREFERENCED_PARAMETER(CompletionContext);
 
-    if (!H3BIsKnownPagefile(Data->Iopb->TargetFileObject))
+    if (!H3BGetPagefileEpoch(
+            Data->Iopb->TargetFileObject,
+            &readEpoch))
     {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
+    *CompletionContext = (PVOID)(ULONG_PTR)readEpoch;
     length = Data->Iopb->Parameters.Read.Length;
 
     InterlockedIncrement64(&g_PagefileReads);
@@ -664,8 +777,11 @@ H3BPostRead (
     _In_ FLT_POST_OPERATION_FLAGS Flags
     )
 {
+    ULONG readEpoch;
+
     UNREFERENCED_PARAMETER(FltObjects);
-    UNREFERENCED_PARAMETER(CompletionContext);
+
+    readEpoch = (ULONG)(ULONG_PTR)CompletionContext;
 
     if (FlagOn(Flags, FLTFL_POST_OPERATION_DRAINING))
     {
@@ -675,7 +791,7 @@ H3BPostRead (
     if (NT_SUCCESS(Data->IoStatus.Status) &&
         (Data->IoStatus.Information != 0))
     {
-        H3BVerifyCompletedRead(Data);
+        H3BVerifyCompletedRead(Data, readEpoch);
     }
 
     return FLT_POSTOP_FINISHED_PROCESSING;
@@ -689,15 +805,18 @@ H3BPreWrite (
     )
 {
     ULONG length;
+    ULONG writeEpoch;
 
     UNREFERENCED_PARAMETER(FltObjects);
-    UNREFERENCED_PARAMETER(CompletionContext);
 
-    if (!H3BIsKnownPagefile(Data->Iopb->TargetFileObject))
+    if (!H3BAdvancePagefileEpoch(
+            Data->Iopb->TargetFileObject,
+            &writeEpoch))
     {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
+    *CompletionContext = (PVOID)(ULONG_PTR)writeEpoch;
     length = Data->Iopb->Parameters.Write.Length;
 
     InterlockedIncrement64(&g_PagefileWrites);
@@ -714,8 +833,11 @@ H3BPostWrite (
     _In_ FLT_POST_OPERATION_FLAGS Flags
     )
 {
+    ULONG writeEpoch;
+
     UNREFERENCED_PARAMETER(FltObjects);
-    UNREFERENCED_PARAMETER(CompletionContext);
+
+    writeEpoch = (ULONG)(ULONG_PTR)CompletionContext;
 
     if (FlagOn(Flags, FLTFL_POST_OPERATION_DRAINING))
     {
@@ -725,7 +847,7 @@ H3BPostWrite (
     if (NT_SUCCESS(Data->IoStatus.Status) &&
         (Data->IoStatus.Information != 0))
     {
-        H3BShadowCompletedWrite(Data);
+        H3BShadowCompletedWrite(Data, writeEpoch);
     }
 
     return FLT_POSTOP_FINISHED_PROCESSING;
@@ -995,6 +1117,7 @@ DriverEntry (
     g_ShadowGeneration = 1;
 
     RtlZeroMemory(g_PagefileObjects, sizeof(g_PagefileObjects));
+    RtlZeroMemory((PVOID)g_PagefileEpochs, sizeof(g_PagefileEpochs));
 
     KeInitializeSpinLock(&g_PagefileLock);
     KeInitializeSpinLock(&g_ShadowLock);
