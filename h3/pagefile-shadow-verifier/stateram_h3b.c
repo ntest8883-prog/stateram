@@ -7,6 +7,7 @@
 #define H3B_MAX_PAGEFILES    4
 #define H3B_SHADOW_SLOTS     32768
 #define H3B_POOL_TAG         'B3HS'
+#define H3B_MAX_HASH_PAGES_PER_IO 4
 
 typedef struct _H3B_COMMAND
 {
@@ -357,8 +358,22 @@ H3BGetReadBuffer (
             NormalPagePriority);
     }
 
-    if (FLT_IS_SYSTEM_BUFFER(Data) ||
-        FLT_IS_FASTIO_OPERATION(Data) ||
+    if (FLT_IS_SYSTEM_BUFFER(Data))
+    {
+        return Data->Iopb->Parameters.Read.ReadBuffer;
+    }
+
+    /*
+     * Paging-file completions on the target machine arrive at DISPATCH_LEVEL.
+     * At elevated IRQL we only touch MDL-backed or system-buffered memory.
+     * Raw buffer addresses are only considered at IRQL <= APC_LEVEL.
+     */
+    if (KeGetCurrentIrql() > APC_LEVEL)
+    {
+        return NULL;
+    }
+
+    if (FLT_IS_FASTIO_OPERATION(Data) ||
         (Data->RequestorMode == KernelMode))
     {
         return Data->Iopb->Parameters.Read.ReadBuffer;
@@ -384,8 +399,22 @@ H3BGetWriteBuffer (
             NormalPagePriority);
     }
 
-    if (FLT_IS_SYSTEM_BUFFER(Data) ||
-        FLT_IS_FASTIO_OPERATION(Data) ||
+    if (FLT_IS_SYSTEM_BUFFER(Data))
+    {
+        return Data->Iopb->Parameters.Write.WriteBuffer;
+    }
+
+    /*
+     * Paging-file completions on the target machine arrive at DISPATCH_LEVEL.
+     * At elevated IRQL we only touch MDL-backed or system-buffered memory.
+     * Raw buffer addresses are only considered at IRQL <= APC_LEVEL.
+     */
+    if (KeGetCurrentIrql() > APC_LEVEL)
+    {
+        return NULL;
+    }
+
+    if (FLT_IS_FASTIO_OPERATION(Data) ||
         (Data->RequestorMode == KernelMode))
     {
         return Data->Iopb->Parameters.Write.WriteBuffer;
@@ -407,7 +436,7 @@ H3BShadowCompletedWrite (
     ULONG pageCount;
     ULONG i;
 
-    if (KeGetCurrentIrql() > APC_LEVEL)
+    if (KeGetCurrentIrql() > DISPATCH_LEVEL)
     {
         InterlockedIncrement64(&g_ShadowHighIrqlSkips);
         return;
@@ -434,12 +463,28 @@ H3BShadowCompletedWrite (
 
     if (mappedBuffer == NULL)
     {
-        InterlockedIncrement64(&g_ShadowBufferUnavailable);
+        if (KeGetCurrentIrql() > APC_LEVEL)
+        {
+            InterlockedIncrement64(&g_ShadowHighIrqlSkips);
+        }
+        else
+        {
+            InterlockedIncrement64(&g_ShadowBufferUnavailable);
+        }
         return;
     }
 
     bytes = (PUCHAR)mappedBuffer;
     pageCount = (ULONG)(completedBytes / PAGE_SIZE);
+
+    /*
+     * H3-B is a verifier, not the final data path. Bound work done in the
+     * completion callback so DISPATCH_LEVEL residence stays short.
+     */
+    if (pageCount > H3B_MAX_HASH_PAGES_PER_IO)
+    {
+        pageCount = H3B_MAX_HASH_PAGES_PER_IO;
+    }
 
     __try
     {
@@ -487,7 +532,7 @@ H3BVerifyCompletedRead (
     ULONG pageCount;
     ULONG i;
 
-    if (KeGetCurrentIrql() > APC_LEVEL)
+    if (KeGetCurrentIrql() > DISPATCH_LEVEL)
     {
         InterlockedIncrement64(&g_ShadowHighIrqlSkips);
         return;
@@ -514,12 +559,28 @@ H3BVerifyCompletedRead (
 
     if (mappedBuffer == NULL)
     {
-        InterlockedIncrement64(&g_ShadowBufferUnavailable);
+        if (KeGetCurrentIrql() > APC_LEVEL)
+        {
+            InterlockedIncrement64(&g_ShadowHighIrqlSkips);
+        }
+        else
+        {
+            InterlockedIncrement64(&g_ShadowBufferUnavailable);
+        }
         return;
     }
 
     bytes = (PUCHAR)mappedBuffer;
     pageCount = (ULONG)(completedBytes / PAGE_SIZE);
+
+    /*
+     * Bound verifier work in the completion path. Matching is sampled, but a
+     * mismatch remains a stop condition.
+     */
+    if (pageCount > H3B_MAX_HASH_PAGES_PER_IO)
+    {
+        pageCount = H3B_MAX_HASH_PAGES_PER_IO;
+    }
 
     __try
     {
