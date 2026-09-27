@@ -128,7 +128,6 @@ H3BResetCounters (
             g_ShadowTable,
             sizeof(H3B_SHADOW_ENTRY) * H3B_SHADOW_SLOTS);
         g_ShadowGeneration = 1;
-    g_WriteSequence = 1;
         KeReleaseSpinLock(&g_ShadowLock, oldIrql);
     }
 }
@@ -307,6 +306,7 @@ H3BInvalidateAllShadow (
         g_ShadowGeneration = 1;
     }
 
+    InterlockedExchange64(&g_ShadowTableEntries, 0);
     KeReleaseSpinLock(&g_ShadowLock, oldIrql);
 }
 
@@ -1214,6 +1214,7 @@ DriverEntry (
     g_ClientPort = NULL;
     g_ShadowTable = NULL;
     g_ShadowGeneration = 1;
+    g_WriteSequence = 1;
 
     RtlZeroMemory(g_PagefileObjects, sizeof(g_PagefileObjects));
 
