@@ -52,10 +52,12 @@ typedef struct _H3B_COUNTERS
     LONG64 CrossObjectComparisons;
     LONG64 CrossObjectMatches;
     LONG64 CrossObjectMismatches;
+    LONG64 NewSystemBufferComparisons;
+    LONG64 NewSystemBufferMismatches;
 } H3B_COUNTERS, *PH3B_COUNTERS;
 
 C_ASSERT(sizeof(H3B_COMMAND) == 8);
-C_ASSERT(sizeof(H3B_COUNTERS) == 240);
+C_ASSERT(sizeof(H3B_COUNTERS) == 256);
 
 typedef struct _H3B_SHADOW_ENTRY
 {
@@ -136,6 +138,8 @@ volatile LONG64 g_ReadNewSystemBuffers;
 volatile LONG64 g_CrossObjectComparisons;
 volatile LONG64 g_CrossObjectMatches;
 volatile LONG64 g_CrossObjectMismatches;
+volatile LONG64 g_NewSystemBufferComparisons;
+volatile LONG64 g_NewSystemBufferMismatches;
 
 DRIVER_INITIALIZE DriverEntry;
 
@@ -181,6 +185,8 @@ H3BResetCounters (
     InterlockedExchange64(&g_CrossObjectComparisons, 0);
     InterlockedExchange64(&g_CrossObjectMatches, 0);
     InterlockedExchange64(&g_CrossObjectMismatches, 0);
+    InterlockedExchange64(&g_NewSystemBufferComparisons, 0);
+    InterlockedExchange64(&g_NewSystemBufferMismatches, 0);
 
     generation = InterlockedIncrement(&g_ShadowGeneration);
 
@@ -985,12 +991,17 @@ H3BVerifyCompletedRead (
     ULONG pageCount;
     ULONG i;
     ULONG identityIndex;
+    BOOLEAN newSystemBufferRead;
 
     if (KeGetCurrentIrql() > DISPATCH_LEVEL)
     {
         InterlockedIncrement64(&g_ShadowHighIrqlSkips);
         return;
     }
+
+    newSystemBufferRead =
+        FlagOn(Data->Flags, FLTFL_CALLBACK_DATA_NEW_SYSTEM_BUFFER) ?
+        TRUE : FALSE;
 
     if (!H3BGetPagefileIdentityIndex(
             Data->Iopb->TargetFileObject,
@@ -1099,6 +1110,11 @@ H3BVerifyCompletedRead (
                 InterlockedIncrement64(&g_CrossObjectComparisons);
             }
 
+            if (newSystemBufferRead)
+            {
+                InterlockedIncrement64(&g_NewSystemBufferComparisons);
+            }
+
             InterlockedIncrement64(&g_ShadowReadPages);
 
             if ((actual1 == expected1) &&
@@ -1118,6 +1134,11 @@ H3BVerifyCompletedRead (
                 if (crossObject)
                 {
                     InterlockedIncrement64(&g_CrossObjectMismatches);
+                }
+
+                if (newSystemBufferRead)
+                {
+                    InterlockedIncrement64(&g_NewSystemBufferMismatches);
                 }
             }
         }
@@ -1423,6 +1444,8 @@ H3BMessage (
     reply->CrossObjectComparisons = H3BReadCounter(&g_CrossObjectComparisons);
     reply->CrossObjectMatches = H3BReadCounter(&g_CrossObjectMatches);
     reply->CrossObjectMismatches = H3BReadCounter(&g_CrossObjectMismatches);
+    reply->NewSystemBufferComparisons = H3BReadCounter(&g_NewSystemBufferComparisons);
+    reply->NewSystemBufferMismatches = H3BReadCounter(&g_NewSystemBufferMismatches);
 
     *ReturnOutputBufferLength = sizeof(*reply);
     return STATUS_SUCCESS;
