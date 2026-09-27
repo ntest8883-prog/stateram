@@ -25,6 +25,7 @@ Environment:
 #include "..\shv_x.h"
 #pragma warning(disable:4221)
 #pragma warning(disable:4204)
+#pragma warning(disable:4996) // ExAllocatePoolWithTag required for Windows 10 1909 target
 
 NTKERNELAPI
 _IRQL_requires_max_(APC_LEVEL)
