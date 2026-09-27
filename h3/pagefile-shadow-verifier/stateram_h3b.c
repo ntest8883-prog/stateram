@@ -7,7 +7,8 @@
 #define H3B_MAX_PAGEFILES    4
 #define H3B_SHADOW_SLOTS     32768
 #define H3B_POOL_TAG         'B3HS'
-#define H3B_MAX_HASH_PAGES_PER_IO 4
+#define H3B_MAX_HASH_PAGES_PER_IO       4
+#define H3B_MAX_INVALIDATE_PAGES_PER_IO 2048
 
 typedef struct _H3B_COMMAND
 {
@@ -46,6 +47,8 @@ typedef struct _H3B_SHADOW_ENTRY
     ULONGLONG Hash1;
     ULONGLONG Hash2;
     ULONG Generation;
+    ULONG WriteSequence;
+    ULONG Valid;
     ULONG Reserved;
 } H3B_SHADOW_ENTRY, *PH3B_SHADOW_ENTRY;
 
@@ -59,6 +62,7 @@ PFILE_OBJECT g_PagefileObjects[H3B_MAX_PAGEFILES];
 KSPIN_LOCK g_ShadowLock;
 PH3B_SHADOW_ENTRY g_ShadowTable;
 volatile LONG g_ShadowGeneration;
+volatile LONG g_WriteSequence;
 
 volatile LONG64 g_PagefileReads;
 volatile LONG64 g_PagefileReadBytes;
@@ -124,6 +128,7 @@ H3BResetCounters (
             g_ShadowTable,
             sizeof(H3B_SHADOW_ENTRY) * H3B_SHADOW_SLOTS);
         g_ShadowGeneration = 1;
+    g_WriteSequence = 1;
         KeReleaseSpinLock(&g_ShadowLock, oldIrql);
     }
 }
@@ -264,27 +269,64 @@ H3BShadowIndex (
 }
 
 static
+ULONG
+H3BNextWriteSequence (
+    VOID
+    )
+{
+    LONG value;
+
+    value = InterlockedIncrement(&g_WriteSequence);
+
+    if (value == 0)
+    {
+        value = InterlockedIncrement(&g_WriteSequence);
+    }
+
+    return (ULONG)value;
+}
+
+static
 VOID
-H3BStoreShadow (
-    _In_ PFILE_OBJECT FileObject,
-    _In_ ULONGLONG Offset,
-    _In_ ULONGLONG Hash1,
-    _In_ ULONGLONG Hash2
+H3BInvalidateAllShadow (
+    VOID
     )
 {
     KIRQL oldIrql;
-    ULONG index;
     LONG generation;
+
+    KeAcquireSpinLock(&g_ShadowLock, &oldIrql);
+
+    generation = ++g_ShadowGeneration;
+
+    if (generation == 0)
+    {
+        RtlZeroMemory(
+            g_ShadowTable,
+            sizeof(H3B_SHADOW_ENTRY) * H3B_SHADOW_SLOTS);
+        g_ShadowGeneration = 1;
+    }
+
+    KeReleaseSpinLock(&g_ShadowLock, oldIrql);
+}
+
+static
+VOID
+H3BMarkPendingLocked (
+    _In_ PFILE_OBJECT FileObject,
+    _In_ ULONGLONG Offset,
+    _In_ ULONG WriteSequence,
+    _In_ LONG Generation
+    )
+{
+    ULONG index;
     PH3B_SHADOW_ENTRY entry;
     BOOLEAN currentEntry;
 
     index = H3BShadowIndex(FileObject, Offset);
-    generation = InterlockedCompareExchange(&g_ShadowGeneration, 0, 0);
-
-    KeAcquireSpinLock(&g_ShadowLock, &oldIrql);
-
     entry = &g_ShadowTable[index];
-    currentEntry = (entry->Generation == (ULONG)generation) ? TRUE : FALSE;
+
+    currentEntry = (entry->Generation == (ULONG)Generation) ? TRUE : FALSE;
 
     if (currentEntry == FALSE)
     {
@@ -298,11 +340,159 @@ H3BStoreShadow (
 
     entry->FileObject = FileObject;
     entry->Offset = Offset;
-    entry->Hash1 = Hash1;
-    entry->Hash2 = Hash2;
-    entry->Generation = (ULONG)generation;
+    entry->Hash1 = 0;
+    entry->Hash2 = 0;
+    entry->Generation = (ULONG)Generation;
+    entry->WriteSequence = WriteSequence;
+    entry->Valid = 0;
+}
+
+static
+VOID
+H3BPrepareWriteRange (
+    _In_ PFILE_OBJECT FileObject,
+    _In_ LONGLONG ByteOffset,
+    _In_ ULONG Length,
+    _In_ ULONG WriteSequence
+    )
+{
+    KIRQL oldIrql;
+    ULONGLONG start;
+    ULONGLONG lastByte;
+    ULONGLONG pageOffset;
+    ULONGLONG pageCount64;
+    ULONG pageCount;
+    ULONG i;
+    LONG generation;
+    BOOLEAN globalInvalidate;
+
+    if ((ByteOffset < 0) || (Length == 0))
+    {
+        H3BInvalidateAllShadow();
+        return;
+    }
+
+    start = ((ULONGLONG)ByteOffset) & ~((ULONGLONG)PAGE_SIZE - 1);
+
+    if (((ULONGLONG)ByteOffset) >
+        (MAXULONGLONG - ((ULONGLONG)Length - 1)))
+    {
+        H3BInvalidateAllShadow();
+        return;
+    }
+
+    lastByte = (ULONGLONG)ByteOffset + ((ULONGLONG)Length - 1);
+    pageCount64 = ((lastByte - start) >> PAGE_SHIFT) + 1;
+
+    globalInvalidate =
+        (pageCount64 > H3B_MAX_INVALIDATE_PAGES_PER_IO) ? TRUE : FALSE;
+
+    if (globalInvalidate)
+    {
+        H3BInvalidateAllShadow();
+        pageCount = (ULONG)((pageCount64 > H3B_MAX_HASH_PAGES_PER_IO)
+            ? H3B_MAX_HASH_PAGES_PER_IO
+            : pageCount64);
+    }
+    else
+    {
+        pageCount = (ULONG)pageCount64;
+    }
+
+    KeAcquireSpinLock(&g_ShadowLock, &oldIrql);
+    generation = g_ShadowGeneration;
+
+    for (i = 0; i < pageCount; i++)
+    {
+        pageOffset = start + ((ULONGLONG)i * PAGE_SIZE);
+
+        H3BMarkPendingLocked(
+            FileObject,
+            pageOffset,
+            WriteSequence,
+            generation);
+    }
 
     KeReleaseSpinLock(&g_ShadowLock, oldIrql);
+}
+
+static
+BOOLEAN
+H3BStoreShadowIfPending (
+    _In_ PFILE_OBJECT FileObject,
+    _In_ ULONGLONG Offset,
+    _In_ ULONG WriteSequence,
+    _In_ ULONGLONG Hash1,
+    _In_ ULONGLONG Hash2
+    )
+{
+    KIRQL oldIrql;
+    ULONG index;
+    LONG generation;
+    PH3B_SHADOW_ENTRY entry;
+    BOOLEAN stored;
+
+    stored = FALSE;
+    index = H3BShadowIndex(FileObject, Offset);
+    generation = InterlockedCompareExchange(&g_ShadowGeneration, 0, 0);
+
+    KeAcquireSpinLock(&g_ShadowLock, &oldIrql);
+
+    entry = &g_ShadowTable[index];
+
+    if ((entry->Generation == (ULONG)generation) &&
+        (entry->FileObject == FileObject) &&
+        (entry->Offset == Offset) &&
+        (entry->WriteSequence == WriteSequence) &&
+        (entry->Valid == 0))
+    {
+        entry->Hash1 = Hash1;
+        entry->Hash2 = Hash2;
+        entry->Valid = 1;
+        stored = TRUE;
+    }
+
+    KeReleaseSpinLock(&g_ShadowLock, oldIrql);
+    return stored;
+}
+
+static
+BOOLEAN
+H3BShadowStillCurrent (
+    _In_ PFILE_OBJECT FileObject,
+    _In_ ULONGLONG Offset,
+    _In_ ULONG WriteSequence,
+    _In_ ULONGLONG Hash1,
+    _In_ ULONGLONG Hash2
+    )
+{
+    KIRQL oldIrql;
+    ULONG index;
+    LONG generation;
+    PH3B_SHADOW_ENTRY entry;
+    BOOLEAN current;
+
+    current = FALSE;
+    index = H3BShadowIndex(FileObject, Offset);
+    generation = InterlockedCompareExchange(&g_ShadowGeneration, 0, 0);
+
+    KeAcquireSpinLock(&g_ShadowLock, &oldIrql);
+
+    entry = &g_ShadowTable[index];
+
+    if ((entry->Generation == (ULONG)generation) &&
+        (entry->FileObject == FileObject) &&
+        (entry->Offset == Offset) &&
+        (entry->WriteSequence == WriteSequence) &&
+        (entry->Valid != 0) &&
+        (entry->Hash1 == Hash1) &&
+        (entry->Hash2 == Hash2))
+    {
+        current = TRUE;
+    }
+
+    KeReleaseSpinLock(&g_ShadowLock, oldIrql);
+    return current;
 }
 
 static
@@ -311,7 +501,8 @@ H3BLookupShadow (
     _In_ PFILE_OBJECT FileObject,
     _In_ ULONGLONG Offset,
     _Out_ PULONGLONG Hash1,
-    _Out_ PULONGLONG Hash2
+    _Out_ PULONGLONG Hash2,
+    _Out_ PULONG WriteSequence
     )
 {
     KIRQL oldIrql;
@@ -330,10 +521,12 @@ H3BLookupShadow (
 
     if ((entry->Generation == (ULONG)generation) &&
         (entry->FileObject == FileObject) &&
-        (entry->Offset == Offset))
+        (entry->Offset == Offset) &&
+        (entry->Valid != 0))
     {
         *Hash1 = entry->Hash1;
         *Hash2 = entry->Hash2;
+        *WriteSequence = entry->WriteSequence;
         found = TRUE;
     }
 
@@ -426,7 +619,8 @@ H3BGetWriteBuffer (
 static
 VOID
 H3BShadowCompletedWrite (
-    _Inout_ PFLT_CALLBACK_DATA Data
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ ULONG WriteSequence
     )
 {
     PVOID mappedBuffer;
@@ -504,13 +698,15 @@ H3BShadowCompletedWrite (
 
             offset = baseOffset + ((ULONGLONG)i * PAGE_SIZE);
 
-            H3BStoreShadow(
-                Data->Iopb->TargetFileObject,
-                offset,
-                hash1,
-                hash2);
-
-            InterlockedIncrement64(&g_ShadowWritePages);
+            if (H3BStoreShadowIfPending(
+                    Data->Iopb->TargetFileObject,
+                    offset,
+                    WriteSequence,
+                    hash1,
+                    hash2))
+            {
+                InterlockedIncrement64(&g_ShadowWritePages);
+            }
         }
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -591,6 +787,7 @@ H3BVerifyCompletedRead (
             ULONGLONG actual1;
             ULONGLONG actual2;
             ULONGLONG offset;
+            ULONG writeSequence;
 
             offset = baseOffset + ((ULONGLONG)i * PAGE_SIZE);
 
@@ -598,7 +795,8 @@ H3BVerifyCompletedRead (
                     Data->Iopb->TargetFileObject,
                     offset,
                     &expected1,
-                    &expected2))
+                    &expected2,
+                    &writeSequence))
             {
                 InterlockedIncrement64(&g_ShadowUntracked);
                 continue;
@@ -611,6 +809,17 @@ H3BVerifyCompletedRead (
             actual2 = H3BHashPage(
                 bytes + ((SIZE_T)i * PAGE_SIZE),
                 0xD6E8FEB86659FD93ULL);
+
+            if (!H3BShadowStillCurrent(
+                    Data->Iopb->TargetFileObject,
+                    offset,
+                    writeSequence,
+                    expected1,
+                    expected2))
+            {
+                InterlockedIncrement64(&g_ShadowUntracked);
+                continue;
+            }
 
             InterlockedIncrement64(&g_ShadowReadPages);
 
@@ -689,9 +898,9 @@ H3BPreWrite (
     )
 {
     ULONG length;
+    ULONG writeSequence;
 
     UNREFERENCED_PARAMETER(FltObjects);
-    UNREFERENCED_PARAMETER(CompletionContext);
 
     if (!H3BIsKnownPagefile(Data->Iopb->TargetFileObject))
     {
@@ -699,6 +908,15 @@ H3BPreWrite (
     }
 
     length = Data->Iopb->Parameters.Write.Length;
+    writeSequence = H3BNextWriteSequence();
+
+    H3BPrepareWriteRange(
+        Data->Iopb->TargetFileObject,
+        Data->Iopb->Parameters.Write.ByteOffset.QuadPart,
+        length,
+        writeSequence);
+
+    *CompletionContext = (PVOID)(ULONG_PTR)writeSequence;
 
     InterlockedIncrement64(&g_PagefileWrites);
     InterlockedAdd64(&g_PagefileWriteBytes, length);
@@ -714,8 +932,11 @@ H3BPostWrite (
     _In_ FLT_POST_OPERATION_FLAGS Flags
     )
 {
+    ULONG writeSequence;
+
     UNREFERENCED_PARAMETER(FltObjects);
-    UNREFERENCED_PARAMETER(CompletionContext);
+
+    writeSequence = (ULONG)(ULONG_PTR)CompletionContext;
 
     if (FlagOn(Flags, FLTFL_POST_OPERATION_DRAINING))
     {
@@ -725,7 +946,7 @@ H3BPostWrite (
     if (NT_SUCCESS(Data->IoStatus.Status) &&
         (Data->IoStatus.Information != 0))
     {
-        H3BShadowCompletedWrite(Data);
+        H3BShadowCompletedWrite(Data, writeSequence);
     }
 
     return FLT_POSTOP_FINISHED_PROCESSING;
