@@ -56,6 +56,9 @@ public static class StateRAMH3BNative
         public Int64 NewSystemBufferComparisons;
         public Int64 NewSystemBufferMismatches;
         public Int64 DynamicPagefileDiscoveries;
+        public Int64 ConcurrentOverlapSkips;
+        public Int64 DroppedInflightRecords;
+        public Int64 DroppedInflightOutstanding;
     }
 
     [DllImport("fltlib.dll", CharSet = CharSet.Unicode)]
@@ -93,11 +96,11 @@ if ($SelfTest) {
         throw "Protocol self-test failed: Command size is $commandSize, expected 8."
     }
 
-    if ($counterSize -ne 264) {
-        throw "Protocol self-test failed: Counters size is $counterSize, expected 264."
+    if ($counterSize -ne 288) {
+        throw "Protocol self-test failed: Counters size is $counterSize, expected 288."
     }
 
-    Write-Host "StateRAMH3B query protocol self-test: PASS (Command=8, Counters=264)"
+    Write-Host "StateRAMH3B query protocol self-test: PASS (Command=8, Counters=288)"
     exit 0
 }
 
@@ -169,6 +172,9 @@ try {
         NewSystemBufComparisons = $reply.NewSystemBufferComparisons
         NewSystemBufMismatches  = $reply.NewSystemBufferMismatches
         DynamicPagefileDiscovery = $reply.DynamicPagefileDiscoveries
+        ConcurrentOverlapSkips   = $reply.ConcurrentOverlapSkips
+        DroppedInflightRecords   = $reply.DroppedInflightRecords
+        DroppedInflightOutstanding = $reply.DroppedInflightOutstanding
     } | Format-List
 }
 finally {
