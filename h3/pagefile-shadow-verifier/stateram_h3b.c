@@ -1853,10 +1853,19 @@ DriverEntry (
     KeInitializeSpinLock(&g_PagefileLock);
     KeInitializeSpinLock(&g_ShadowLock);
 
+    /*
+     * ExAllocatePool2 would remove the deprecation warning in newer WDKs, but
+     * it is not available on the target Windows 10 1909 build.  Keep the
+     * legacy allocator deliberately for target compatibility and suppress
+     * only this one WDK deprecation warning.
+     */
+#pragma warning(push)
+#pragma warning(disable:4996)
     g_ShadowTable = (PH3B_SHADOW_ENTRY)ExAllocatePoolWithTag(
         NonPagedPoolNx,
         sizeof(H3B_SHADOW_ENTRY) * H3B_SHADOW_SLOTS,
         H3B_POOL_TAG);
+#pragma warning(pop)
 
     if (g_ShadowTable == NULL)
     {
