@@ -1,0 +1,68 @@
+name: StateRAM H3-B pagefile read pressure harness
+
+on:
+  push:
+    branches:
+      - h3-pagefile-shadow-history
+    paths:
+      - "h3/pagefile-read-pressure/**"
+      - ".github/workflows/stateram-h3b-pressure.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Locate MSVC
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found" }
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ([string]::IsNullOrWhiteSpace($vs)) { throw "MSVC installation not found" }
+          "VSINSTALL=$vs" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build x64 harness
+        shell: pwsh
+        run: |
+          $src = "h3\pagefile-read-pressure\StateRAMH3BPressure.cpp"
+          $out = "h3\pagefile-read-pressure\StateRAMH3BPressure.exe"
+          $devcmd = Join-Path $env:VSINSTALL "Common7\Tools\VsDevCmd.bat"
+          $cmd = '"' + $devcmd + '" -arch=x64 -host_arch=x64 && cl.exe /nologo /std:c++17 /O2 /W4 /WX /EHsc /MT /DUNICODE /D_UNICODE "' + $src + '" /Fe:"' + $out + '"'
+          cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw "cl.exe failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path $out)) { throw "Expected executable was not produced" }
+
+      - name: Run harness self-test
+        shell: pwsh
+        run: |
+          & "h3\pagefile-read-pressure\StateRAMH3BPressure.exe" --selftest
+          if ($LASTEXITCODE -ne 0) { throw "Harness self-test failed with exit code $LASTEXITCODE" }
+
+      - name: Stage package and hashes
+        shell: pwsh
+        run: |
+          $root = "h3\pagefile-read-pressure"
+          $package = "$root\package"
+          New-Item -ItemType Directory -Path $package -Force | Out-Null
+          Copy-Item "$root\StateRAMH3BPressure.exe" "$package\StateRAMH3BPressure.exe" -Force
+          Copy-Item "$root\README.md" "$package\README.md" -Force
+          $exeHash = (Get-FileHash "$package\StateRAMH3BPressure.exe" -Algorithm SHA256).Hash
+          $exeSize = (Get-Item "$package\StateRAMH3BPressure.exe").Length
+          Write-Host "PRESSURE_EXE_SHA256=$exeHash"
+          Write-Host "PRESSURE_EXE_SIZE=$exeSize"
+          @("PRESSURE_EXE_SHA256=$exeHash", "PRESSURE_EXE_SIZE=$exeSize") | Out-File "$package\StateRAMH3BPressure-SHA256.txt" -Encoding ascii
+
+      - name: Upload pressure harness
+        uses: actions/upload-artifact@v4
+        with:
+          name: StateRAM-H3B-pagefile-read-pressure
+          path: h3/pagefile-read-pressure/package/*
+          if-no-files-found: error
