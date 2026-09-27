@@ -82,6 +82,25 @@ ShvUtilAdjustMsr (
     _In_ UINT32 DesiredValue
     );
 
+UINT64
+ShvH2HashBuffer (
+    _In_reads_bytes_(Length) const UINT8* Buffer,
+    _In_ UINT32 Length
+    );
+
+UINT8
+ShvH2CompressPage (
+    _In_ UINT32 PageIndex,
+    _In_reads_bytes_(PAGE_SIZE) const UINT8* Source,
+    _Out_ UINT32* CompressedLength
+    );
+
+UINT8
+ShvH2DecompressPage (
+    _In_ UINT32 PageIndex,
+    _Out_writes_bytes_(PAGE_SIZE) UINT8* Destination
+    );
+
 PSHV_VP_DATA
 ShvVpAllocateData (
     _In_ UINT32 CpuCount
@@ -202,4 +221,17 @@ extern volatile long ShvH1DResetCount;
 extern volatile long ShvH1DInveptCount;
 extern volatile long ShvH1DInveptFailureCount;
 extern volatile long ShvH1DCompletedCycles;
+
+extern UINT64 ShvH2CachePageVirtualAddress;
+extern UINT64 ShvH2CachePagePhysicalAddress;
+extern UINT64 ShvH2StorePageVirtualAddresses[H2A_STORE_PAGE_COUNT];
+extern UINT32 ShvH2CompressedLength[H2A_PAGE_COUNT];
+extern UINT64 ShvH2PageHash[H2A_PAGE_COUNT];
+extern volatile long ShvH2PageInCount;
+extern volatile long ShvH2EvictionCount;
+extern volatile long ShvH2CompressionCount;
+extern volatile long ShvH2DecompressionCount;
+extern volatile long ShvH2HashFailureCount;
+extern volatile long ShvH2CompletedTouches;
+extern volatile long ShvH2FlushCount;
 
