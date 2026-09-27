@@ -93,272 +93,338 @@ ShvOsGetPhysicalAddress (
     );
 
 PVOID g_PowerCallbackRegistration;
-PVOID g_H1TargetPages[H1D_PAGE_COUNT];
-PVOID g_H1BackingPages[H1D_PAGE_COUNT];
+PVOID g_H2TargetPages[H2A_PAGE_COUNT];
+PVOID g_H2CachePage;
+PVOID g_H2StorePages[H2A_STORE_PAGE_COUNT];
+UCHAR g_H2InitialMarker[H2A_PAGE_COUNT];
 
-#define H1D_WRITE_XOR 0x5A
+#define H2A_POISON_BYTE 0xCC
+#define H2A_MARKER_BASE 3072
+
+ULONG
+ShvH2MarkerOffset (
+    _In_ ULONG PageIndex
+    )
+{
+    return H2A_MARKER_BASE + (PageIndex * 37);
+}
 
 VOID
-ShvH1FreePages (
+ShvH2FreePages (
     VOID
     )
 {
     ULONG i;
 
-    for (i = 0; i < H1D_PAGE_COUNT; i++)
+    if (g_H2CachePage != NULL)
     {
-        if (g_H1BackingPages[i] != NULL)
+        ShvOsFreeContiguousAlignedMemory(g_H2CachePage);
+        g_H2CachePage = NULL;
+    }
+
+    ShvH2CachePageVirtualAddress = 0;
+    ShvH2CachePagePhysicalAddress = 0;
+
+    for (i = 0; i < H2A_STORE_PAGE_COUNT; i++)
+    {
+        if (g_H2StorePages[i] != NULL)
         {
-            ShvOsFreeContiguousAlignedMemory(g_H1BackingPages[i]);
-            g_H1BackingPages[i] = NULL;
+            ShvOsFreeContiguousAlignedMemory(g_H2StorePages[i]);
+            g_H2StorePages[i] = NULL;
         }
 
-        if (g_H1TargetPages[i] != NULL)
+        ShvH2StorePageVirtualAddresses[i] = 0;
+    }
+
+    for (i = 0; i < H2A_PAGE_COUNT; i++)
+    {
+        if (g_H2TargetPages[i] != NULL)
         {
-            ShvOsFreeContiguousAlignedMemory(g_H1TargetPages[i]);
-            g_H1TargetPages[i] = NULL;
+            ShvOsFreeContiguousAlignedMemory(g_H2TargetPages[i]);
+            g_H2TargetPages[i] = NULL;
         }
 
         ShvH1TargetPageVirtualAddresses[i] = 0;
-        ShvH1BackingPageVirtualAddresses[i] = 0;
         ShvH1TargetPagePhysicalAddresses[i] = 0;
+        ShvH1BackingPageVirtualAddresses[i] = 0;
         ShvH1BackingPagePhysicalAddresses[i] = 0;
+        ShvH2CompressedLength[i] = 0;
+        ShvH2PageHash[i] = 0;
+        g_H2InitialMarker[i] = 0;
     }
 }
 
 NTSTATUS
-ShvH1PreparePages (
+ShvH2PreparePages (
     VOID
     )
 {
     ULONG i;
     ULONG j;
+    ULONG block;
+    ULONG within;
+    ULONG markerOffset;
+    ULONG totalCompressed;
+    UINT32 compressedLength;
+    UINT64 hash;
     PUCHAR targetBytes;
-    PUCHAR backingBytes;
+    PUCHAR cacheBytes;
 
-    for (i = 0; i < H1D_PAGE_COUNT; i++)
+    //
+    // Allocate the exact retained H2-A backing geometry: three compressed
+    // store pages plus one hot materialization cache page.
+    //
+    for (i = 0; i < H2A_STORE_PAGE_COUNT; i++)
     {
-        g_H1TargetPages[i] =
+        g_H2StorePages[i] =
             ShvOsAllocateContigousAlignedMemory(PAGE_SIZE);
-        if (g_H1TargetPages[i] == NULL)
+        if (g_H2StorePages[i] == NULL)
         {
-            ShvH1FreePages();
+            ShvH2FreePages();
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
-        g_H1BackingPages[i] =
+        RtlZeroMemory(g_H2StorePages[i], PAGE_SIZE);
+        ShvH2StorePageVirtualAddresses[i] =
+            (UINT64)(ULONG_PTR)g_H2StorePages[i];
+    }
+
+    g_H2CachePage =
+        ShvOsAllocateContigousAlignedMemory(PAGE_SIZE);
+    if (g_H2CachePage == NULL)
+    {
+        ShvH2FreePages();
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    ShvH2CachePageVirtualAddress =
+        (UINT64)(ULONG_PTR)g_H2CachePage;
+    ShvH2CachePagePhysicalAddress =
+        ShvOsGetPhysicalAddress(g_H2CachePage);
+
+    if (ShvH2CachePagePhysicalAddress == 0)
+    {
+        ShvH2FreePages();
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    cacheBytes = (PUCHAR)g_H2CachePage;
+    totalCompressed = 0;
+
+    for (i = 0; i < H2A_PAGE_COUNT; i++)
+    {
+        g_H2TargetPages[i] =
             ShvOsAllocateContigousAlignedMemory(PAGE_SIZE);
-        if (g_H1BackingPages[i] == NULL)
+        if (g_H2TargetPages[i] == NULL)
         {
-            ShvH1FreePages();
+            ShvH2FreePages();
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
-        targetBytes = (PUCHAR)g_H1TargetPages[i];
-        backingBytes = (PUCHAR)g_H1BackingPages[i];
+        targetBytes = (PUCHAR)g_H2TargetPages[i];
 
+        //
+        // Build a nontrivial but compressible 4KB page: every 64-byte block
+        // contains a 48-byte run followed by 16 deterministic literal bytes.
+        // This is intentionally more demanding than an all-zero synthetic page.
+        //
         for (j = 0; j < PAGE_SIZE; j++)
         {
-            targetBytes[j] =
-                (UCHAR)(((j * 131u) + (i * 29u) + 0x5Du) & 0xFFu);
-            backingBytes[j] = targetBytes[j];
+            block = j >> 6;
+            within = j & 63;
+
+            if (within < 48)
+            {
+                targetBytes[j] =
+                    (UCHAR)(0x20 +
+                            ((i * 13u + block * 7u) & 0x5Fu));
+            }
+            else
+            {
+                targetBytes[j] =
+                    (UCHAR)(((j * 131u) +
+                             (i * 29u) +
+                             (block * 17u) +
+                             0x5Du) & 0xFFu);
+            }
         }
+
+        markerOffset = ShvH2MarkerOffset(i);
+        g_H2InitialMarker[i] = targetBytes[markerOffset];
 
         ShvH1TargetPageVirtualAddresses[i] =
-            (UINT64)(ULONG_PTR)g_H1TargetPages[i];
-        ShvH1BackingPageVirtualAddresses[i] =
-            (UINT64)(ULONG_PTR)g_H1BackingPages[i];
+            (UINT64)(ULONG_PTR)g_H2TargetPages[i];
         ShvH1TargetPagePhysicalAddresses[i] =
-            ShvOsGetPhysicalAddress(g_H1TargetPages[i]);
-        ShvH1BackingPagePhysicalAddresses[i] =
-            ShvOsGetPhysicalAddress(g_H1BackingPages[i]);
+            ShvOsGetPhysicalAddress(g_H2TargetPages[i]);
 
         if ((ShvH1TargetPagePhysicalAddresses[i] == 0) ||
-            (ShvH1BackingPagePhysicalAddresses[i] == 0) ||
             (ShvH1TargetPagePhysicalAddresses[i] ==
-             ShvH1BackingPagePhysicalAddresses[i]))
+             ShvH2CachePagePhysicalAddress))
         {
-            ShvH1FreePages();
+            ShvH2FreePages();
             return STATUS_UNSUCCESSFUL;
         }
+
+        hash = ShvH2HashBuffer(targetBytes, PAGE_SIZE);
+        compressedLength = 0;
+
+        if (ShvH2CompressPage(i,
+                              targetBytes,
+                              &compressedLength) == FALSE)
+        {
+            ShvH2FreePages();
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+
+        ShvH2CompressedLength[i] = compressedLength;
+        ShvH2PageHash[i] = hash;
+        totalCompressed += compressedLength;
+
+        //
+        // Immediately decode and hash-check each initial slot before VMX is
+        // started. This validates the codec/store path independently.
+        //
+        RtlFillMemory(cacheBytes, PAGE_SIZE, H2A_POISON_BYTE);
+        if ((ShvH2DecompressPage(i, cacheBytes) == FALSE) ||
+            (ShvH2HashBuffer(cacheBytes, PAGE_SIZE) != hash))
+        {
+            ShvH2FreePages();
+            return STATUS_DATA_ERROR;
+        }
+
+        //
+        // Destroy the original payload. From this point forward the compressed
+        // store is the authoritative copy until the page is demand-materialized
+        // into the one shared cache frame.
+        //
+        RtlFillMemory(targetBytes, PAGE_SIZE, H2A_POISON_BYTE);
     }
+
+    //
+    // H2-A's compressed payload must fit in the exact three-page store. With
+    // the one hot cache page, retained backing is exactly 16KB versus 32KB for
+    // eight full 4KB backing pages. The eight target GPA frames remain allocated
+    // in this controlled milestone and are NOT counted as freed Windows RAM.
+    //
+    if ((totalCompressed == 0) ||
+        (totalCompressed > (H2A_STORE_PAGE_COUNT * PAGE_SIZE)) ||
+        ((H2A_STORE_PAGE_COUNT + 1) >= H2A_PAGE_COUNT))
+    {
+        ShvH2FreePages();
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    RtlFillMemory(g_H2CachePage, PAGE_SIZE, H2A_POISON_BYTE);
 
     ShvH0EptTrapCount = 0;
     ShvH0LastGuestPhysicalAddress = 0;
     ShvH0LastExitQualification = 0;
-    ShvH1RemapCount = 0;
-    ShvH1WriteTrapCount = 0;
-    ShvH1DetachedFrameVerifiedCount = 0;
-    ShvH1DResetCount = 0;
     ShvH1DInveptCount = 0;
     ShvH1DInveptFailureCount = 0;
-    ShvH1DCompletedCycles = 0;
+    ShvH2PageInCount = 0;
+    ShvH2EvictionCount = 0;
+    ShvH2CompressionCount = 0;
+    ShvH2DecompressionCount = 0;
+    ShvH2HashFailureCount = 0;
+    ShvH2CompletedTouches = 0;
+    ShvH2FlushCount = 0;
 
     return STATUS_SUCCESS;
 }
 
 BOOLEAN
-ShvH1DRunCycles (
+ShvH2RunCompressionHarness (
     VOID
     )
 {
     BOOLEAN result;
     INT32 cpuInfo[4];
-    INT32 cpuCount;
-    INT32 cpu;
-    ULONG cycle;
-    ULONG sequence;
+    ULONG round;
     ULONG targetIndex;
-    ULONG offset;
-    ULONG offset2;
-    SIZE_T matched;
+    ULONG markerOffset;
+    ULONG totalCompressed;
+    ULONG expectedPageIns;
+    ULONG expectedEvictions;
     KAFFINITY previousAffinity;
-    UCHAR oldByte;
-    UCHAR newByte;
-    UCHAR oldByte2;
-    UCHAR newByte2;
-    long trapBefore;
-    long remapBefore;
-    long writeBefore;
-    long detachedBefore;
-    long failureBefore;
+    UCHAR marker;
+    UCHAR newMarker;
+    UCHAR expectedMarker[H2A_PAGE_COUNT];
+    UINT64 hash;
+    UINT64 expectedHash[H2A_PAGE_COUNT];
 
     result = TRUE;
-    cpuCount = (INT32)KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
 
-    if ((cpuCount <= 0) ||
-        (cpuCount > (INT32)(sizeof(KAFFINITY) * 8)))
+    for (targetIndex = 0;
+         targetIndex < H2A_PAGE_COUNT;
+         targetIndex++)
     {
-        return FALSE;
+        expectedMarker[targetIndex] =
+            g_H2InitialMarker[targetIndex];
+        expectedHash[targetIndex] =
+            ShvH2PageHash[targetIndex];
     }
 
     //
-    // Exercise every logical processor separately. Each VP owns a distinct
-    // EPT hierarchy and EPTP, so every CPU must pass the live-remap path.
+    // H2-A deliberately serializes the controlled cache experiment on CPU 0.
+    // Multi-CPU cache coherence belongs to the later Windows-integration gate.
     //
-    for (cpu = 0; cpu < cpuCount; cpu++)
+    previousAffinity = KeSetSystemAffinityThreadEx((KAFFINITY)1);
+
+    for (round = 0; round < H2A_ROUNDS; round++)
     {
-        previousAffinity =
-            KeSetSystemAffinityThreadEx(((KAFFINITY)1) << cpu);
-
-        for (cycle = 0; cycle < H1D_CYCLES_PER_CPU; cycle++)
+        for (targetIndex = 0;
+             targetIndex < H2A_PAGE_COUNT;
+             targetIndex++)
         {
-            sequence =
-                ((ULONG)cpu * H1D_CYCLES_PER_CPU) + cycle;
+            markerOffset = ShvH2MarkerOffset(targetIndex);
 
-            trapBefore = ShvH0EptTrapCount;
-            remapBefore = ShvH1RemapCount;
-            writeBefore = ShvH1WriteTrapCount;
-            detachedBefore = ShvH1DetachedFrameVerifiedCount;
-            failureBefore = ShvH1DInveptFailureCount;
+            //
+            // This first byte access faults if the logical page is cold. VMX
+            // root evicts/compresses the old page, decompresses this page into
+            // the single cache HPA, remaps the GPA, and retries this read.
+            //
+            marker = *(volatile UCHAR*)
+                ((PUCHAR)g_H2TargetPages[targetIndex] +
+                 markerOffset);
 
-            __cpuidex(cpuInfo,
-                      H1D_CPUID_RESET_LEAF,
-                      (INT32)sequence);
-
-            if ((UINT32)cpuInfo[0] != H1D_CPUID_RESET_OK)
+            if (marker != expectedMarker[targetIndex])
             {
                 result = FALSE;
                 break;
             }
 
-            targetIndex = (ULONG)(UINT32)cpuInfo[1];
-            if (targetIndex >= H1D_PAGE_COUNT)
-            {
-                result = FALSE;
-                break;
-            }
-
-            //
-            // Full-page compare generates the first EPT violation, remaps the
-            // same GPA to backing HPA B, and then continues transparently.
-            //
-            matched =
-                RtlCompareMemory(g_H1TargetPages[targetIndex],
-                                 g_H1BackingPages[targetIndex],
-                                 PAGE_SIZE);
-            if (matched != PAGE_SIZE)
+            hash =
+                ShvH2HashBuffer(
+                    (PUCHAR)g_H2TargetPages[targetIndex],
+                    PAGE_SIZE);
+            if (hash != expectedHash[targetIndex])
             {
                 result = FALSE;
                 break;
             }
 
             //
-            // First write: second EPT violation. Root mode independently
-            // overwrites/verifies detached HPA A, then retries this write on B.
+            // Dirty the resident logical page. The next different page fault
+            // must recompress this modified full 4KB image before reusing the
+            // cache frame.
             //
-            offset =
-                ((sequence * 977u) + 1379u) & (PAGE_SIZE - 1);
-            oldByte =
-                ((PUCHAR)g_H1BackingPages[targetIndex])[offset];
-            newByte = oldByte ^ H1D_WRITE_XOR;
+            newMarker =
+                (UCHAR)(marker ^
+                        (UCHAR)(0x31u +
+                                ((round + targetIndex) & 0x1Fu)));
 
             *(volatile UCHAR*)
-                ((PUCHAR)g_H1TargetPages[targetIndex] + offset) =
-                    newByte;
+                ((PUCHAR)g_H2TargetPages[targetIndex] +
+                 markerOffset) = newMarker;
 
-            if ((((PUCHAR)g_H1TargetPages[targetIndex])[offset] !=
-                 newByte) ||
-                (((PUCHAR)g_H1BackingPages[targetIndex])[offset] !=
-                 newByte))
-            {
-                result = FALSE;
-                break;
-            }
+            expectedMarker[targetIndex] = newMarker;
+            expectedHash[targetIndex] =
+                ShvH2HashBuffer(
+                    (PUCHAR)g_H2TargetPages[targetIndex],
+                    PAGE_SIZE);
 
-            //
-            // Second write should require no new semantic phase transition and
-            // must remain coherent through the already-remapped writable leaf.
-            //
-            offset2 =
-                ((sequence * 313u) + 257u) & (PAGE_SIZE - 1);
-            if (offset2 == offset)
-            {
-                offset2 = (offset2 + 1) & (PAGE_SIZE - 1);
-            }
-
-            oldByte2 =
-                ((PUCHAR)g_H1BackingPages[targetIndex])[offset2];
-            newByte2 = oldByte2 ^ (H1D_WRITE_XOR + 1);
-
-            *(volatile UCHAR*)
-                ((PUCHAR)g_H1TargetPages[targetIndex] + offset2) =
-                    newByte2;
-
-            if ((((PUCHAR)g_H1TargetPages[targetIndex])[offset2] !=
-                 newByte2) ||
-                (((PUCHAR)g_H1BackingPages[targetIndex])[offset2] !=
-                 newByte2))
-            {
-                result = FALSE;
-                break;
-            }
-
-            matched =
-                RtlCompareMemory(g_H1TargetPages[targetIndex],
-                                 g_H1BackingPages[targetIndex],
-                                 PAGE_SIZE);
-            if (matched != PAGE_SIZE)
-            {
-                result = FALSE;
-                break;
-            }
-
-            if ((ShvH1RemapCount != (remapBefore + 1)) ||
-                (ShvH1WriteTrapCount != (writeBefore + 1)) ||
-                (ShvH1DetachedFrameVerifiedCount !=
-                 (detachedBefore + 1)) ||
-                (ShvH0EptTrapCount < (trapBefore + 2)) ||
-                (ShvH1DInveptFailureCount != failureBefore))
-            {
-                result = FALSE;
-                break;
-            }
-
-            _InterlockedIncrement(&ShvH1DCompletedCycles);
+            _InterlockedIncrement(&ShvH2CompletedTouches);
         }
-
-        KeRevertToUserAffinityThreadEx(previousAffinity);
 
         if (result == FALSE)
         {
@@ -366,27 +432,112 @@ ShvH1DRunCycles (
         }
     }
 
+    //
+    // Force the final hot page back into compressed storage so all eight
+    // logical pages are cold and represented only by their packed slots.
+    //
     if (result != FALSE)
     {
-        long expectedCycles;
-
-        expectedCycles =
-            ((long)cpuCount) * H1D_CYCLES_PER_CPU;
-
-        if ((ShvH1DCompletedCycles != expectedCycles) ||
-            (ShvH1DResetCount != expectedCycles) ||
-            (ShvH1RemapCount != expectedCycles) ||
-            (ShvH1WriteTrapCount != expectedCycles) ||
-            (ShvH1DetachedFrameVerifiedCount != expectedCycles) ||
-            (ShvH0EptTrapCount < (expectedCycles * 2)) ||
-            (ShvH1DInveptCount < (expectedCycles * 3)) ||
-            (ShvH1DInveptFailureCount != 0))
+        __cpuidex(cpuInfo, H2A_CPUID_FLUSH_LEAF, 0);
+        if ((UINT32)cpuInfo[0] != H2A_CPUID_FLUSH_OK)
         {
             result = FALSE;
         }
     }
 
-    return result;
+    //
+    // Final byte-for-byte integrity pass after all repeated dirty
+    // compress/decompress cycles.
+    //
+    if (result != FALSE)
+    {
+        for (targetIndex = 0;
+             targetIndex < H2A_PAGE_COUNT;
+             targetIndex++)
+        {
+            markerOffset = ShvH2MarkerOffset(targetIndex);
+            marker = *(volatile UCHAR*)
+                ((PUCHAR)g_H2TargetPages[targetIndex] +
+                 markerOffset);
+
+            if (marker != expectedMarker[targetIndex])
+            {
+                result = FALSE;
+                break;
+            }
+
+            hash =
+                ShvH2HashBuffer(
+                    (PUCHAR)g_H2TargetPages[targetIndex],
+                    PAGE_SIZE);
+            if (hash != expectedHash[targetIndex])
+            {
+                result = FALSE;
+                break;
+            }
+        }
+    }
+
+    if (result != FALSE)
+    {
+        __cpuidex(cpuInfo, H2A_CPUID_FLUSH_LEAF, 0);
+        if ((UINT32)cpuInfo[0] != H2A_CPUID_FLUSH_OK)
+        {
+            result = FALSE;
+        }
+    }
+
+    KeRevertToUserAffinityThreadEx(previousAffinity);
+
+    if (result == FALSE)
+    {
+        return FALSE;
+    }
+
+    expectedPageIns =
+        (H2A_ROUNDS * H2A_PAGE_COUNT) +
+        H2A_PAGE_COUNT;
+    expectedEvictions = expectedPageIns;
+
+    if ((ShvH2PageInCount != (long)expectedPageIns) ||
+        (ShvH2DecompressionCount != (long)expectedPageIns) ||
+        (ShvH2EvictionCount != (long)expectedEvictions) ||
+        (ShvH2CompressionCount != (long)expectedEvictions) ||
+        (ShvH2CompletedTouches !=
+         (long)(H2A_ROUNDS * H2A_PAGE_COUNT)) ||
+        (ShvH2FlushCount != 2) ||
+        (ShvH2HashFailureCount != 0) ||
+        (ShvH1DInveptFailureCount != 0) ||
+        (ShvH0EptTrapCount < (long)expectedPageIns) ||
+        (ShvH1DInveptCount <
+         (long)(expectedPageIns + expectedEvictions)))
+    {
+        return FALSE;
+    }
+
+    totalCompressed = 0;
+    for (targetIndex = 0;
+         targetIndex < H2A_PAGE_COUNT;
+         targetIndex++)
+    {
+        if ((ShvH2CompressedLength[targetIndex] == 0) ||
+            (ShvH2CompressedLength[targetIndex] >
+             H2A_SLOT_SIZE))
+        {
+            return FALSE;
+        }
+
+        totalCompressed +=
+            ShvH2CompressedLength[targetIndex];
+    }
+
+    if (totalCompressed >
+        (H2A_STORE_PAGE_COUNT * PAGE_SIZE))
+    {
+        return FALSE;
+    }
+
+    return TRUE;
 }
 
 
@@ -669,10 +820,10 @@ DriverUnload (
     ExUnregisterCallback(g_PowerCallbackRegistration);
 
     //
-    // Unload the hypervisor before releasing the private H1-D page pool.
+    // Unload the hypervisor before releasing the private H2-A page pool.
     //
     ShvUnload();
-    ShvH1FreePages();
+    ShvH2FreePages();
 }
 
 NTSTATUS
@@ -682,6 +833,8 @@ DriverEntry (
     )
 {
     NTSTATUS status;
+    ULONG i;
+    ULONG totalCompressed;
     PCALLBACK_OBJECT callbackObject;
     UNICODE_STRING callbackName =
         RTL_CONSTANT_STRING(L"\\Callback\\PowerState");
@@ -692,11 +845,11 @@ DriverEntry (
     UNREFERENCED_PARAMETER(RegistryPath);
 
     //
-    // H1-D owns eight private target pages plus eight private backing pages.
-    // All allocations are page-sized; no application or ordinary Windows page
-    // is used by this controlled repeated-reclamation milestone.
+    // H2-A owns eight private target GPA frames, exactly three compressed-store
+    // pages, and one shared hot cache frame. It proves compressed backing and
+    // demand restoration without touching application/ordinary Windows pages.
     //
-    status = ShvH1PreparePages();
+    status = ShvH2PreparePages();
     if (!NT_SUCCESS(status))
     {
         return status;
@@ -713,7 +866,7 @@ DriverEntry (
     status = ExCreateCallback(&callbackObject, &objectAttributes, FALSE, TRUE);
     if (!NT_SUCCESS(status))
     {
-        ShvH1FreePages();
+        ShvH2FreePages();
         return status;
     }
 
@@ -736,7 +889,7 @@ DriverEntry (
     //
     if (g_PowerCallbackRegistration == NULL)
     {
-        ShvH1FreePages();
+        ShvH2FreePages();
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -752,34 +905,45 @@ DriverEntry (
     if (!NT_SUCCESS(status))
     {
         ExUnregisterCallback(g_PowerCallbackRegistration);
-        ShvH1FreePages();
+        ShvH2FreePages();
         return status;
     }
 
     //
-    // H1-D runs hundreds of complete reset -> trap -> remap -> detached-frame
-    // reuse -> write -> verify cycles on every logical processor, rotating
-    // across eight independent target/backing page pairs.
+    // H2-A repeatedly cycles all eight logical pages through one 4KB hot cache.
+    // Cold contents live in three physical compressed-store pages, with
+    // full-page hashes checked across every compress/decompress transition.
     //
-    if (ShvH1DRunCycles() == FALSE)
+    if (ShvH2RunCompressionHarness() == FALSE)
     {
         ShvUnload();
         ExUnregisterCallback(g_PowerCallbackRegistration);
-        ShvH1FreePages();
+        ShvH2FreePages();
         return STATUS_UNSUCCESSFUL;
     }
 
-    ShvOsDebugPrint("H1-D PASS: cycles=%ld resets=%ld traps=%ld remaps=%ld write_traps=%ld detached_verified=%ld invept=%ld invept_fail=%ld last_GPA=0x%llX qualification=0x%llX\n",
-                    ShvH1DCompletedCycles,
-                    ShvH1DResetCount,
+    totalCompressed = 0;
+    for (i = 0; i < H2A_PAGE_COUNT; i++)
+    {
+        totalCompressed += ShvH2CompressedLength[i];
+    }
+
+    ShvOsDebugPrint("H2-A PASS: logical_backing=%lu store_reserved=%lu cache=%lu retained_backing=%lu payload=%lu pageins=%ld evictions=%ld compressions=%ld decompressions=%ld touches=%ld flushes=%ld traps=%ld invept=%ld invept_fail=%ld hash_fail=%ld\n",
+                    (ULONG)(H2A_PAGE_COUNT * PAGE_SIZE),
+                    (ULONG)(H2A_STORE_PAGE_COUNT * PAGE_SIZE),
+                    (ULONG)PAGE_SIZE,
+                    (ULONG)((H2A_STORE_PAGE_COUNT + 1) * PAGE_SIZE),
+                    totalCompressed,
+                    ShvH2PageInCount,
+                    ShvH2EvictionCount,
+                    ShvH2CompressionCount,
+                    ShvH2DecompressionCount,
+                    ShvH2CompletedTouches,
+                    ShvH2FlushCount,
                     ShvH0EptTrapCount,
-                    ShvH1RemapCount,
-                    ShvH1WriteTrapCount,
-                    ShvH1DetachedFrameVerifiedCount,
                     ShvH1DInveptCount,
                     ShvH1DInveptFailureCount,
-                    ShvH0LastGuestPhysicalAddress,
-                    ShvH0LastExitQualification);
+                    ShvH2HashFailureCount);
 
     return STATUS_SUCCESS;
 }

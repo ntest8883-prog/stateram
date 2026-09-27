@@ -37,6 +37,19 @@ volatile long ShvH1DInveptCount;
 volatile long ShvH1DInveptFailureCount;
 volatile long ShvH1DCompletedCycles;
 
+UINT64 ShvH2CachePageVirtualAddress;
+UINT64 ShvH2CachePagePhysicalAddress;
+UINT64 ShvH2StorePageVirtualAddresses[H2A_STORE_PAGE_COUNT];
+UINT32 ShvH2CompressedLength[H2A_PAGE_COUNT];
+UINT64 ShvH2PageHash[H2A_PAGE_COUNT];
+volatile long ShvH2PageInCount;
+volatile long ShvH2EvictionCount;
+volatile long ShvH2CompressionCount;
+volatile long ShvH2DecompressionCount;
+volatile long ShvH2HashFailureCount;
+volatile long ShvH2CompletedTouches;
+volatile long ShvH2FlushCount;
+
 VOID
 ShvUnload (
     VOID
