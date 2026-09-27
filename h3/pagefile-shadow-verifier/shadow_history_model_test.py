@@ -364,7 +364,6 @@ def main() -> None:
     assert h.read("C", 60 * PAGE, page(6)) == "match"
 
     # 17. A dropped in-flight write on C must not block independent D tracking.
-    h.aliases = {} if hasattr(h, "aliases") else None
     d2 = h.begin_write("D", 0, PAGE)
     h.complete_write("D", d2, {0: page(5)})
     assert h.read("D", 0, page(5)) == "match"
