@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <wchar.h>
 #include <vector>
+#include <string>
 #include <algorithm>
 
 static const wchar_t* kPortName = L"\\StateRAMH3BPort";
