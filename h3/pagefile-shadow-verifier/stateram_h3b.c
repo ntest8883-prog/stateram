@@ -455,11 +455,12 @@ H3BRecordWriteRange (
     _In_ PFILE_OBJECT FileObject,
     _In_ LONGLONG ByteOffset,
     _In_ ULONG Length,
-    _Out_ PULONGLONG Sequence
+    _Out_ PULONGLONG Sequence,
+    _Out_ PULONG IdentityIndex
     )
 {
     KIRQL oldIrql;
-    LONG index;
+    ULONG identityIndex;
     PH3B_PAGEFILE_STATE state;
     PH3B_WRITE_RANGE record;
     ULONGLONG start;
@@ -492,14 +493,15 @@ H3BRecordWriteRange (
 
     KeAcquireSpinLock(&g_PagefileLock, &oldIrql);
 
-    index = H3BFindPagefileIndexLocked(FileObject);
-    if (index < 0)
+    if (!H3BGetIdentityIndexForObjectLocked(
+            FileObject,
+            &identityIndex))
     {
         KeReleaseSpinLock(&g_PagefileLock, oldIrql);
         return FALSE;
     }
 
-    state = &g_Pagefiles[index];
+    state = &g_PagefileIdentities[identityIndex];
 
     if (state->HistoryCount == H3B_WRITE_HISTORY_SLOTS)
     {
@@ -530,20 +532,20 @@ H3BRecordWriteRange (
     KeReleaseSpinLock(&g_PagefileLock, oldIrql);
 
     *Sequence = sequence;
+    *IdentityIndex = identityIndex;
     return TRUE;
 }
 
 static
 BOOLEAN
 H3BHistoryAllows (
-    _In_ PFILE_OBJECT FileObject,
+    _In_ ULONG IdentityIndex,
     _In_ ULONGLONG PageOffset,
     _In_ ULONGLONG Sequence,
     _Out_opt_ PULONG Generation
     )
 {
     KIRQL oldIrql;
-    LONG index;
     PH3B_PAGEFILE_STATE state;
     ULONG i;
     BOOLEAN foundOwn;
@@ -554,16 +556,20 @@ H3BHistoryAllows (
     newerOverlap = FALSE;
     ownGeneration = 0;
 
+    if (IdentityIndex >= H3B_MAX_PAGEFILE_IDENTITIES)
+    {
+        return FALSE;
+    }
+
     KeAcquireSpinLock(&g_PagefileLock, &oldIrql);
 
-    index = H3BFindPagefileIndexLocked(FileObject);
-    if (index < 0)
+    state = &g_PagefileIdentities[IdentityIndex];
+
+    if (state->Instance == NULL)
     {
         KeReleaseSpinLock(&g_PagefileLock, oldIrql);
         return FALSE;
     }
-
-    state = &g_Pagefiles[index];
 
     if (Sequence <= state->HistoryFloor)
     {
@@ -635,15 +641,14 @@ H3BHashPage (
 static
 ULONG
 H3BShadowIndex (
-    _In_ PFILE_OBJECT FileObject,
+    _In_ ULONG IdentityIndex,
     _In_ ULONGLONG Offset
     )
 {
     ULONGLONG value;
 
     value = (Offset >> PAGE_SHIFT);
-    value ^= ((ULONGLONG)(ULONG_PTR)FileObject >> 4);
-    value ^= ((ULONGLONG)(ULONG_PTR)FileObject >> 19);
+    value ^= ((ULONGLONG)IdentityIndex * 0x9E3779B97F4A7C15ULL);
     value ^= (value >> 17);
 
     return (ULONG)(value & (H3B_SHADOW_SLOTS - 1));
@@ -652,7 +657,8 @@ H3BShadowIndex (
 static
 BOOLEAN
 H3BStoreShadow (
-    _In_ PFILE_OBJECT FileObject,
+    _In_ ULONG IdentityIndex,
+    _In_ PFILE_OBJECT WriterFileObject,
     _In_ ULONGLONG Offset,
     _In_ ULONGLONG Hash1,
     _In_ ULONGLONG Hash2,
@@ -666,7 +672,7 @@ H3BStoreShadow (
     PH3B_SHADOW_ENTRY entry;
     BOOLEAN currentEntry;
 
-    index = H3BShadowIndex(FileObject, Offset);
+    index = H3BShadowIndex(IdentityIndex, Offset);
     generation = InterlockedCompareExchange(&g_ShadowGeneration, 0, 0);
 
     if ((ULONG)generation != WriteGeneration)
@@ -683,13 +689,14 @@ H3BStoreShadow (
     {
         InterlockedIncrement64(&g_ShadowTableEntries);
     }
-    else if ((entry->FileObject != FileObject) ||
+    else if ((entry->IdentityIndex != IdentityIndex) ||
              (entry->Offset != Offset))
     {
         InterlockedIncrement64(&g_ShadowReplacements);
     }
 
-    entry->FileObject = FileObject;
+    entry->IdentityIndex = IdentityIndex;
+    entry->WriterFileObject = WriterFileObject;
     entry->Offset = Offset;
     entry->Hash1 = Hash1;
     entry->Hash2 = Hash2;
@@ -703,11 +710,12 @@ H3BStoreShadow (
 static
 BOOLEAN
 H3BLookupShadow (
-    _In_ PFILE_OBJECT FileObject,
+    _In_ ULONG IdentityIndex,
     _In_ ULONGLONG Offset,
     _Out_ PULONGLONG Hash1,
     _Out_ PULONGLONG Hash2,
-    _Out_ PULONGLONG WriteSequence
+    _Out_ PULONGLONG WriteSequence,
+    _Out_ PFILE_OBJECT* WriterFileObject
     )
 {
     KIRQL oldIrql;
@@ -717,7 +725,7 @@ H3BLookupShadow (
     BOOLEAN found;
 
     found = FALSE;
-    index = H3BShadowIndex(FileObject, Offset);
+    index = H3BShadowIndex(IdentityIndex, Offset);
     generation = InterlockedCompareExchange(&g_ShadowGeneration, 0, 0);
 
     KeAcquireSpinLock(&g_ShadowLock, &oldIrql);
@@ -725,12 +733,13 @@ H3BLookupShadow (
     entry = &g_ShadowTable[index];
 
     if ((entry->Generation == (ULONG)generation) &&
-        (entry->FileObject == FileObject) &&
+        (entry->IdentityIndex == IdentityIndex) &&
         (entry->Offset == Offset))
     {
         *Hash1 = entry->Hash1;
         *Hash2 = entry->Hash2;
         *WriteSequence = entry->WriteSequence;
+        *WriterFileObject = entry->WriterFileObject;
         found = TRUE;
     }
 
@@ -745,6 +754,21 @@ H3BGetReadBuffer (
     )
 {
     PMDL mdl;
+
+    if (FlagOn(Data->Flags, FLTFL_CALLBACK_DATA_NEW_SYSTEM_BUFFER))
+    {
+        PVOID newSystemBuffer;
+
+        newSystemBuffer = FltGetNewSystemBufferAddress(Data);
+
+        if (newSystemBuffer != NULL)
+        {
+            InterlockedIncrement64(&g_ReadNewSystemBuffers);
+            return newSystemBuffer;
+        }
+
+        return NULL;
+    }
 
     mdl = Data->Iopb->Parameters.Read.MdlAddress;
 
