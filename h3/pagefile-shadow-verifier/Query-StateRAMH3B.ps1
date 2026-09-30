@@ -59,6 +59,16 @@ public static class StateRAMH3BNative
         public Int64 ConcurrentOverlapSkips;
         public Int64 DroppedInflightRecords;
         public Int64 DroppedInflightOutstanding;
+
+        public Int64 PayloadWritePages;
+        public Int64 PayloadReadPages;
+        public Int64 PayloadMatches;
+        public Int64 PayloadMismatches;
+        public Int64 PayloadReplacements;
+        public Int64 PayloadLookupMisses;
+        public Int64 PayloadCaptureSkipped;
+        public Int64 PayloadBufferUnavailable;
+        public Int64 PayloadCapacity;
     }
 
     [DllImport("fltlib.dll", CharSet = CharSet.Unicode)]
@@ -96,11 +106,11 @@ if ($SelfTest) {
         throw "Protocol self-test failed: Command size is $commandSize, expected 8."
     }
 
-    if ($counterSize -ne 288) {
-        throw "Protocol self-test failed: Counters size is $counterSize, expected 288."
+    if ($counterSize -ne 360) {
+        throw "Protocol self-test failed: Counters size is $counterSize, expected 360."
     }
 
-    Write-Host "StateRAMH3B query protocol self-test: PASS (Command=8, Counters=288)"
+    Write-Host "StateRAMH3B query protocol self-test: PASS (Command=8, Counters=360)"
     exit 0
 }
 
@@ -119,7 +129,7 @@ if ($hr -ne 0) {
 
 try {
     $cmd = New-Object StateRAMH3BNative+Command
-    $cmd.Version = 3
+    $cmd.Version = 4
     $cmd.CommandId = if ($Command -eq "reset") { 2 } else { 1 }
 
     $reply = New-Object StateRAMH3BNative+Counters
@@ -175,6 +185,16 @@ try {
         ConcurrentOverlapSkips   = $reply.ConcurrentOverlapSkips
         DroppedInflightRecords   = $reply.DroppedInflightRecords
         DroppedInflightOutstanding = $reply.DroppedInflightOutstanding
+
+        PayloadWritePages         = $reply.PayloadWritePages
+        PayloadReadPages          = $reply.PayloadReadPages
+        PayloadMatches            = $reply.PayloadMatches
+        PayloadMismatches         = $reply.PayloadMismatches
+        PayloadReplacements       = $reply.PayloadReplacements
+        PayloadLookupMisses       = $reply.PayloadLookupMisses
+        PayloadCaptureSkipped     = $reply.PayloadCaptureSkipped
+        PayloadBufferUnavailable  = $reply.PayloadBufferUnavailable
+        PayloadCapacity           = $reply.PayloadCapacity
     } | Format-List
 }
 finally {
