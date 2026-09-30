@@ -8,6 +8,7 @@ on:
       - h3-pagefile-shadow-history
       - h3-pagefile-shadow-canonical
       - h3-pagefile-shadow-b51
+      - h3-payload-mirror-c1
     paths:
       - "h3/pagefile-shadow-verifier/**"
       - ".github/workflows/stateram-h3b-shadow.yml"
