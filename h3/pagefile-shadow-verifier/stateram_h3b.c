@@ -1317,7 +1317,7 @@ H3BShadowCompletedWrite (
     if (!H3BHistoryAllowsPublish(
             identityIndex,
             baseOffset,
-            WriteSequence,
+            writeSequence,
             &writeGeneration))
     {
         InterlockedIncrement64(&g_ShadowPublishSkipped);
