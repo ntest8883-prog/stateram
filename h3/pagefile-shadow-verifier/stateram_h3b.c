@@ -1549,6 +1549,7 @@ H3BTryServeSinglePageRead (
     PH3B_PAYLOAD_ENTRY entry;
     BOOLEAN payloadFound;
     BOOLEAN copySucceeded;
+    BOOLEAN armConsumed;
 
     if (InterlockedCompareExchange(&g_InterventionArmed, 0, 0) != 1)
     {
@@ -1683,6 +1684,7 @@ H3BTryServeSinglePageRead (
     }
 
     copySucceeded = FALSE;
+    armConsumed = FALSE;
 
     /*
      * Final proof is performed while holding the pagefile-history lock.
@@ -1730,6 +1732,7 @@ H3BTryServeSinglePageRead (
             0,
             1) == 1))
     {
+        armConsumed = TRUE;
         InterlockedIncrement64(&g_InterventionEligible);
 
         __try
@@ -1761,7 +1764,7 @@ H3BTryServeSinglePageRead (
          * experiment disarmed and pass the request through.  The real
          * pagefile read will overwrite any partial destination bytes.
          */
-        if (InterlockedCompareExchange(&g_InterventionArmed, 0, 0) == 0)
+        if (armConsumed)
         {
             InterlockedIncrement64(&g_InterventionSafetyRejects);
         }
