@@ -985,6 +985,8 @@ static int ParentMode()
         bool stopForMismatch = false;
         bool targetCold = false;
         bool coldEvidenceReported = false;
+        bool armedDuringPressure = false;
+        bool servedDuringPressure = false;
         H3B_COUNTERS mid = before;
 
         /*
@@ -1095,16 +1097,55 @@ static int ParentMode()
                 const int64_t payloadMismatchDelta =
                     probe.PayloadMismatches - before.PayloadMismatches;
 
-                if ((payloadReadDelta > 0) &&
+                if (!armedDuringPressure &&
+                    targetCold &&
+                    (payloadReadDelta > 0) &&
                     (payloadMatchDelta > 0) &&
                     (payloadMismatchDelta == 0))
                 {
-                    wprintf(L"PRESSURE_STOP reason=PAYLOAD_ALREADY_MATCHED "
+                    H3B_COUNTERS armed = {};
+
+                    if (!SendH3BCommand(kCommandArm, armed) ||
+                        (armed.InterventionArmed != 1) ||
+                        (armed.InterventionEligible != 1) ||
+                        (armed.InterventionServedPages != before.InterventionServedPages) ||
+                        (armed.ShadowMismatches != before.ShadowMismatches) ||
+                        (armed.PayloadMismatches != before.PayloadMismatches))
+                    {
+                        fwprintf(stderr,
+                            L"PRESSURE_STOP reason=ARM_REJECTED eligible=%lld armed=%lld "
+                            L"served=%lld shadowMismatches=%lld payloadMismatches=%lld\n",
+                            armed.InterventionEligible,
+                            armed.InterventionArmed,
+                            armed.InterventionServedPages,
+                            armed.ShadowMismatches,
+                            armed.PayloadMismatches);
+                        stopForMismatch = true;
+                        break;
+                    }
+
+                    armedDuringPressure = true;
+                    mid = armed;
+
+                    wprintf(L"INTERVENTION_ARM_DURING_PRESSURE=PASS "
                             L"payloadReads=%lld payloadMatches=%lld allocated=%llu MiB\n",
                         payloadReadDelta,
                         payloadMatchDelta,
                         static_cast<unsigned long long>(allocatedMiB));
+
+                    continue;
+                }
+
+                if (armedDuringPressure &&
+                    (probe.InterventionServedPages > before.InterventionServedPages))
+                {
+                    servedDuringPressure = true;
                     stopForEvidence = true;
+                    wprintf(L"PRESSURE_STOP reason=INTERVENTION_SERVED "
+                            L"served=%lld attempts=%lld allocated=%llu MiB\n",
+                        probe.InterventionServedPages - before.InterventionServedPages,
+                        probe.InterventionAttempts - before.InterventionAttempts,
+                        static_cast<unsigned long long>(allocatedMiB));
                     break;
                 }
 
@@ -1250,35 +1291,51 @@ static int ParentMode()
             break;
         }
 
-        H3B_COUNTERS armed = {};
-        if (!SendH3BCommand(kCommandArm, armed))
-        {
-            fwprintf(stderr, L"RESULT=ABORT reason=ARM_COMMAND_FAILED\n");
-            result = 51;
-            break;
-        }
+        H3B_COUNTERS armed = mid;
 
-        if ((armed.InterventionArmed != 1) ||
-            (armed.InterventionEligible != 1) ||
-            (armed.InterventionServedPages != before.InterventionServedPages) ||
-            (armed.ShadowMismatches != before.ShadowMismatches) ||
-            (armed.PayloadMismatches != before.PayloadMismatches))
+        if (!servedDuringPressure)
         {
-            fwprintf(stderr,
-                L"RESULT=ABORT reason=ARM_REJECTED eligible=%lld armed=%lld served=%lld "
-                L"shadowMismatches=%lld payloadMismatches=%lld\n",
-                armed.InterventionEligible,
-                armed.InterventionArmed,
-                armed.InterventionServedPages,
-                armed.ShadowMismatches,
-                armed.PayloadMismatches);
-            result = 52;
-            break;
-        }
+            if (!armedDuringPressure)
+            {
+                if (!SendH3BCommand(kCommandArm, armed))
+                {
+                    fwprintf(stderr, L"RESULT=ABORT reason=ARM_COMMAND_FAILED\n");
+                    result = 51;
+                    break;
+                }
 
-        wprintf(L"INTERVENTION_ARM=PASS capacity=%lld payloadMatches=%lld\n",
-            armed.InterventionCapacity,
-            armed.PayloadMatches);
+                if ((armed.InterventionArmed != 1) ||
+                    (armed.InterventionEligible != 1) ||
+                    (armed.InterventionServedPages != before.InterventionServedPages) ||
+                    (armed.ShadowMismatches != before.ShadowMismatches) ||
+                    (armed.PayloadMismatches != before.PayloadMismatches))
+                {
+                    fwprintf(stderr,
+                        L"RESULT=ABORT reason=ARM_REJECTED eligible=%lld armed=%lld served=%lld "
+                        L"shadowMismatches=%lld payloadMismatches=%lld\n",
+                        armed.InterventionEligible,
+                        armed.InterventionArmed,
+                        armed.InterventionServedPages,
+                        armed.ShadowMismatches,
+                        armed.PayloadMismatches);
+                    result = 52;
+                    break;
+                }
+
+                wprintf(L"INTERVENTION_ARM_BEFORE_TARGET_READ=PASS "
+                        L"capacity=%lld payloadMatches=%lld\n",
+                    armed.InterventionCapacity,
+                    armed.PayloadMatches);
+            }
+            else
+            {
+                wprintf(L"INTERVENTION_ARM_PRESERVED_TO_TARGET_READ=YES\n");
+            }
+        }
+        else
+        {
+            wprintf(L"INTERVENTION_ALREADY_SERVED_BEFORE_TARGET_READ=YES\n");
+        }
 
         SetEvent(go);
 
