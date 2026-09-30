@@ -61,11 +61,28 @@ jobs:
           & "h3\pagefile-read-pressure\StateRAMH3BPressure.exe" --selftest
           if ($LASTEXITCODE -ne 0) { throw "Harness self-test failed with exit code $LASTEXITCODE" }
 
+      - name: Build x64 D1 early-arm harness
+        shell: pwsh
+        run: |
+          $src = "h3\pagefile-read-pressure\StateRAMH3D1EarlyArm.cpp"
+          $out = "h3\pagefile-read-pressure\StateRAMH3D1EarlyArm.exe"
+          $devcmd = Join-Path $env:VSINSTALL "Common7\Tools\VsDevCmd.bat"
+          $cmd = '"' + $devcmd + '" -arch=x64 -host_arch=x64 && cl.exe /nologo /std:c++17 /O2 /W4 /WX /EHsc /MT /DUNICODE /D_UNICODE "' + $src + '" /Fe:"' + $out + '"'
+          cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw "D1 early-arm cl.exe failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path $out)) { throw "Expected D1 early-arm executable was not produced" }
+
       - name: Run D1 intervention harness self-test
         shell: pwsh
         run: |
           & "h3\pagefile-read-pressure\StateRAMH3D1Intervention.exe" --selftest
           if ($LASTEXITCODE -ne 0) { throw "D1 intervention self-test failed with exit code $LASTEXITCODE" }
+
+      - name: Run D1 early-arm harness self-test
+        shell: pwsh
+        run: |
+          & "h3\pagefile-read-pressure\StateRAMH3D1EarlyArm.exe" --selftest
+          if ($LASTEXITCODE -ne 0) { throw "D1 early-arm self-test failed with exit code $LASTEXITCODE" }
 
       - name: Stage package and hashes
         shell: pwsh
@@ -106,4 +123,24 @@ jobs:
         with:
           name: StateRAM-H3D1-one-shot-intervention-harness
           path: h3/pagefile-read-pressure/intervention-package/*
+          if-no-files-found: error
+
+      - name: Stage D1 early-arm harness
+        shell: pwsh
+        run: |
+          $root = "h3\pagefile-read-pressure"
+          $package = "$root\early-arm-package"
+          New-Item -ItemType Directory -Path $package -Force | Out-Null
+          Copy-Item "$root\StateRAMH3D1EarlyArm.exe" "$package\StateRAMH3D1EarlyArm.exe" -Force
+          $exeHash = (Get-FileHash "$package\StateRAMH3D1EarlyArm.exe" -Algorithm SHA256).Hash
+          $exeSize = (Get-Item "$package\StateRAMH3D1EarlyArm.exe").Length
+          Write-Host "D1_EARLY_ARM_EXE_SHA256=$exeHash"
+          Write-Host "D1_EARLY_ARM_EXE_SIZE=$exeSize"
+          @("D1_EARLY_ARM_EXE_SHA256=$exeHash", "D1_EARLY_ARM_EXE_SIZE=$exeSize") | Out-File "$package\StateRAMH3D1EarlyArm-SHA256.txt" -Encoding ascii
+
+      - name: Upload D1 early-arm harness
+        uses: actions/upload-artifact@v4
+        with:
+          name: StateRAM-H3D1-early-arm-pressure-harness
+          path: h3/pagefile-read-pressure/early-arm-package/*
           if-no-files-found: error
