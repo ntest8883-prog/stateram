@@ -1,8 +1,10 @@
 #include <fltKernel.h>
 
-#define H3B_PROTOCOL_VERSION 4
+#define H3B_PROTOCOL_VERSION 5
 #define H3B_COMMAND_QUERY    1
 #define H3B_COMMAND_RESET    2
+#define H3B_COMMAND_ARM      3
+#define H3B_COMMAND_DISARM   4
 
 #define H3B_MAX_PAGEFILE_OBJECTS 16
 #define H3B_MAX_PAGEFILE_IDENTITIES 4
@@ -73,10 +75,20 @@ typedef struct _H3B_COUNTERS
     LONG64 PayloadCaptureSkipped;
     LONG64 PayloadBufferUnavailable;
     LONG64 PayloadCapacity;
+
+    LONG64 InterventionArmed;
+    LONG64 InterventionEligible;
+    LONG64 InterventionAttempts;
+    LONG64 InterventionServedPages;
+    LONG64 InterventionFallbacks;
+    LONG64 InterventionGuardRejects;
+    LONG64 InterventionPayloadMisses;
+    LONG64 InterventionHashRejects;
+    LONG64 InterventionCapacity;
 } H3B_COUNTERS, *PH3B_COUNTERS;
 
 C_ASSERT(sizeof(H3B_COMMAND) == 8);
-C_ASSERT(sizeof(H3B_COUNTERS) == 360);
+C_ASSERT(sizeof(H3B_COUNTERS) == 432);
 
 typedef struct _H3B_SHADOW_ENTRY
 {
@@ -198,6 +210,17 @@ volatile LONG64 g_PayloadLookupMisses;
 volatile LONG64 g_PayloadCaptureSkipped;
 volatile LONG64 g_PayloadBufferUnavailable;
 
+volatile LONG g_InterventionArmed;
+volatile LONG g_InterventionInProgress;
+volatile LONG g_InterventionUsed;
+volatile LONG64 g_InterventionAttempts;
+volatile LONG64 g_InterventionServedPages;
+volatile LONG64 g_InterventionFallbacks;
+volatile LONG64 g_InterventionGuardRejects;
+volatile LONG64 g_InterventionPayloadMisses;
+volatile LONG64 g_InterventionHashRejects;
+UCHAR g_InterventionBuffer[PAGE_SIZE];
+
 volatile LONG g_TrackingCompromised;
 
 DRIVER_INITIALIZE DriverEntry;
@@ -258,6 +281,17 @@ H3BResetCounters (
     InterlockedExchange64(&g_PayloadLookupMisses, 0);
     InterlockedExchange64(&g_PayloadCaptureSkipped, 0);
     InterlockedExchange64(&g_PayloadBufferUnavailable, 0);
+
+    InterlockedExchange(&g_InterventionArmed, 0);
+    InterlockedExchange(&g_InterventionInProgress, 0);
+    InterlockedExchange(&g_InterventionUsed, 0);
+    InterlockedExchange64(&g_InterventionAttempts, 0);
+    InterlockedExchange64(&g_InterventionServedPages, 0);
+    InterlockedExchange64(&g_InterventionFallbacks, 0);
+    InterlockedExchange64(&g_InterventionGuardRejects, 0);
+    InterlockedExchange64(&g_InterventionPayloadMisses, 0);
+    InterlockedExchange64(&g_InterventionHashRejects, 0);
+    RtlZeroMemory(g_InterventionBuffer, sizeof(g_InterventionBuffer));
 
     generation = InterlockedIncrement(&g_ShadowGeneration);
 
@@ -1282,6 +1316,87 @@ H3BComparePayload (
     return found;
 }
 
+
+static
+BOOLEAN
+H3BCopyPayload (
+    _In_ ULONG IdentityIndex,
+    _In_ ULONGLONG Offset,
+    _In_ ULONGLONG WriteSequence,
+    _Out_writes_bytes_(PAGE_SIZE) UCHAR* Destination
+    )
+{
+    KIRQL oldIrql;
+    ULONG baseIndex;
+    ULONG i;
+    LONG generation;
+    PH3B_PAYLOAD_ENTRY entry;
+    BOOLEAN found;
+
+    found = FALSE;
+    generation = InterlockedCompareExchange(&g_ShadowGeneration, 0, 0);
+    baseIndex = H3BPayloadWriteBase(WriteSequence);
+
+    KeAcquireSpinLock(&g_PayloadLock, &oldIrql);
+
+    for (i = 0; i < H3B_MAX_HASH_PAGES_PER_IO; i++)
+    {
+        entry = &g_PayloadTable[baseIndex + i];
+
+        if ((entry->Generation == (ULONG)generation) &&
+            (entry->IdentityIndex == IdentityIndex) &&
+            (entry->Offset == Offset) &&
+            (entry->WriteSequence == WriteSequence))
+        {
+            RtlCopyMemory(Destination, entry->Bytes, PAGE_SIZE);
+            found = TRUE;
+            break;
+        }
+    }
+
+    KeReleaseSpinLock(&g_PayloadLock, oldIrql);
+    return found;
+}
+
+static
+BOOLEAN
+H3BInterventionEligible (
+    VOID
+    )
+{
+    if (InterlockedCompareExchange(&g_InterventionUsed, 0, 0) != 0)
+    {
+        return FALSE;
+    }
+
+    if (InterlockedCompareExchange(&g_TrackingCompromised, 0, 0) != 0)
+    {
+        return FALSE;
+    }
+
+    if ((H3BReadCounter(&g_ShadowMismatches) != 0) ||
+        (H3BReadCounter(&g_PayloadMismatches) != 0) ||
+        (H3BReadCounter(&g_PagefileTableFull) != 0) ||
+        (H3BReadCounter(&g_DroppedInflightOutstanding) != 0))
+    {
+        return FALSE;
+    }
+
+    /*
+     * D1 is deliberately not allowed to serve until this exact driver session
+     * has already observed at least one normal pagefile read whose bytes match
+     * a retained payload byte-for-byte.
+     */
+    if ((H3BReadCounter(&g_PayloadMatches) <= 0) ||
+        (H3BReadCounter(&g_PayloadWritePages) <= 0) ||
+        (H3BReadCounter(&g_KnownPagefiles) <= 0))
+    {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
 static
 PVOID
 H3BGetReadBuffer (
@@ -1336,6 +1451,218 @@ H3BGetReadBuffer (
     }
 
     return NULL;
+}
+
+
+static
+BOOLEAN
+H3BTrySinglePageIntervention (
+    _Inout_ PFLT_CALLBACK_DATA Data
+    )
+{
+    LONGLONG signedOffset;
+    ULONG length;
+    ULONG identityIndex;
+    ULONGLONG expected1;
+    ULONGLONG expected2;
+    ULONGLONG actual1;
+    ULONGLONG actual2;
+    ULONGLONG writeSequence;
+    PFILE_OBJECT writerFileObject;
+    PMDL mdl;
+    PVOID mappedBuffer;
+
+    if (InterlockedCompareExchange(&g_InterventionArmed, 0, 0) == 0)
+    {
+        return FALSE;
+    }
+
+    if (InterlockedCompareExchange(&g_InterventionUsed, 0, 0) != 0)
+    {
+        InterlockedExchange(&g_InterventionArmed, 0);
+        return FALSE;
+    }
+
+    if (!FLT_IS_IRP_OPERATION(Data) ||
+        !FlagOn(Data->Iopb->IrpFlags, IRP_PAGING_IO))
+    {
+        return FALSE;
+    }
+
+    signedOffset = Data->Iopb->Parameters.Read.ByteOffset.QuadPart;
+    length = Data->Iopb->Parameters.Read.Length;
+
+    /*
+     * D1 is intentionally restricted to exactly one aligned 4 KiB paging read.
+     * All other reads continue through the normal Windows pagefile path.
+     */
+    if ((signedOffset < 0) ||
+        (length != PAGE_SIZE) ||
+        (((ULONGLONG)signedOffset & (PAGE_SIZE - 1)) != 0))
+    {
+        return FALSE;
+    }
+
+    if (!H3BGetPagefileIdentityIndex(
+            Data->Iopb->TargetFileObject,
+            &identityIndex))
+    {
+        return FALSE;
+    }
+
+    writerFileObject = NULL;
+
+    if (!H3BLookupShadow(
+            identityIndex,
+            (ULONGLONG)signedOffset,
+            &expected1,
+            &expected2,
+            &writeSequence,
+            &writerFileObject))
+    {
+        return FALSE;
+    }
+
+    UNREFERENCED_PARAMETER(writerFileObject);
+    InterlockedIncrement64(&g_InterventionAttempts);
+
+    if (!H3BInterventionEligible() ||
+        !H3BHistoryAllowsVerify(
+            identityIndex,
+            (ULONGLONG)signedOffset,
+            writeSequence))
+    {
+        InterlockedIncrement64(&g_InterventionGuardRejects);
+        InterlockedIncrement64(&g_InterventionFallbacks);
+
+        if ((H3BReadCounter(&g_ShadowMismatches) != 0) ||
+            (H3BReadCounter(&g_PayloadMismatches) != 0) ||
+            (H3BReadCounter(&g_PagefileTableFull) != 0) ||
+            (InterlockedCompareExchange(&g_TrackingCompromised, 0, 0) != 0))
+        {
+            InterlockedExchange(&g_InterventionArmed, 0);
+        }
+
+        return FALSE;
+    }
+
+    if (InterlockedCompareExchange(
+            &g_InterventionInProgress,
+            1,
+            0) != 0)
+    {
+        InterlockedIncrement64(&g_InterventionFallbacks);
+        return FALSE;
+    }
+
+    if ((InterlockedCompareExchange(&g_InterventionArmed, 0, 0) == 0) ||
+        (InterlockedCompareExchange(&g_InterventionUsed, 0, 0) != 0) ||
+        !H3BHistoryAllowsVerify(
+            identityIndex,
+            (ULONGLONG)signedOffset,
+            writeSequence))
+    {
+        InterlockedIncrement64(&g_InterventionGuardRejects);
+        InterlockedIncrement64(&g_InterventionFallbacks);
+        InterlockedExchange(&g_InterventionInProgress, 0);
+        return FALSE;
+    }
+
+    if (!H3BCopyPayload(
+            identityIndex,
+            (ULONGLONG)signedOffset,
+            writeSequence,
+            g_InterventionBuffer))
+    {
+        InterlockedIncrement64(&g_InterventionPayloadMisses);
+        InterlockedIncrement64(&g_InterventionFallbacks);
+        InterlockedExchange(&g_InterventionInProgress, 0);
+        return FALSE;
+    }
+
+    actual1 = H3BHashPage(
+        g_InterventionBuffer,
+        0x9E3779B97F4A7C15ULL);
+
+    actual2 = H3BHashPage(
+        g_InterventionBuffer,
+        0xD6E8FEB86659FD93ULL);
+
+    if ((actual1 != expected1) || (actual2 != expected2))
+    {
+        InterlockedIncrement64(&g_InterventionHashRejects);
+        InterlockedIncrement64(&g_InterventionFallbacks);
+        InterlockedExchange(&g_InterventionArmed, 0);
+        InterlockedExchange(&g_InterventionInProgress, 0);
+        return FALSE;
+    }
+
+    /*
+     * Re-check after copying from the cache.  A newer overlapping write could
+     * have appeared between the first history check and this point.
+     */
+    if (!H3BHistoryAllowsVerify(
+            identityIndex,
+            (ULONGLONG)signedOffset,
+            writeSequence))
+    {
+        InterlockedIncrement64(&g_InterventionGuardRejects);
+        InterlockedIncrement64(&g_InterventionFallbacks);
+        InterlockedExchange(&g_InterventionInProgress, 0);
+        return FALSE;
+    }
+
+    mdl = Data->Iopb->Parameters.Read.MdlAddress;
+
+    /*
+     * D1 only serves into an MDL-backed paging buffer.  If the read does not
+     * have one, it falls through to ordinary pagefile I/O.
+     */
+    if (mdl == NULL)
+    {
+        InterlockedIncrement64(&g_InterventionGuardRejects);
+        InterlockedIncrement64(&g_InterventionFallbacks);
+        InterlockedExchange(&g_InterventionInProgress, 0);
+        return FALSE;
+    }
+
+    mappedBuffer = MmGetSystemAddressForMdlSafe(
+        mdl,
+        NormalPagePriority);
+
+    if (mappedBuffer == NULL)
+    {
+        InterlockedIncrement64(&g_InterventionGuardRejects);
+        InterlockedIncrement64(&g_InterventionFallbacks);
+        InterlockedExchange(&g_InterventionInProgress, 0);
+        return FALSE;
+    }
+
+    __try
+    {
+        RtlCopyMemory(
+            mappedBuffer,
+            g_InterventionBuffer,
+            PAGE_SIZE);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        InterlockedIncrement64(&g_InterventionGuardRejects);
+        InterlockedIncrement64(&g_InterventionFallbacks);
+        InterlockedExchange(&g_InterventionInProgress, 0);
+        return FALSE;
+    }
+
+    Data->IoStatus.Status = STATUS_SUCCESS;
+    Data->IoStatus.Information = PAGE_SIZE;
+    FltSetCallbackDataDirty(Data);
+
+    InterlockedExchange(&g_InterventionUsed, 1);
+    InterlockedExchange(&g_InterventionArmed, 0);
+    InterlockedIncrement64(&g_InterventionServedPages);
+    InterlockedExchange(&g_InterventionInProgress, 0);
+
+    return TRUE;
 }
 
 static
@@ -1906,6 +2233,11 @@ H3BPreRead (
     InterlockedIncrement64(&g_PagefileReads);
     InterlockedAdd64(&g_PagefileReadBytes, length);
 
+    if (H3BTrySinglePageIntervention(Data))
+    {
+        return FLT_PREOP_COMPLETE;
+    }
+
     return FLT_PREOP_SUCCESS_WITH_CALLBACK;
 }
 
@@ -2190,6 +2522,22 @@ H3BMessage (
     {
         H3BResetCounters();
     }
+    else if (command->Command == H3B_COMMAND_ARM)
+    {
+        if (H3BInterventionEligible())
+        {
+            InterlockedExchange(&g_InterventionArmed, 1);
+        }
+        else
+        {
+            InterlockedIncrement64(&g_InterventionGuardRejects);
+            InterlockedExchange(&g_InterventionArmed, 0);
+        }
+    }
+    else if (command->Command == H3B_COMMAND_DISARM)
+    {
+        InterlockedExchange(&g_InterventionArmed, 0);
+    }
     else if (command->Command != H3B_COMMAND_QUERY)
     {
         return STATUS_INVALID_PARAMETER;
@@ -2253,6 +2601,18 @@ H3BMessage (
     reply->PayloadCaptureSkipped = H3BReadCounter(&g_PayloadCaptureSkipped);
     reply->PayloadBufferUnavailable = H3BReadCounter(&g_PayloadBufferUnavailable);
     reply->PayloadCapacity = H3B_PAYLOAD_SLOTS;
+
+    reply->InterventionArmed =
+        InterlockedCompareExchange(&g_InterventionArmed, 0, 0) ? 1 : 0;
+    reply->InterventionEligible =
+        H3BInterventionEligible() ? 1 : 0;
+    reply->InterventionAttempts = H3BReadCounter(&g_InterventionAttempts);
+    reply->InterventionServedPages = H3BReadCounter(&g_InterventionServedPages);
+    reply->InterventionFallbacks = H3BReadCounter(&g_InterventionFallbacks);
+    reply->InterventionGuardRejects = H3BReadCounter(&g_InterventionGuardRejects);
+    reply->InterventionPayloadMisses = H3BReadCounter(&g_InterventionPayloadMisses);
+    reply->InterventionHashRejects = H3BReadCounter(&g_InterventionHashRejects);
+    reply->InterventionCapacity = 1;
 
     *ReturnOutputBufferLength = sizeof(*reply);
     return STATUS_SUCCESS;
@@ -2353,6 +2713,9 @@ DriverEntry (
     g_ShadowGeneration = 1;
     g_WriteSequence = 1;
     g_TrackingCompromised = 0;
+    g_InterventionArmed = 0;
+    g_InterventionInProgress = 0;
+    g_InterventionUsed = 0;
 
     RtlZeroMemory(
         g_PagefileIdentities,
@@ -2363,6 +2726,9 @@ DriverEntry (
     RtlZeroMemory(
         g_PayloadTable,
         sizeof(g_PayloadTable));
+    RtlZeroMemory(
+        g_InterventionBuffer,
+        sizeof(g_InterventionBuffer));
 
     KeInitializeSpinLock(&g_PagefileLock);
     KeInitializeSpinLock(&g_ShadowLock);
