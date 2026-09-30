@@ -1551,6 +1551,8 @@ H3BTryServeSinglePageRead (
     BOOLEAN copySucceeded;
     BOOLEAN armConsumed;
 
+    entry = NULL;
+
     if (InterlockedCompareExchange(&g_InterventionArmed, 0, 0) != 1)
     {
         return FALSE;
@@ -1727,6 +1729,7 @@ H3BTryServeSinglePageRead (
     }
 
     if (payloadFound &&
+        (entry != NULL) &&
         (InterlockedCompareExchange(
             &g_InterventionArmed,
             0,
