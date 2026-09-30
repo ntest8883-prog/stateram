@@ -957,13 +957,12 @@ H3BHistoryAllowsPublish (
 
 static
 BOOLEAN
-H3BHistoryAllowsVerify (
+H3BHistoryAllowsVerifyLocked (
     _In_ ULONG IdentityIndex,
     _In_ ULONGLONG PageOffset,
     _In_ ULONGLONG Sequence
     )
 {
-    KIRQL oldIrql;
     PH3B_PAGEFILE_STATE state;
     ULONG i;
     BOOLEAN foundOwn;
@@ -976,6 +975,12 @@ H3BHistoryAllowsVerify (
     ownGeneration = 0;
     ownState = 0;
 
+    /*
+     * Caller must hold g_PagefileLock.  D1.1 uses this locked form at the
+     * final intervention commit point so a pagefile write pre-operation cannot
+     * register a newer overlapping range between verification and completion
+     * of the cached read.
+     */
     if ((IdentityIndex >= H3B_MAX_PAGEFILE_IDENTITIES) ||
         (InterlockedCompareExchange(
             &g_TrackingCompromised,
@@ -985,30 +990,21 @@ H3BHistoryAllowsVerify (
         return FALSE;
     }
 
-    KeAcquireSpinLock(&g_PagefileLock, &oldIrql);
-
     state = &g_PagefileIdentities[IdentityIndex];
 
     if (state->Instance == NULL)
     {
-        KeReleaseSpinLock(&g_PagefileLock, oldIrql);
         return FALSE;
     }
 
-    /*
-     * A dropped INFLIGHT range is an unknown overlapping-write possibility.
-     * Refuse comparisons until its post-write completion retires the barrier.
-     */
     if (state->DroppedInflightCount != 0)
     {
-        KeReleaseSpinLock(&g_PagefileLock, oldIrql);
         return FALSE;
     }
 
     if (Sequence <= state->HistoryFloor)
     {
         InterlockedIncrement64(&g_HistoryExpired);
-        KeReleaseSpinLock(&g_PagefileLock, oldIrql);
         return FALSE;
     }
 
@@ -1029,8 +1025,6 @@ H3BHistoryAllowsVerify (
         }
     }
 
-    KeReleaseSpinLock(&g_PagefileLock, oldIrql);
-
     if (!foundOwn ||
         (ownState != H3B_WRITE_STATE_COMPLETED) ||
         newerOverlap)
@@ -1047,6 +1041,27 @@ H3BHistoryAllowsVerify (
     }
 
     return TRUE;
+}
+
+static
+BOOLEAN
+H3BHistoryAllowsVerify (
+    _In_ ULONG IdentityIndex,
+    _In_ ULONGLONG PageOffset,
+    _In_ ULONGLONG Sequence
+    )
+{
+    KIRQL oldIrql;
+    BOOLEAN allowed;
+
+    KeAcquireSpinLock(&g_PagefileLock, &oldIrql);
+    allowed = H3BHistoryAllowsVerifyLocked(
+        IdentityIndex,
+        PageOffset,
+        Sequence);
+    KeReleaseSpinLock(&g_PagefileLock, oldIrql);
+
+    return allowed;
 }
 
 static
@@ -1471,6 +1486,8 @@ H3BTrySinglePageIntervention (
     PFILE_OBJECT writerFileObject;
     PMDL mdl;
     PVOID mappedBuffer;
+    KIRQL oldIrql;
+    BOOLEAN finalAllowed;
 
     if (InterlockedCompareExchange(&g_InterventionArmed, 0, 0) == 0)
     {
@@ -1598,26 +1615,11 @@ H3BTrySinglePageIntervention (
     }
 
     /*
-     * Re-check after copying from the cache.  A newer overlapping write could
-     * have appeared between the first history check and this point.
+     * Resolve the destination mapping before entering the final serialized
+     * commit section.  D1.1 serves only an MDL-backed paging read.
      */
-    if (!H3BHistoryAllowsVerify(
-            identityIndex,
-            (ULONGLONG)signedOffset,
-            writeSequence))
-    {
-        InterlockedIncrement64(&g_InterventionGuardRejects);
-        InterlockedIncrement64(&g_InterventionFallbacks);
-        InterlockedExchange(&g_InterventionInProgress, 0);
-        return FALSE;
-    }
-
     mdl = Data->Iopb->Parameters.Read.MdlAddress;
 
-    /*
-     * D1 only serves into an MDL-backed paging buffer.  If the read does not
-     * have one, it falls through to ordinary pagefile I/O.
-     */
     if (mdl == NULL)
     {
         InterlockedIncrement64(&g_InterventionGuardRejects);
@@ -1638,29 +1640,53 @@ H3BTrySinglePageIntervention (
         return FALSE;
     }
 
-    __try
+    /*
+     * Final atomic commit point.
+     *
+     * H3BRecordWriteRange also acquires g_PagefileLock before any pagefile
+     * write is allowed to continue below this filter.  Holding this lock from
+     * the final history check through the 4 KiB destination copy and setting
+     * IoStatus therefore linearizes this read before any subsequently
+     * registered overlapping write.  A write already registered is visible to
+     * H3BHistoryAllowsVerifyLocked and makes us fall back instead.
+     */
+    KeAcquireSpinLock(&g_PagefileLock, &oldIrql);
+
+    finalAllowed =
+        (InterlockedCompareExchange(&g_InterventionArmed, 0, 0) != 0) &&
+        (InterlockedCompareExchange(&g_InterventionUsed, 0, 0) == 0) &&
+        H3BHistoryAllowsVerifyLocked(
+            identityIndex,
+            (ULONGLONG)signedOffset,
+            writeSequence);
+
+    if (!finalAllowed)
     {
-        RtlCopyMemory(
-            mappedBuffer,
-            g_InterventionBuffer,
-            PAGE_SIZE);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
+        KeReleaseSpinLock(&g_PagefileLock, oldIrql);
         InterlockedIncrement64(&g_InterventionGuardRejects);
         InterlockedIncrement64(&g_InterventionFallbacks);
         InterlockedExchange(&g_InterventionInProgress, 0);
         return FALSE;
     }
 
+    /*
+     * MmGetSystemAddressForMdlSafe returned a system mapping for locked pages,
+     * so this bounded 4 KiB copy does not touch pageable user memory.
+     */
+    RtlCopyMemory(
+        mappedBuffer,
+        g_InterventionBuffer,
+        PAGE_SIZE);
+
     Data->IoStatus.Status = STATUS_SUCCESS;
     Data->IoStatus.Information = PAGE_SIZE;
-    FltSetCallbackDataDirty(Data);
 
     InterlockedExchange(&g_InterventionUsed, 1);
     InterlockedExchange(&g_InterventionArmed, 0);
     InterlockedIncrement64(&g_InterventionServedPages);
     InterlockedExchange(&g_InterventionInProgress, 0);
+
+    KeReleaseSpinLock(&g_PagefileLock, oldIrql);
 
     return TRUE;
 }
