@@ -9,6 +9,7 @@
 #include <psapi.h>
 #pragma comment(lib, "psapi.lib")
 
+// H3-C1 payload-aware pressure harness (protocol v4).
 static const wchar_t* kPortName = L"\\StateRAMH3BPort";
 static const uint32_t kProtocolVersion = 4;
 static const uint32_t kCommandQuery = 1;
