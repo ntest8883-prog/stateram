@@ -1,95 +1,92 @@
-# StateRAM H3-B5: canonical pagefile shadow verifier
+# StateRAM H3-D1: one-shot guarded payload intervention
 
-H3-B5 is a write-through verifier. Windows' normal pagefiles remain authoritative.
-The minifilter does not block, redirect, suppress, complete, rewrite, compress, or
-otherwise alter pagefile I/O.
+H3-D1 is the first StateRAM pagefile **intervention** experiment.
 
-## Why H3-B5 exists
+It inherits the H3-B5.1/H3-C2 canonical pagefile tracking, bounded write history,
+two-hash verifier, and retained byte-for-byte payload mirror. Unlike H3-C2,
+H3-D1 can complete **one** eligible pagefile read from the retained payload
+instead of sending that one read to the lower file-system/pagefile path.
 
-The H3-B4 target run produced 1,396 tracked read comparisons: 1,363 matches and
-33 mismatches. The same run reported six distinct paging-file FILE_OBJECTs even
-though the target is configured with pagefiles on only two partitions.
+This is intentionally a tiny proof step. It is not a RAM-expansion claim and it
+is not a production cache.
 
-H3-B4 incorrectly treated FILE_OBJECT identity as pagefile identity. A newer
-overlapping write through another FILE_OBJECT for the same underlying pagefile
-could therefore escape the old object's write history and make a stale
-fingerprint look like a mismatch.
+## Default state
 
-H3-B5 separates:
+The driver is passive after load. It observes normal Windows pagefile I/O and
+builds the same verifier/payload evidence as H3-C2.
 
-- **paging-file object identity**: each observed FILE_OBJECT;
-- **canonical paging-file identity**: the minifilter instance/volume that owns
-  the paging file.
+It cannot be armed until the current driver session has already observed at
+least one normal pagefile read whose returned bytes match a retained payload
+byte-for-byte.
 
-Windows supports one Pagefile.sys per partition, so all paging-file FILE_OBJECTs
-observed by this minifilter instance on one volume are aliases of the same
-pagefile. History and shadow entries are keyed by that canonical identity plus
-byte offset, while FILE_OBJECTs remain tracked only so ordinary files on the
-same volume are never mistaken for the pagefile.
+## Intervention gates
 
-## Read-buffer correction
+A D1 intervention requires all of the following:
 
-In a post-read callback, if Filter Manager sets
-`FLTFL_CALLBACK_DATA_NEW_SYSTEM_BUFFER`, the original pre-operation buffer is
-not necessarily the buffer containing the data returned by the file system.
-H3-B5 checks this flag and uses `FltGetNewSystemBufferAddress` before hashing.
+- explicit user-space `arm` command;
+- no previous intervention in the current generation;
+- no shadow mismatch;
+- no payload mismatch;
+- no pagefile table overflow or compromised tracking state;
+- no unresolved dropped in-flight write;
+- a known canonical pagefile identity;
+- an exactly 4 KiB, page-aligned IRP paging read;
+- a current shadow entry for that offset;
+- bounded write history proving the write is still current;
+- an exact retained payload for the same write sequence;
+- both stored payload hashes matching the shadow hashes again immediately before use;
+- a second history validation after payload copy;
+- an MDL-backed destination buffer.
 
-The verifier also records:
+If any condition fails, the request falls through to ordinary Windows pagefile
+I/O. A verifier mismatch while armed immediately disarms D1.
 
-- cross-FILE_OBJECT comparisons/matches/mismatches;
-- new-system-buffer reads/comparisons/mismatches;
-- canonical pagefile identities and FILE_OBJECT aliases;
-- dynamic pagefile discoveries;
-- history expiry/drop and race-invalidated samples.
+After one successful intervention, D1 automatically disarms and will not serve
+another page in that generation.
 
-## Reboot avoidance
+## Protocol
 
-Boot-time `SL_OPEN_PAGING_FILE` detection is retained, but H3-B5 adds a
-DEMAND_START fallback for an already-running Windows session. For an unknown
-FILE_OBJECT seen in an IRP-based paging read/write pre-operation callback,
-H3-B5 calls `FsRtlIsPagingFile` at IRQL <= APC_LEVEL. If Windows identifies the
-object as a paging file, the driver registers it and maps it to that volume's
-canonical identity.
+H3-D1 uses protocol version 5.
 
-This allows the verifier logic to be exercised after a manual load in the same
-Windows boot, rather than requiring another reboot merely to rediscover the
-already-open pagefiles.
+`Query-StateRAMH3B.ps1` supports:
 
-## Concurrent-write correctness
+```powershell
+-Command query
+-Command reset
+-Command arm
+-Command disarm
+```
 
-H3-B5 does not use pre-write sequence numbers as proof of final storage order.
-If two overlapping writes are simultaneously in flight, both ranges remember
-that uncertainty and neither completion may publish a fingerprint. This remains
-true even if their post-operation callbacks happen in an apparently convenient
-order.
+Important telemetry:
 
-If an in-flight range is evicted from the bounded history ring before its
-completion arrives, the corresponding canonical pagefile enters a conservative
-unknown-write state. New samples and comparisons are suppressed until that late
-completion retires the barrier. If pagefile-object/identity capacity is ever
-exceeded, verification fails closed and `PagefileTableFull` becomes a stop
-signal.
+- `InterventionEligible`
+- `InterventionArmed`
+- `InterventionAttempts`
+- `InterventionServedPages`
+- `InterventionFallbacks`
+- `InterventionGuardRejects`
+- `InterventionPayloadMisses`
+- `InterventionHashRejects`
+- `InterventionCapacity` (always 1 for D1)
 
-## Bounded verifier state
+## Acceptance rule
 
-- 32,768 direct-mapped shadow entries in nonpaged pool.
-- 256 write-history range records per canonical pagefile identity.
-- At most four 4 KiB pages fingerprinted per completed I/O.
-- Two independent 64-bit FNV-style page fingerprints.
-- History overflow/expiry makes a sample **untracked**, never a match.
-- Newer overlapping writes invalidate older samples before comparison.
+The D1 milestone is only interesting if all of these are true after an armed
+test:
 
-The history scan remains bounded and is verifier-stage code, not the eventual
-production data path.
+- `InterventionServedPages = 1`
+- `ShadowMismatches = 0`
+- `PayloadMismatches = 0`
+- `InterventionHashRejects = 0`
+- the machine remains stable and the workload's data verification passes.
 
-## Success rule
+A pass would prove that StateRAM can safely substitute one previously captured
+page into a real Windows paging read under these guards. It would **not** yet
+prove useful memory expansion, sustained paging acceleration, or 4 GB behaving
+like 8 GB.
 
-`ShadowMismatches > 0` is still an immediate stop condition.
+## Reboot policy
 
-A useful H3-B5 validation requires real pagefile writes, later tracked reads,
-positive matches, and zero mismatches. Cross-object and buffer-source telemetry
-is diagnostic; it does not lower the success criterion.
-
-H3-B5 still saves no RAM and is not evidence that 4 GB behaves like 8 GB. It
-only validates pagefile write-to-later-read semantics needed for the later H3
-integration work.
+The package remains DEMAND_START and is designed for manual unload/reload in the
+same boot. Do not reboot merely to move between H3-C2 and H3-D1 unless Windows
+itself refuses a clean unload/load.
