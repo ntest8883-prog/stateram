@@ -1061,12 +1061,36 @@ static int ParentMode()
                     probe.ShadowWritePages - before.ShadowWritePages;
                 const int64_t historyDropDelta =
                     probe.HistoryRecordDrops - before.HistoryRecordDrops;
+                const int64_t interventionServedDelta =
+                    probe.InterventionServed - before.InterventionServed;
+                const int64_t interventionSafetyRejectDelta =
+                    probe.InterventionSafetyRejects - before.InterventionSafetyRejects;
                 const int64_t payloadReadDelta =
                     probe.PayloadReadPages - before.PayloadReadPages;
                 const int64_t payloadMatchDelta =
                     probe.PayloadMatches - before.PayloadMatches;
                 const int64_t payloadMismatchDelta =
                     probe.PayloadMismatches - before.PayloadMismatches;
+
+                if (interventionSafetyRejectDelta > 0)
+                {
+                    wprintf(L"PRESSURE_STOP reason=INTERVENTION_SAFETY_REJECT "
+                            L"delta=%lld allocated=%llu MiB\n",
+                        interventionSafetyRejectDelta,
+                        static_cast<unsigned long long>(allocatedMiB));
+                    stopForMismatch = true;
+                    break;
+                }
+
+                if (interventionServedDelta > 0)
+                {
+                    wprintf(L"PRESSURE_STOP reason=INTERVENTION_SERVED "
+                            L"served=%lld allocated=%llu MiB\n",
+                        interventionServedDelta,
+                        static_cast<unsigned long long>(allocatedMiB));
+                    stopForEvidence = true;
+                    break;
+                }
 
                 if ((payloadReadDelta > 0) &&
                     (payloadMatchDelta > 0) &&
