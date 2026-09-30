@@ -128,8 +128,6 @@ H3B_PAGEFILE_OBJECT g_PagefileObjects[H3B_MAX_PAGEFILE_OBJECTS];
 
 KSPIN_LOCK g_ShadowLock;
 PH3B_SHADOW_ENTRY g_ShadowTable;
-NPAGED_LOOKASIDE_LIST g_WriteContextLookaside;
-BOOLEAN g_WriteContextLookasideInitialized;
 volatile LONG g_ShadowGeneration;
 volatile LONG64 g_WriteSequence;
 
@@ -1660,8 +1658,13 @@ H3BPreWrite (
 
     length = Data->Iopb->Parameters.Write.Length;
 
-    writeContext = (PH3B_WRITE_CONTEXT)
-        ExAllocateFromNPagedLookasideList(&g_WriteContextLookaside);
+#pragma warning(push)
+#pragma warning(disable:4996)
+    writeContext = (PH3B_WRITE_CONTEXT)ExAllocatePoolWithTag(
+        NonPagedPoolNx,
+        sizeof(H3B_WRITE_CONTEXT),
+        H3B_POOL_TAG);
+#pragma warning(pop)
 
     if (writeContext == NULL)
     {
@@ -1679,9 +1682,9 @@ H3BPreWrite (
             length,
             &writeSequence))
     {
-        ExFreeToNPagedLookasideList(
-            &g_WriteContextLookaside,
-            writeContext);
+        ExFreePoolWithTag(
+            writeContext,
+            H3B_POOL_TAG);
 
         InterlockedIncrement64(&g_PagefileWrites);
         InterlockedAdd64(&g_PagefileWriteBytes, length);
@@ -1721,9 +1724,9 @@ H3BPostWrite (
 
     if (FlagOn(Flags, FLTFL_POST_OPERATION_DRAINING))
     {
-        ExFreeToNPagedLookasideList(
-            &g_WriteContextLookaside,
-            writeContext);
+        ExFreePoolWithTag(
+            writeContext,
+            H3B_POOL_TAG);
         return FLT_POSTOP_FINISHED_PROCESSING;
     }
 
@@ -1742,9 +1745,9 @@ H3BPostWrite (
             InterlockedIncrement64(&g_ShadowPublishSkipped);
         }
 
-        ExFreeToNPagedLookasideList(
-            &g_WriteContextLookaside,
-            writeContext);
+        ExFreePoolWithTag(
+            writeContext,
+            H3B_POOL_TAG);
         return FLT_POSTOP_FINISHED_PROCESSING;
     }
 
@@ -1754,9 +1757,9 @@ H3BPostWrite (
         H3BShadowCompletedWrite(Data, writeContext);
     }
 
-    ExFreeToNPagedLookasideList(
-        &g_WriteContextLookaside,
-        writeContext);
+    ExFreePoolWithTag(
+        writeContext,
+        H3B_POOL_TAG);
 
     return FLT_POSTOP_FINISHED_PROCESSING;
 }
@@ -1971,12 +1974,6 @@ H3BUnload (
 
     H3BReleasePagefiles();
 
-    if (g_WriteContextLookasideInitialized)
-    {
-        ExDeleteNPagedLookasideList(&g_WriteContextLookaside);
-        g_WriteContextLookasideInitialized = FALSE;
-    }
-
     if (g_ShadowTable != NULL)
     {
         ExFreePoolWithTag(g_ShadowTable, H3B_POOL_TAG);
@@ -2049,7 +2046,6 @@ DriverEntry (
     g_ServerPort = NULL;
     g_ClientPort = NULL;
     g_ShadowTable = NULL;
-    g_WriteContextLookasideInitialized = FALSE;
     g_ShadowGeneration = 1;
     g_WriteSequence = 1;
     g_TrackingCompromised = 0;
@@ -2148,22 +2144,10 @@ DriverEntry (
         return status;
     }
 
-    ExInitializeNPagedLookasideList(
-        &g_WriteContextLookaside,
-        NULL,
-        NULL,
-        0,
-        sizeof(H3B_WRITE_CONTEXT),
-        H3B_POOL_TAG,
-        0);
-    g_WriteContextLookasideInitialized = TRUE;
-
     status = FltStartFiltering(g_Filter);
 
     if (!NT_SUCCESS(status))
     {
-        ExDeleteNPagedLookasideList(&g_WriteContextLookaside);
-        g_WriteContextLookasideInitialized = FALSE;
         FltCloseCommunicationPort(g_ServerPort);
         g_ServerPort = NULL;
         FltUnregisterFilter(g_Filter);
