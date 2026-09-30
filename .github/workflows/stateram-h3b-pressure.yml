@@ -6,6 +6,7 @@ on:
       - h3-pagefile-shadow-history
       - h3-pagefile-shadow-canonical
       - h3-payload-mirror-c1
+      - h3-intervention-d0
       - h3-pagefile-shadow-b51
     paths:
       - "h3/pagefile-read-pressure/**"
