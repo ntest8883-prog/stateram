@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("query","reset")]
+    [ValidateSet("query","reset","arm-once","disarm")]
     [string]$Command = "query",
     [switch]$SelfTest
 )
@@ -69,6 +69,16 @@ public static class StateRAMH3BNative
         public Int64 PayloadCaptureSkipped;
         public Int64 PayloadBufferUnavailable;
         public Int64 PayloadCapacity;
+
+        public Int64 InterventionArmed;
+        public Int64 InterventionAttempts;
+        public Int64 InterventionEligible;
+        public Int64 InterventionServed;
+        public Int64 InterventionBytes;
+        public Int64 InterventionFallbacks;
+        public Int64 InterventionPayloadMisses;
+        public Int64 InterventionBufferUnavailable;
+        public Int64 InterventionSafetyRejects;
     }
 
     [DllImport("fltlib.dll", CharSet = CharSet.Unicode)]
@@ -106,11 +116,11 @@ if ($SelfTest) {
         throw "Protocol self-test failed: Command size is $commandSize, expected 8."
     }
 
-    if ($counterSize -ne 360) {
-        throw "Protocol self-test failed: Counters size is $counterSize, expected 360."
+    if ($counterSize -ne 432) {
+        throw "Protocol self-test failed: Counters size is $counterSize, expected 432."
     }
 
-    Write-Host "StateRAMH3B query protocol self-test: PASS (Command=8, Counters=360)"
+    Write-Host "StateRAMH3B query protocol self-test: PASS (Command=8, Counters=432)"
     exit 0
 }
 
@@ -129,8 +139,13 @@ if ($hr -ne 0) {
 
 try {
     $cmd = New-Object StateRAMH3BNative+Command
-    $cmd.Version = 4
-    $cmd.CommandId = if ($Command -eq "reset") { 2 } else { 1 }
+    $cmd.Version = 5
+    $cmd.CommandId = switch ($Command) {
+        "reset"    { 2 }
+        "arm-once" { 3 }
+        "disarm"   { 4 }
+        default    { 1 }
+    }
 
     $reply = New-Object StateRAMH3BNative+Counters
     [uint32]$returned = 0
@@ -195,6 +210,16 @@ try {
         PayloadCaptureSkipped     = $reply.PayloadCaptureSkipped
         PayloadBufferUnavailable  = $reply.PayloadBufferUnavailable
         PayloadCapacity           = $reply.PayloadCapacity
+
+        InterventionArmed             = $reply.InterventionArmed
+        InterventionAttempts          = $reply.InterventionAttempts
+        InterventionEligible          = $reply.InterventionEligible
+        InterventionServed            = $reply.InterventionServed
+        InterventionBytes             = $reply.InterventionBytes
+        InterventionFallbacks         = $reply.InterventionFallbacks
+        InterventionPayloadMisses     = $reply.InterventionPayloadMisses
+        InterventionBufferUnavailable = $reply.InterventionBufferUnavailable
+        InterventionSafetyRejects     = $reply.InterventionSafetyRejects
     } | Format-List
 }
 finally {
