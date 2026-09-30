@@ -8,7 +8,8 @@
 #define H3B_MAX_PAGEFILE_IDENTITIES 4
 #define H3B_WRITE_HISTORY_SLOTS 2048
 #define H3B_SHADOW_SLOTS     32768
-#define H3B_PAYLOAD_SLOTS    256
+#define H3B_PAYLOAD_SLOTS    2048
+#define H3B_PAYLOAD_WRITES_RETAINED (H3B_PAYLOAD_SLOTS / H3B_MAX_HASH_PAGES_PER_IO)
 #define H3B_POOL_TAG         'B3HS'
 #define H3B_MAX_HASH_PAGES_PER_IO 4
 #define H3B_WRITE_STATE_INFLIGHT  1
@@ -1146,18 +1147,21 @@ H3BLookupShadow (
 
 static
 ULONG
-H3BPayloadIndex (
-    _In_ ULONG IdentityIndex,
-    _In_ ULONGLONG Offset
+H3BPayloadWriteBase (
+    _In_ ULONGLONG WriteSequence
     )
 {
-    ULONGLONG value;
+    ULONGLONG writeSlot;
 
-    value = (Offset >> PAGE_SHIFT);
-    value ^= ((ULONGLONG)IdentityIndex * 0xD6E8FEB86659FD93ULL);
-    value ^= (value >> 19);
+    /*
+     * A payload record is retained by write sequence rather than by hashing
+     * its pagefile offset.  Each recent write gets four dedicated page slots,
+     * matching H3B_MAX_HASH_PAGES_PER_IO.  This removes direct-map collision
+     * eviction between unrelated offsets.
+     */
+    writeSlot = WriteSequence & (H3B_PAYLOAD_WRITES_RETAINED - 1);
 
-    return (ULONG)(value & (H3B_PAYLOAD_SLOTS - 1));
+    return (ULONG)(writeSlot * H3B_MAX_HASH_PAGES_PER_IO);
 }
 
 static
@@ -1187,6 +1191,7 @@ H3BStorePayload (
     _In_ ULONGLONG Offset,
     _In_ ULONGLONG WriteSequence,
     _In_ ULONG WriteGeneration,
+    _In_ ULONG PageOrdinal,
     _In_reads_bytes_(PAGE_SIZE) const UCHAR* Bytes
     )
 {
@@ -1203,7 +1208,12 @@ H3BStorePayload (
         return FALSE;
     }
 
-    index = H3BPayloadIndex(IdentityIndex, Offset);
+    if (PageOrdinal >= H3B_MAX_HASH_PAGES_PER_IO)
+    {
+        return FALSE;
+    }
+
+    index = H3BPayloadWriteBase(WriteSequence) + PageOrdinal;
 
     KeAcquireSpinLock(&g_PayloadLock, &oldIrql);
 
@@ -1239,7 +1249,8 @@ H3BComparePayload (
     )
 {
     KIRQL oldIrql;
-    ULONG index;
+    ULONG baseIndex;
+    ULONG i;
     LONG generation;
     PH3B_PAYLOAD_ENTRY entry;
     BOOLEAN found;
@@ -1248,19 +1259,23 @@ H3BComparePayload (
     *Match = FALSE;
 
     generation = InterlockedCompareExchange(&g_ShadowGeneration, 0, 0);
-    index = H3BPayloadIndex(IdentityIndex, Offset);
+    baseIndex = H3BPayloadWriteBase(WriteSequence);
 
     KeAcquireSpinLock(&g_PayloadLock, &oldIrql);
 
-    entry = &g_PayloadTable[index];
-
-    if ((entry->Generation == (ULONG)generation) &&
-        (entry->IdentityIndex == IdentityIndex) &&
-        (entry->Offset == Offset) &&
-        (entry->WriteSequence == WriteSequence))
+    for (i = 0; i < H3B_MAX_HASH_PAGES_PER_IO; i++)
     {
-        *Match = H3BPayloadBytesEqual(entry->Bytes, Bytes);
-        found = TRUE;
+        entry = &g_PayloadTable[baseIndex + i];
+
+        if ((entry->Generation == (ULONG)generation) &&
+            (entry->IdentityIndex == IdentityIndex) &&
+            (entry->Offset == Offset) &&
+            (entry->WriteSequence == WriteSequence))
+        {
+            *Match = H3BPayloadBytesEqual(entry->Bytes, Bytes);
+            found = TRUE;
+            break;
+        }
     }
 
     KeReleaseSpinLock(&g_PayloadLock, oldIrql);
@@ -1613,6 +1628,7 @@ H3BShadowCompletedWrite (
                             offset,
                             writeSequence,
                             writeGeneration,
+                            i,
                             payloadScratch))
                     {
                         InterlockedIncrement64(&g_PayloadWritePages);
