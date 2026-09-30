@@ -10,7 +10,7 @@
 #pragma comment(lib, "psapi.lib")
 
 static const wchar_t* kPortName = L"\\StateRAMH3BPort";
-static const uint32_t kProtocolVersion = 3;
+static const uint32_t kProtocolVersion = 4;
 static const uint32_t kCommandQuery = 1;
 static const SIZE_T kMiB = 1024ull * 1024ull;
 static const SIZE_T kPressureChunk = 32ull * kMiB;
@@ -76,11 +76,21 @@ struct H3B_COUNTERS
     int64_t ConcurrentOverlapSkips;
     int64_t DroppedInflightRecords;
     int64_t DroppedInflightOutstanding;
+
+    int64_t PayloadWritePages;
+    int64_t PayloadReadPages;
+    int64_t PayloadMatches;
+    int64_t PayloadMismatches;
+    int64_t PayloadReplacements;
+    int64_t PayloadLookupMisses;
+    int64_t PayloadCaptureSkipped;
+    int64_t PayloadBufferUnavailable;
+    int64_t PayloadCapacity;
 };
 #pragma pack(pop)
 
 static_assert(sizeof(H3B_COMMAND) == 8, "H3B command ABI drift");
-static_assert(sizeof(H3B_COUNTERS) == 288, "H3B counter ABI drift");
+static_assert(sizeof(H3B_COUNTERS) == 360, "H3B counter ABI drift");
 
 typedef HRESULT (WINAPI *PFN_FILTER_CONNECT_COMMUNICATION_PORT)(
     LPCWSTR, DWORD, LPVOID, WORD, LPSECURITY_ATTRIBUTES, HANDLE*);
@@ -235,7 +245,10 @@ static void PrintDelta(const H3B_COUNTERS& before, const H3B_COUNTERS& after)
             L"ShadowUntracked=%lld HistoryExpired=%lld "
             L"HistoryRecordDrops=%lld PublishSkipped=%lld "
             L"VerifyInvalidated=%lld ConcurrentOverlapSkips=%lld "
-            L"DroppedInflightOutstanding=%lld PagefileTableFull=%lld\n",
+            L"DroppedInflightOutstanding=%lld PagefileTableFull=%lld "
+            L"PayloadWrites=%lld PayloadReads=%lld PayloadMatches=%lld "
+            L"PayloadMismatches=%lld PayloadLookupMisses=%lld "
+            L"PayloadCaptureSkipped=%lld PayloadBufferUnavailable=%lld\n",
         after.PagefileWrites - before.PagefileWrites,
         after.PagefileReads - before.PagefileReads,
         after.ShadowWritePages - before.ShadowWritePages,
@@ -249,7 +262,14 @@ static void PrintDelta(const H3B_COUNTERS& before, const H3B_COUNTERS& after)
         after.ShadowVerifyInvalidated - before.ShadowVerifyInvalidated,
         after.ConcurrentOverlapSkips - before.ConcurrentOverlapSkips,
         after.DroppedInflightOutstanding,
-        after.PagefileTableFull);
+        after.PagefileTableFull,
+        after.PayloadWritePages - before.PayloadWritePages,
+        after.PayloadReadPages - before.PayloadReadPages,
+        after.PayloadMatches - before.PayloadMatches,
+        after.PayloadMismatches - before.PayloadMismatches,
+        after.PayloadLookupMisses - before.PayloadLookupMisses,
+        after.PayloadCaptureSkipped - before.PayloadCaptureSkipped,
+        after.PayloadBufferUnavailable - before.PayloadBufferUnavailable);
 }
 
 static bool GetSampledResidency(
@@ -521,7 +541,7 @@ static int TargetMode(DWORD parentPid, SIZE_T targetMiB)
 
 static int SelfTest()
 {
-    if ((sizeof(H3B_COMMAND) != 8) || (sizeof(H3B_COUNTERS) != 288))
+    if ((sizeof(H3B_COMMAND) != 8) || (sizeof(H3B_COUNTERS) != 360))
     {
         fwprintf(stderr, L"SELFTEST=FAIL ABI\n");
         return 2;
@@ -584,10 +604,13 @@ static int MachinePreflight()
         return 70;
     }
 
-    if (counters.ShadowMismatches != 0)
+    if ((counters.ShadowMismatches != 0) ||
+        (counters.PayloadMismatches != 0))
     {
-        fwprintf(stderr, L"PREFLIGHT=FAIL reason=EXISTING_MISMATCHES value=%lld\n",
-            counters.ShadowMismatches);
+        fwprintf(stderr,
+            L"PREFLIGHT=FAIL reason=EXISTING_MISMATCHES shadow=%lld payload=%lld\n",
+            counters.ShadowMismatches,
+            counters.PayloadMismatches);
         return 71;
     }
 
@@ -662,10 +685,13 @@ static int MachinePreflight()
         return 77;
     }
 
-    if (after.ShadowMismatches != counters.ShadowMismatches)
+    if ((after.ShadowMismatches != counters.ShadowMismatches) ||
+        (after.PayloadMismatches != counters.PayloadMismatches))
     {
-        fwprintf(stderr, L"PREFLIGHT=FAIL reason=NEW_MISMATCH delta=%lld\n",
-            after.ShadowMismatches - counters.ShadowMismatches);
+        fwprintf(stderr,
+            L"PREFLIGHT=FAIL reason=NEW_MISMATCH shadowDelta=%lld payloadDelta=%lld\n",
+            after.ShadowMismatches - counters.ShadowMismatches,
+            after.PayloadMismatches - counters.PayloadMismatches);
         return 78;
     }
 
@@ -694,11 +720,13 @@ static int ParentMode()
         return 30;
     }
 
-    if (before.ShadowMismatches != 0)
+    if ((before.ShadowMismatches != 0) ||
+        (before.PayloadMismatches != 0))
     {
         fwprintf(stderr,
-            L"RESULT=ABORT reason=BASELINE_MISMATCHES value=%lld\n",
-            before.ShadowMismatches);
+            L"RESULT=ABORT reason=BASELINE_MISMATCHES shadow=%lld payload=%lld\n",
+            before.ShadowMismatches,
+            before.PayloadMismatches);
         return 31;
     }
 
@@ -1201,20 +1229,47 @@ static int ParentMode()
 
         int64_t readDelta = after.ShadowReadPages - before.ShadowReadPages;
         int64_t matchDelta = after.ShadowMatches - before.ShadowMatches;
+        int64_t payloadReadDelta = after.PayloadReadPages - before.PayloadReadPages;
+        int64_t payloadMatchDelta = after.PayloadMatches - before.PayloadMatches;
+        int64_t payloadMismatchDelta = after.PayloadMismatches - before.PayloadMismatches;
 
-        if ((readDelta > 0) && (matchDelta > 0))
+        if ((payloadReadDelta > 0) &&
+            (payloadMatchDelta > 0) &&
+            (payloadMismatchDelta == 0))
         {
-            wprintf(L"RESULT=PASS shadowReadPagesDelta=%lld shadowMatchesDelta=%lld\n",
-                readDelta, matchDelta);
+            wprintf(L"RESULT=PAYLOAD_PASS payloadReadPagesDelta=%lld "
+                    L"payloadMatchesDelta=%lld payloadMismatchesDelta=%lld "
+                    L"shadowReadPagesDelta=%lld shadowMatchesDelta=%lld\n",
+                payloadReadDelta,
+                payloadMatchDelta,
+                payloadMismatchDelta,
+                readDelta,
+                matchDelta);
             result = 0;
+        }
+        else if ((readDelta > 0) && (matchDelta > 0))
+        {
+            wprintf(L"RESULT=SHADOW_ONLY payloadReadPagesDelta=%lld "
+                    L"payloadMatchesDelta=%lld payloadMismatchesDelta=%lld "
+                    L"shadowReadPagesDelta=%lld shadowMatchesDelta=%lld\n",
+                payloadReadDelta,
+                payloadMatchDelta,
+                payloadMismatchDelta,
+                readDelta,
+                matchDelta);
+            result = 44;
         }
         else
         {
             wprintf(L"RESULT=NO_TRACKED_READ shadowReadPagesDelta=%lld "
-                    L"shadowMatchesDelta=%lld historyExpiredDelta=%lld "
-                    L"historyDropsDelta=%lld\n",
+                    L"shadowMatchesDelta=%lld payloadReadPagesDelta=%lld "
+                    L"payloadMatchesDelta=%lld payloadMismatchesDelta=%lld "
+                    L"historyExpiredDelta=%lld historyDropsDelta=%lld\n",
                 readDelta,
                 matchDelta,
+                payloadReadDelta,
+                payloadMatchDelta,
+                payloadMismatchDelta,
                 after.HistoryExpired - before.HistoryExpired,
                 after.HistoryRecordDrops - before.HistoryRecordDrops);
             result = 43;
