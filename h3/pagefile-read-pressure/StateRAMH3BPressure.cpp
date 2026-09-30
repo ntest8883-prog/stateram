@@ -926,6 +926,7 @@ static int ParentMode()
         bool stopForEvidence = false;
         bool stopForMismatch = false;
         bool targetCold = false;
+        bool coldEvidenceReported = false;
         H3B_COUNTERS mid = before;
 
         /*
@@ -992,8 +993,14 @@ static int ParentMode()
                 targetCold =
                     (WaitForSingleObject(cold, 0) == WAIT_OBJECT_0);
 
-                if (probe.ShadowMismatches != before.ShadowMismatches)
+                if ((probe.ShadowMismatches != before.ShadowMismatches) ||
+                    (probe.PayloadMismatches != before.PayloadMismatches))
                 {
+                    wprintf(L"PRESSURE_STOP reason=MISMATCH shadowDelta=%lld payloadDelta=%lld "
+                            L"allocated=%llu MiB\n",
+                        probe.ShadowMismatches - before.ShadowMismatches,
+                        probe.PayloadMismatches - before.PayloadMismatches,
+                        static_cast<unsigned long long>(allocatedMiB));
                     stopForMismatch = true;
                     break;
                 }
@@ -1027,11 +1034,21 @@ static int ParentMode()
                     probe.ShadowMatches - before.ShadowMatches;
                 const int64_t historyDropDelta =
                     probe.HistoryRecordDrops - before.HistoryRecordDrops;
+                const int64_t payloadReadDelta =
+                    probe.PayloadReadPages - before.PayloadReadPages;
+                const int64_t payloadMatchDelta =
+                    probe.PayloadMatches - before.PayloadMatches;
+                const int64_t payloadMismatchDelta =
+                    probe.PayloadMismatches - before.PayloadMismatches;
 
-                if ((readDelta > 0) && (matchDelta > 0))
+                if ((payloadReadDelta > 0) &&
+                    (payloadMatchDelta > 0) &&
+                    (payloadMismatchDelta == 0))
                 {
-                    wprintf(L"PRESSURE_STOP reason=VERIFIER_ALREADY_MATCHED "
-                            L"allocated=%llu MiB\n",
+                    wprintf(L"PRESSURE_STOP reason=PAYLOAD_ALREADY_MATCHED "
+                            L"payloadReads=%lld payloadMatches=%lld allocated=%llu MiB\n",
+                        payloadReadDelta,
+                        payloadMatchDelta,
                         static_cast<unsigned long long>(allocatedMiB));
                     stopForEvidence = true;
                     break;
@@ -1047,18 +1064,19 @@ static int ParentMode()
                     break;
                 }
 
-                if (targetCold &&
+                if (!coldEvidenceReported &&
+                    targetCold &&
                     (allocatedMiB >= 256) &&
                     (writeDelta >= kEvidencePagefileWrites) &&
                     (shadowDelta >= kEvidenceShadowPages))
                 {
-                    wprintf(L"PRESSURE_STOP reason=TARGET_COLD_AND_PAGEFILE_EVIDENCE "
-                            L"writes=%lld shadowPages=%lld allocated=%llu MiB\n",
+                    wprintf(L"PRESSURE_CONTINUE reason=TARGET_COLD_AND_PAGEFILE_EVIDENCE "
+                            L"writes=%lld shadowPages=%lld allocated=%llu MiB "
+                            L"awaitingPayloadRead=YES\n",
                         writeDelta,
                         shadowDelta,
                         static_cast<unsigned long long>(allocatedMiB));
-                    stopForEvidence = true;
-                    break;
+                    coldEvidenceReported = true;
                 }
             }
         }
@@ -1102,11 +1120,13 @@ static int ParentMode()
 
         PrintDelta(before, mid);
 
-        if (mid.ShadowMismatches != before.ShadowMismatches)
+        if ((mid.ShadowMismatches != before.ShadowMismatches) ||
+            (mid.PayloadMismatches != before.PayloadMismatches))
         {
             fwprintf(stderr,
-                L"RESULT=STOP_MISMATCH phase=before-read delta=%lld\n",
-                mid.ShadowMismatches - before.ShadowMismatches);
+                L"RESULT=STOP_MISMATCH phase=before-read shadowDelta=%lld payloadDelta=%lld\n",
+                mid.ShadowMismatches - before.ShadowMismatches,
+                mid.PayloadMismatches - before.PayloadMismatches);
             result = 40;
             break;
         }
@@ -1210,11 +1230,13 @@ static int ParentMode()
 
         PrintDelta(before, after);
 
-        if (after.ShadowMismatches != before.ShadowMismatches)
+        if ((after.ShadowMismatches != before.ShadowMismatches) ||
+            (after.PayloadMismatches != before.PayloadMismatches))
         {
             fwprintf(stderr,
-                L"RESULT=STOP_MISMATCH delta=%lld\n",
-                after.ShadowMismatches - before.ShadowMismatches);
+                L"RESULT=STOP_MISMATCH shadowDelta=%lld payloadDelta=%lld\n",
+                after.ShadowMismatches - before.ShadowMismatches,
+                after.PayloadMismatches - before.PayloadMismatches);
             result = 42;
             break;
         }
