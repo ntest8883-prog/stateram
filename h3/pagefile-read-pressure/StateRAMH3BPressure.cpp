@@ -1028,10 +1028,6 @@ static int ParentMode()
                     probe.PagefileWrites - before.PagefileWrites;
                 const int64_t shadowDelta =
                     probe.ShadowWritePages - before.ShadowWritePages;
-                const int64_t readDelta =
-                    probe.ShadowReadPages - before.ShadowReadPages;
-                const int64_t matchDelta =
-                    probe.ShadowMatches - before.ShadowMatches;
                 const int64_t historyDropDelta =
                     probe.HistoryRecordDrops - before.HistoryRecordDrops;
                 const int64_t payloadReadDelta =
