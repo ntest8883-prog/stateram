@@ -9,9 +9,10 @@
 #include <psapi.h>
 #pragma comment(lib, "psapi.lib")
 
-// H3-C1 payload-aware pressure harness (protocol v4).
+// H3-D1 passive-evidence pressure harness (protocol v5).
+// This harness only issues QUERY commands. It never arms intervention.
 static const wchar_t* kPortName = L"\\StateRAMH3BPort";
-static const uint32_t kProtocolVersion = 4;
+static const uint32_t kProtocolVersion = 5;
 static const uint32_t kCommandQuery = 1;
 static const SIZE_T kMiB = 1024ull * 1024ull;
 static const SIZE_T kPressureChunk = 32ull * kMiB;
@@ -87,11 +88,21 @@ struct H3B_COUNTERS
     int64_t PayloadCaptureSkipped;
     int64_t PayloadBufferUnavailable;
     int64_t PayloadCapacity;
+
+    int64_t InterventionArmed;
+    int64_t InterventionEligible;
+    int64_t InterventionAttempts;
+    int64_t InterventionServedPages;
+    int64_t InterventionFallbacks;
+    int64_t InterventionGuardRejects;
+    int64_t InterventionPayloadMisses;
+    int64_t InterventionHashRejects;
+    int64_t InterventionCapacity;
 };
 #pragma pack(pop)
 
 static_assert(sizeof(H3B_COMMAND) == 8, "H3B command ABI drift");
-static_assert(sizeof(H3B_COUNTERS) == 360, "H3B counter ABI drift");
+static_assert(sizeof(H3B_COUNTERS) == 432, "H3B counter ABI drift");
 
 typedef HRESULT (WINAPI *PFN_FILTER_CONNECT_COMMUNICATION_PORT)(
     LPCWSTR, DWORD, LPVOID, WORD, LPSECURITY_ATTRIBUTES, HANDLE*);
@@ -249,7 +260,9 @@ static void PrintDelta(const H3B_COUNTERS& before, const H3B_COUNTERS& after)
             L"DroppedInflightOutstanding=%lld PagefileTableFull=%lld "
             L"PayloadWrites=%lld PayloadReads=%lld PayloadMatches=%lld "
             L"PayloadMismatches=%lld PayloadLookupMisses=%lld "
-            L"PayloadCaptureSkipped=%lld PayloadBufferUnavailable=%lld\n",
+            L"PayloadCaptureSkipped=%lld PayloadBufferUnavailable=%lld "
+            L"InterventionArmed=%lld InterventionEligible=%lld "
+            L"InterventionAttempts=%lld InterventionServedPages=%lld\n",
         after.PagefileWrites - before.PagefileWrites,
         after.PagefileReads - before.PagefileReads,
         after.ShadowWritePages - before.ShadowWritePages,
@@ -270,7 +283,11 @@ static void PrintDelta(const H3B_COUNTERS& before, const H3B_COUNTERS& after)
         after.PayloadMismatches - before.PayloadMismatches,
         after.PayloadLookupMisses - before.PayloadLookupMisses,
         after.PayloadCaptureSkipped - before.PayloadCaptureSkipped,
-        after.PayloadBufferUnavailable - before.PayloadBufferUnavailable);
+        after.PayloadBufferUnavailable - before.PayloadBufferUnavailable,
+        after.InterventionArmed,
+        after.InterventionEligible,
+        after.InterventionAttempts - before.InterventionAttempts,
+        after.InterventionServedPages - before.InterventionServedPages);
 }
 
 static bool GetSampledResidency(
@@ -542,7 +559,7 @@ static int TargetMode(DWORD parentPid, SIZE_T targetMiB)
 
 static int SelfTest()
 {
-    if ((sizeof(H3B_COMMAND) != 8) || (sizeof(H3B_COUNTERS) != 360))
+    if ((sizeof(H3B_COMMAND) != 8) || (sizeof(H3B_COUNTERS) != 432))
     {
         fwprintf(stderr, L"SELFTEST=FAIL ABI\n");
         return 2;
@@ -603,6 +620,16 @@ static int MachinePreflight()
     {
         fwprintf(stderr, L"PREFLIGHT=FAIL reason=H3B_QUERY\n");
         return 70;
+    }
+
+    if ((counters.InterventionArmed != 0) ||
+        (counters.InterventionServedPages != 0))
+    {
+        fwprintf(stderr,
+            L"PREFLIGHT=FAIL reason=INTERVENTION_NOT_PASSIVE armed=%lld served=%lld\n",
+            counters.InterventionArmed,
+            counters.InterventionServedPages);
+        return 79;
     }
 
     if ((counters.ShadowMismatches != 0) ||
