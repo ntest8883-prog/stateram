@@ -5,6 +5,7 @@ on:
     branches:
       - h3-pagefile-shadow-history
       - h3-pagefile-shadow-canonical
+      - h3-pagefile-shadow-b51
     paths:
       - "h3/pagefile-read-pressure/**"
       - ".github/workflows/stateram-h3b-pressure.yml"
