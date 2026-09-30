@@ -1,6 +1,6 @@
 #include <fltKernel.h>
 
-#define H3B_PROTOCOL_VERSION 3
+#define H3B_PROTOCOL_VERSION 4
 #define H3B_COMMAND_QUERY    1
 #define H3B_COMMAND_RESET    2
 
@@ -8,6 +8,7 @@
 #define H3B_MAX_PAGEFILE_IDENTITIES 4
 #define H3B_WRITE_HISTORY_SLOTS 2048
 #define H3B_SHADOW_SLOTS     32768
+#define H3B_PAYLOAD_SLOTS    256
 #define H3B_POOL_TAG         'B3HS'
 #define H3B_MAX_HASH_PAGES_PER_IO 4
 #define H3B_WRITE_STATE_INFLIGHT  1
@@ -61,10 +62,20 @@ typedef struct _H3B_COUNTERS
     LONG64 ConcurrentOverlapSkips;
     LONG64 DroppedInflightRecords;
     LONG64 DroppedInflightOutstanding;
+
+    LONG64 PayloadWritePages;
+    LONG64 PayloadReadPages;
+    LONG64 PayloadMatches;
+    LONG64 PayloadMismatches;
+    LONG64 PayloadReplacements;
+    LONG64 PayloadLookupMisses;
+    LONG64 PayloadCaptureSkipped;
+    LONG64 PayloadBufferUnavailable;
+    LONG64 PayloadCapacity;
 } H3B_COUNTERS, *PH3B_COUNTERS;
 
 C_ASSERT(sizeof(H3B_COMMAND) == 8);
-C_ASSERT(sizeof(H3B_COUNTERS) == 288);
+C_ASSERT(sizeof(H3B_COUNTERS) == 360);
 
 typedef struct _H3B_SHADOW_ENTRY
 {
@@ -78,6 +89,15 @@ typedef struct _H3B_SHADOW_ENTRY
     ULONG Reserved2;
     ULONGLONG WriteSequence;
 } H3B_SHADOW_ENTRY, *PH3B_SHADOW_ENTRY;
+
+typedef struct _H3B_PAYLOAD_ENTRY
+{
+    ULONG IdentityIndex;
+    ULONG Generation;
+    ULONGLONG Offset;
+    ULONGLONG WriteSequence;
+    UCHAR Bytes[PAGE_SIZE];
+} H3B_PAYLOAD_ENTRY, *PH3B_PAYLOAD_ENTRY;
 
 typedef struct _H3B_WRITE_RANGE
 {
@@ -128,6 +148,8 @@ H3B_PAGEFILE_OBJECT g_PagefileObjects[H3B_MAX_PAGEFILE_OBJECTS];
 
 KSPIN_LOCK g_ShadowLock;
 PH3B_SHADOW_ENTRY g_ShadowTable;
+KSPIN_LOCK g_PayloadLock;
+H3B_PAYLOAD_ENTRY g_PayloadTable[H3B_PAYLOAD_SLOTS];
 volatile LONG g_ShadowGeneration;
 volatile LONG64 g_WriteSequence;
 
@@ -165,6 +187,16 @@ volatile LONG64 g_DynamicPagefileDiscoveries;
 volatile LONG64 g_ConcurrentOverlapSkips;
 volatile LONG64 g_DroppedInflightRecords;
 volatile LONG64 g_DroppedInflightOutstanding;
+
+volatile LONG64 g_PayloadWritePages;
+volatile LONG64 g_PayloadReadPages;
+volatile LONG64 g_PayloadMatches;
+volatile LONG64 g_PayloadMismatches;
+volatile LONG64 g_PayloadReplacements;
+volatile LONG64 g_PayloadLookupMisses;
+volatile LONG64 g_PayloadCaptureSkipped;
+volatile LONG64 g_PayloadBufferUnavailable;
+
 volatile LONG g_TrackingCompromised;
 
 DRIVER_INITIALIZE DriverEntry;
@@ -217,6 +249,15 @@ H3BResetCounters (
     InterlockedExchange64(&g_ConcurrentOverlapSkips, 0);
     InterlockedExchange64(&g_DroppedInflightRecords, 0);
 
+    InterlockedExchange64(&g_PayloadWritePages, 0);
+    InterlockedExchange64(&g_PayloadReadPages, 0);
+    InterlockedExchange64(&g_PayloadMatches, 0);
+    InterlockedExchange64(&g_PayloadMismatches, 0);
+    InterlockedExchange64(&g_PayloadReplacements, 0);
+    InterlockedExchange64(&g_PayloadLookupMisses, 0);
+    InterlockedExchange64(&g_PayloadCaptureSkipped, 0);
+    InterlockedExchange64(&g_PayloadBufferUnavailable, 0);
+
     generation = InterlockedIncrement(&g_ShadowGeneration);
 
     if (generation == 0)
@@ -229,6 +270,12 @@ H3BResetCounters (
             sizeof(H3B_SHADOW_ENTRY) * H3B_SHADOW_SLOTS);
         g_ShadowGeneration = 1;
         KeReleaseSpinLock(&g_ShadowLock, oldIrql);
+
+        KeAcquireSpinLock(&g_PayloadLock, &oldIrql);
+        RtlZeroMemory(
+            g_PayloadTable,
+            sizeof(g_PayloadTable));
+        KeReleaseSpinLock(&g_PayloadLock, oldIrql);
     }
 }
 
@@ -1098,6 +1145,129 @@ H3BLookupShadow (
 }
 
 static
+ULONG
+H3BPayloadIndex (
+    _In_ ULONG IdentityIndex,
+    _In_ ULONGLONG Offset
+    )
+{
+    ULONGLONG value;
+
+    value = (Offset >> PAGE_SHIFT);
+    value ^= ((ULONGLONG)IdentityIndex * 0xD6E8FEB86659FD93ULL);
+    value ^= (value >> 19);
+
+    return (ULONG)(value & (H3B_PAYLOAD_SLOTS - 1));
+}
+
+static
+BOOLEAN
+H3BPayloadBytesEqual (
+    _In_reads_bytes_(PAGE_SIZE) const UCHAR* Left,
+    _In_reads_bytes_(PAGE_SIZE) const UCHAR* Right
+    )
+{
+    ULONG i;
+
+    for (i = 0; i < PAGE_SIZE; i++)
+    {
+        if (Left[i] != Right[i])
+        {
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
+static
+BOOLEAN
+H3BStorePayload (
+    _In_ ULONG IdentityIndex,
+    _In_ ULONGLONG Offset,
+    _In_ ULONGLONG WriteSequence,
+    _In_ ULONG WriteGeneration,
+    _In_reads_bytes_(PAGE_SIZE) const UCHAR* Bytes
+    )
+{
+    KIRQL oldIrql;
+    ULONG index;
+    LONG generation;
+    PH3B_PAYLOAD_ENTRY entry;
+    BOOLEAN currentEntry;
+
+    generation = InterlockedCompareExchange(&g_ShadowGeneration, 0, 0);
+
+    if ((ULONG)generation != WriteGeneration)
+    {
+        return FALSE;
+    }
+
+    index = H3BPayloadIndex(IdentityIndex, Offset);
+
+    KeAcquireSpinLock(&g_PayloadLock, &oldIrql);
+
+    entry = &g_PayloadTable[index];
+    currentEntry = (entry->Generation == (ULONG)generation) ? TRUE : FALSE;
+
+    if (currentEntry &&
+        ((entry->IdentityIndex != IdentityIndex) ||
+         (entry->Offset != Offset) ||
+         (entry->WriteSequence != WriteSequence)))
+    {
+        InterlockedIncrement64(&g_PayloadReplacements);
+    }
+
+    entry->IdentityIndex = IdentityIndex;
+    entry->Generation = (ULONG)generation;
+    entry->Offset = Offset;
+    entry->WriteSequence = WriteSequence;
+    RtlCopyMemory(entry->Bytes, Bytes, PAGE_SIZE);
+
+    KeReleaseSpinLock(&g_PayloadLock, oldIrql);
+    return TRUE;
+}
+
+static
+BOOLEAN
+H3BComparePayload (
+    _In_ ULONG IdentityIndex,
+    _In_ ULONGLONG Offset,
+    _In_ ULONGLONG WriteSequence,
+    _In_reads_bytes_(PAGE_SIZE) const UCHAR* Bytes,
+    _Out_ PBOOLEAN Match
+    )
+{
+    KIRQL oldIrql;
+    ULONG index;
+    LONG generation;
+    PH3B_PAYLOAD_ENTRY entry;
+    BOOLEAN found;
+
+    found = FALSE;
+    *Match = FALSE;
+
+    generation = InterlockedCompareExchange(&g_ShadowGeneration, 0, 0);
+    index = H3BPayloadIndex(IdentityIndex, Offset);
+
+    KeAcquireSpinLock(&g_PayloadLock, &oldIrql);
+
+    entry = &g_PayloadTable[index];
+
+    if ((entry->Generation == (ULONG)generation) &&
+        (entry->IdentityIndex == IdentityIndex) &&
+        (entry->Offset == Offset) &&
+        (entry->WriteSequence == WriteSequence))
+    {
+        *Match = H3BPayloadBytesEqual(entry->Bytes, Bytes);
+        found = TRUE;
+    }
+
+    KeReleaseSpinLock(&g_PayloadLock, oldIrql);
+    return found;
+}
+
+static
 PVOID
 H3BGetReadBuffer (
     _Inout_ PFLT_CALLBACK_DATA Data
@@ -1272,6 +1442,7 @@ H3BShadowCompletedWrite (
 {
     PVOID mappedBuffer;
     PUCHAR bytes;
+    PUCHAR payloadScratch;
     ULONGLONG baseOffset;
     ULONGLONG writeSequence;
     ULONG_PTR completedBytes;
@@ -1280,6 +1451,7 @@ H3BShadowCompletedWrite (
     ULONG writeGeneration;
     ULONG identityIndex;
 
+    payloadScratch = NULL;
     writeSequence = Context->Sequence;
 
     if (KeGetCurrentIrql() > DISPATCH_LEVEL)
@@ -1344,6 +1516,20 @@ H3BShadowCompletedWrite (
     }
 
     bytes = (PUCHAR)mappedBuffer;
+
+#pragma warning(push)
+#pragma warning(disable:4996)
+    payloadScratch = (PUCHAR)ExAllocatePoolWithTag(
+        NonPagedPoolNx,
+        PAGE_SIZE,
+        H3B_POOL_TAG);
+#pragma warning(pop)
+
+    if (payloadScratch == NULL)
+    {
+        InterlockedIncrement64(&g_PayloadBufferUnavailable);
+    }
+
     pageCount = (ULONG)(completedBytes / PAGE_SIZE);
 
     if (pageCount > H3B_MAX_HASH_PAGES_PER_IO)
@@ -1372,13 +1558,6 @@ H3BShadowCompletedWrite (
                 bytes + ((SIZE_T)i * PAGE_SIZE),
                 0xD6E8FEB86659FD93ULL);
 
-            /*
-             * The lower storage stack may consume the paging buffer while the
-             * originating memory remains mutable.  Publish only when the page
-             * fingerprint is identical before and after the I/O.  This turns
-             * buffer instability into an explicit skipped sample instead of a
-             * false shadow mismatch later.
-             */
             if ((postHash1 != Context->Hash1[i]) ||
                 (postHash2 != Context->Hash2[i]))
             {
@@ -1408,6 +1587,41 @@ H3BShadowCompletedWrite (
                     writeGeneration))
             {
                 InterlockedIncrement64(&g_ShadowWritePages);
+
+                if (payloadScratch != NULL)
+                {
+                    ULONGLONG payloadHash1;
+                    ULONGLONG payloadHash2;
+
+                    RtlCopyMemory(
+                        payloadScratch,
+                        bytes + ((SIZE_T)i * PAGE_SIZE),
+                        PAGE_SIZE);
+
+                    payloadHash1 = H3BHashPage(
+                        payloadScratch,
+                        0x9E3779B97F4A7C15ULL);
+
+                    payloadHash2 = H3BHashPage(
+                        payloadScratch,
+                        0xD6E8FEB86659FD93ULL);
+
+                    if ((payloadHash1 == Context->Hash1[i]) &&
+                        (payloadHash2 == Context->Hash2[i]) &&
+                        H3BStorePayload(
+                            identityIndex,
+                            offset,
+                            writeSequence,
+                            writeGeneration,
+                            payloadScratch))
+                    {
+                        InterlockedIncrement64(&g_PayloadWritePages);
+                    }
+                    else
+                    {
+                        InterlockedIncrement64(&g_PayloadCaptureSkipped);
+                    }
+                }
             }
             else
             {
@@ -1419,6 +1633,13 @@ H3BShadowCompletedWrite (
     {
         InterlockedIncrement64(&g_ShadowBufferUnavailable);
     }
+
+    if (payloadScratch != NULL)
+    {
+        ExFreePoolWithTag(
+            payloadScratch,
+            H3B_POOL_TAG);
+    }
 }
 
 static
@@ -1429,12 +1650,15 @@ H3BVerifyCompletedRead (
 {
     PVOID mappedBuffer;
     PUCHAR bytes;
+    PUCHAR payloadScratch;
     ULONGLONG baseOffset;
     ULONG_PTR completedBytes;
     ULONG pageCount;
     ULONG i;
     ULONG identityIndex;
     BOOLEAN newSystemBufferRead;
+
+    payloadScratch = NULL;
 
     if (KeGetCurrentIrql() > DISPATCH_LEVEL)
     {
@@ -1490,6 +1714,20 @@ H3BVerifyCompletedRead (
     }
 
     bytes = (PUCHAR)mappedBuffer;
+
+#pragma warning(push)
+#pragma warning(disable:4996)
+    payloadScratch = (PUCHAR)ExAllocatePoolWithTag(
+        NonPagedPoolNx,
+        PAGE_SIZE,
+        H3B_POOL_TAG);
+#pragma warning(pop)
+
+    if (payloadScratch == NULL)
+    {
+        InterlockedIncrement64(&g_PayloadBufferUnavailable);
+    }
+
     pageCount = (ULONG)(completedBytes / PAGE_SIZE);
 
     if (pageCount > H3B_MAX_HASH_PAGES_PER_IO)
@@ -1564,6 +1802,39 @@ H3BVerifyCompletedRead (
             {
                 InterlockedIncrement64(&g_ShadowMatches);
 
+                if (payloadScratch != NULL)
+                {
+                    BOOLEAN payloadMatch;
+
+                    RtlCopyMemory(
+                        payloadScratch,
+                        bytes + ((SIZE_T)i * PAGE_SIZE),
+                        PAGE_SIZE);
+
+                    if (H3BComparePayload(
+                            identityIndex,
+                            offset,
+                            writeSequence,
+                            payloadScratch,
+                            &payloadMatch))
+                    {
+                        InterlockedIncrement64(&g_PayloadReadPages);
+
+                        if (payloadMatch)
+                        {
+                            InterlockedIncrement64(&g_PayloadMatches);
+                        }
+                        else
+                        {
+                            InterlockedIncrement64(&g_PayloadMismatches);
+                        }
+                    }
+                    else
+                    {
+                        InterlockedIncrement64(&g_PayloadLookupMisses);
+                    }
+                }
+
                 if (crossObject)
                 {
                     InterlockedIncrement64(&g_CrossObjectMatches);
@@ -1588,6 +1859,13 @@ H3BVerifyCompletedRead (
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
         InterlockedIncrement64(&g_ShadowBufferUnavailable);
+    }
+
+    if (payloadScratch != NULL)
+    {
+        ExFreePoolWithTag(
+            payloadScratch,
+            H3B_POOL_TAG);
     }
 }
 
@@ -1950,6 +2228,16 @@ H3BMessage (
     reply->DroppedInflightRecords = H3BReadCounter(&g_DroppedInflightRecords);
     reply->DroppedInflightOutstanding = H3BReadCounter(&g_DroppedInflightOutstanding);
 
+    reply->PayloadWritePages = H3BReadCounter(&g_PayloadWritePages);
+    reply->PayloadReadPages = H3BReadCounter(&g_PayloadReadPages);
+    reply->PayloadMatches = H3BReadCounter(&g_PayloadMatches);
+    reply->PayloadMismatches = H3BReadCounter(&g_PayloadMismatches);
+    reply->PayloadReplacements = H3BReadCounter(&g_PayloadReplacements);
+    reply->PayloadLookupMisses = H3BReadCounter(&g_PayloadLookupMisses);
+    reply->PayloadCaptureSkipped = H3BReadCounter(&g_PayloadCaptureSkipped);
+    reply->PayloadBufferUnavailable = H3BReadCounter(&g_PayloadBufferUnavailable);
+    reply->PayloadCapacity = H3B_PAYLOAD_SLOTS;
+
     *ReturnOutputBufferLength = sizeof(*reply);
     return STATUS_SUCCESS;
 }
@@ -2056,9 +2344,13 @@ DriverEntry (
     RtlZeroMemory(
         g_PagefileObjects,
         sizeof(g_PagefileObjects));
+    RtlZeroMemory(
+        g_PayloadTable,
+        sizeof(g_PayloadTable));
 
     KeInitializeSpinLock(&g_PagefileLock);
     KeInitializeSpinLock(&g_ShadowLock);
+    KeInitializeSpinLock(&g_PayloadLock);
 
     /*
      * ExAllocatePool2 would remove the deprecation warning in newer WDKs, but
