@@ -2170,6 +2170,7 @@ H3BVerifyCompletedRead (
                         else
                         {
                             InterlockedIncrement64(&g_PayloadMismatches);
+                            InterlockedExchange(&g_InterventionArmed, 0);
                         }
                     }
                     else
@@ -2186,6 +2187,7 @@ H3BVerifyCompletedRead (
             else
             {
                 InterlockedIncrement64(&g_ShadowMismatches);
+                InterlockedExchange(&g_InterventionArmed, 0);
 
                 if (crossObject)
                 {
