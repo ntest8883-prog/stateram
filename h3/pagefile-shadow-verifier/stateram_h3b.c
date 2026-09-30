@@ -1626,6 +1626,14 @@ H3BTrySinglePageIntervention (
         return FALSE;
     }
 
+    if (MmGetMdlByteCount(mdl) < PAGE_SIZE)
+    {
+        InterlockedIncrement64(&g_InterventionGuardRejects);
+        InterlockedIncrement64(&g_InterventionFallbacks);
+        InterlockedExchange(&g_InterventionInProgress, 0);
+        return FALSE;
+    }
+
     mappedBuffer = MmGetSystemAddressForMdlSafe(
         mdl,
         NormalPagePriority);
@@ -1717,8 +1725,10 @@ H3BCapturePreWriteHashes (
     PUCHAR bytes;
     LONGLONG signedOffset;
     ULONG length;
+    ULONG accessibleLength;
     ULONG pageCount;
     ULONG i;
+    PMDL mdl;
 
     Context->PageCount = 0;
     Context->PreHashValid = FALSE;
@@ -1746,7 +1756,21 @@ H3BCapturePreWriteHashes (
     }
 
     bytes = (PUCHAR)mappedBuffer;
-    pageCount = length / PAGE_SIZE;
+    accessibleLength = length;
+    mdl = Data->Iopb->Parameters.Write.MdlAddress;
+
+    if (mdl != NULL)
+    {
+        ULONG mdlBytes;
+
+        mdlBytes = MmGetMdlByteCount(mdl);
+        if (mdlBytes < accessibleLength)
+        {
+            accessibleLength = mdlBytes;
+        }
+    }
+
+    pageCount = accessibleLength / PAGE_SIZE;
     if (pageCount > H3B_MAX_HASH_PAGES_PER_IO)
     {
         pageCount = H3B_MAX_HASH_PAGES_PER_IO;
@@ -1792,6 +1816,7 @@ H3BShadowCompletedWrite (
     ULONG i;
     ULONG writeGeneration;
     ULONG identityIndex;
+    PMDL mdl;
 
     payloadScratch = NULL;
     writeSequence = Context->Sequence;
@@ -1873,6 +1898,18 @@ H3BShadowCompletedWrite (
     }
 
     pageCount = (ULONG)(completedBytes / PAGE_SIZE);
+    mdl = Data->Iopb->Parameters.Write.MdlAddress;
+
+    if (mdl != NULL)
+    {
+        ULONG mdlPages;
+
+        mdlPages = MmGetMdlByteCount(mdl) / PAGE_SIZE;
+        if (pageCount > mdlPages)
+        {
+            pageCount = mdlPages;
+        }
+    }
 
     if (pageCount > H3B_MAX_HASH_PAGES_PER_IO)
     {
@@ -1999,6 +2036,7 @@ H3BVerifyCompletedRead (
     ULONG pageCount;
     ULONG i;
     ULONG identityIndex;
+    PMDL mdl;
     BOOLEAN newSystemBufferRead;
 
     payloadScratch = NULL;
@@ -2072,6 +2110,18 @@ H3BVerifyCompletedRead (
     }
 
     pageCount = (ULONG)(completedBytes / PAGE_SIZE);
+    mdl = Data->Iopb->Parameters.Read.MdlAddress;
+
+    if (mdl != NULL)
+    {
+        ULONG mdlPages;
+
+        mdlPages = MmGetMdlByteCount(mdl) / PAGE_SIZE;
+        if (pageCount > mdlPages)
+        {
+            pageCount = mdlPages;
+        }
+    }
 
     if (pageCount > H3B_MAX_HASH_PAGES_PER_IO)
     {
