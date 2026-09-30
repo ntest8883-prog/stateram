@@ -9,9 +9,9 @@
 #include <psapi.h>
 #pragma comment(lib, "psapi.lib")
 
-// H3-C1 payload-aware pressure harness (protocol v4).
+// H3-D0 intervention-aware pressure harness (protocol v5).
 static const wchar_t* kPortName = L"\\StateRAMH3BPort";
-static const uint32_t kProtocolVersion = 4;
+static const uint32_t kProtocolVersion = 5;
 static const uint32_t kCommandQuery = 1;
 static const SIZE_T kMiB = 1024ull * 1024ull;
 static const SIZE_T kPressureChunk = 32ull * kMiB;
@@ -87,11 +87,21 @@ struct H3B_COUNTERS
     int64_t PayloadCaptureSkipped;
     int64_t PayloadBufferUnavailable;
     int64_t PayloadCapacity;
+
+    int64_t InterventionArmed;
+    int64_t InterventionAttempts;
+    int64_t InterventionEligible;
+    int64_t InterventionServed;
+    int64_t InterventionBytes;
+    int64_t InterventionFallbacks;
+    int64_t InterventionPayloadMisses;
+    int64_t InterventionBufferUnavailable;
+    int64_t InterventionSafetyRejects;
 };
 #pragma pack(pop)
 
 static_assert(sizeof(H3B_COMMAND) == 8, "H3B command ABI drift");
-static_assert(sizeof(H3B_COUNTERS) == 360, "H3B counter ABI drift");
+static_assert(sizeof(H3B_COUNTERS) == 432, "H3B counter ABI drift");
 
 typedef HRESULT (WINAPI *PFN_FILTER_CONNECT_COMMUNICATION_PORT)(
     LPCWSTR, DWORD, LPVOID, WORD, LPSECURITY_ATTRIBUTES, HANDLE*);
@@ -249,7 +259,12 @@ static void PrintDelta(const H3B_COUNTERS& before, const H3B_COUNTERS& after)
             L"DroppedInflightOutstanding=%lld PagefileTableFull=%lld "
             L"PayloadWrites=%lld PayloadReads=%lld PayloadMatches=%lld "
             L"PayloadMismatches=%lld PayloadLookupMisses=%lld "
-            L"PayloadCaptureSkipped=%lld PayloadBufferUnavailable=%lld\n",
+            L"PayloadCaptureSkipped=%lld PayloadBufferUnavailable=%lld "
+            L"InterventionArmed=%lld InterventionAttempts=%lld "
+            L"InterventionEligible=%lld InterventionServed=%lld "
+            L"InterventionBytes=%lld InterventionFallbacks=%lld "
+            L"InterventionPayloadMisses=%lld InterventionBufferUnavailable=%lld "
+            L"InterventionSafetyRejects=%lld\n",
         after.PagefileWrites - before.PagefileWrites,
         after.PagefileReads - before.PagefileReads,
         after.ShadowWritePages - before.ShadowWritePages,
@@ -270,7 +285,16 @@ static void PrintDelta(const H3B_COUNTERS& before, const H3B_COUNTERS& after)
         after.PayloadMismatches - before.PayloadMismatches,
         after.PayloadLookupMisses - before.PayloadLookupMisses,
         after.PayloadCaptureSkipped - before.PayloadCaptureSkipped,
-        after.PayloadBufferUnavailable - before.PayloadBufferUnavailable);
+        after.PayloadBufferUnavailable - before.PayloadBufferUnavailable,
+        after.InterventionArmed,
+        after.InterventionAttempts - before.InterventionAttempts,
+        after.InterventionEligible - before.InterventionEligible,
+        after.InterventionServed - before.InterventionServed,
+        after.InterventionBytes - before.InterventionBytes,
+        after.InterventionFallbacks - before.InterventionFallbacks,
+        after.InterventionPayloadMisses - before.InterventionPayloadMisses,
+        after.InterventionBufferUnavailable - before.InterventionBufferUnavailable,
+        after.InterventionSafetyRejects - before.InterventionSafetyRejects);
 }
 
 static bool GetSampledResidency(
@@ -542,7 +566,7 @@ static int TargetMode(DWORD parentPid, SIZE_T targetMiB)
 
 static int SelfTest()
 {
-    if ((sizeof(H3B_COMMAND) != 8) || (sizeof(H3B_COUNTERS) != 360))
+    if ((sizeof(H3B_COMMAND) != 8) || (sizeof(H3B_COUNTERS) != 432))
     {
         fwprintf(stderr, L"SELFTEST=FAIL ABI\n");
         return 2;
@@ -603,6 +627,12 @@ static int MachinePreflight()
     {
         fwprintf(stderr, L"PREFLIGHT=FAIL reason=H3B_QUERY\n");
         return 70;
+    }
+
+    if (counters.InterventionArmed != 0)
+    {
+        fwprintf(stderr, L"PREFLIGHT=FAIL reason=INTERVENTION_ARMED\n");
+        return 69;
     }
 
     if ((counters.ShadowMismatches != 0) ||
@@ -768,7 +798,7 @@ static int ParentMode()
 
     wprintf(L"BASELINE pagefileObjects=%lld identities=%lld creates=%lld shadowWrites=%lld "
             L"shadowReads=%lld matches=%lld mismatches=%lld "
-            L"historyDrops=%lld concurrentOverlapSkips=%lld\n",
+            L"historyDrops=%lld concurrentOverlapSkips=%lld interventionArmed=%lld\n",
         before.KnownPagefiles,
         before.PagefileIdentities,
         before.PagingFileCreates,
@@ -777,7 +807,8 @@ static int ParentMode()
         before.ShadowMatches,
         before.ShadowMismatches,
         before.HistoryRecordDrops,
-        before.ConcurrentOverlapSkips);
+        before.ConcurrentOverlapSkips,
+        before.InterventionArmed);
 
     wprintf(L"MEMORY_INITIAL total=%llu MiB available=%llu MiB commitAvailable=%llu MiB\n",
         static_cast<unsigned long long>(initial.totalPhysMiB),
@@ -1237,6 +1268,15 @@ static int ParentMode()
             break;
         }
 
+        if (after.InterventionSafetyRejects != before.InterventionSafetyRejects)
+        {
+            fwprintf(stderr,
+                L"RESULT=STOP_INTERVENTION_SAFETY_REJECT delta=%lld\n",
+                after.InterventionSafetyRejects - before.InterventionSafetyRejects);
+            result = 49;
+            break;
+        }
+
         if (after.PagefileTableFull != 0)
         {
             fwprintf(stderr,
@@ -1252,9 +1292,32 @@ static int ParentMode()
         int64_t payloadMatchDelta = after.PayloadMatches - before.PayloadMatches;
         int64_t payloadMismatchDelta = after.PayloadMismatches - before.PayloadMismatches;
 
-        if ((payloadReadDelta > 0) &&
-            (payloadMatchDelta > 0) &&
-            (payloadMismatchDelta == 0))
+        int64_t interventionServedDelta =
+            after.InterventionServed - before.InterventionServed;
+        int64_t interventionEligibleDelta =
+            after.InterventionEligible - before.InterventionEligible;
+        int64_t interventionSafetyRejectDelta =
+            after.InterventionSafetyRejects - before.InterventionSafetyRejects;
+
+        if (interventionServedDelta > 0)
+        {
+            wprintf(L"RESULT=INTERVENTION_SERVED servedDelta=%lld eligibleDelta=%lld "
+                    L"safetyRejectDelta=%lld armedFinal=%lld "
+                    L"payloadReadPagesDelta=%lld payloadMatchesDelta=%lld "
+                    L"shadowReadPagesDelta=%lld shadowMatchesDelta=%lld\n",
+                interventionServedDelta,
+                interventionEligibleDelta,
+                interventionSafetyRejectDelta,
+                after.InterventionArmed,
+                payloadReadDelta,
+                payloadMatchDelta,
+                readDelta,
+                matchDelta);
+            result = 0;
+        }
+        else if ((payloadReadDelta > 0) &&
+                 (payloadMatchDelta > 0) &&
+                 (payloadMismatchDelta == 0))
         {
             wprintf(L"RESULT=PAYLOAD_PASS payloadReadPagesDelta=%lld "
                     L"payloadMatchesDelta=%lld payloadMismatchesDelta=%lld "
