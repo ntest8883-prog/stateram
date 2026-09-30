@@ -6,7 +6,7 @@
 
 #define H3B_MAX_PAGEFILE_OBJECTS 16
 #define H3B_MAX_PAGEFILE_IDENTITIES 4
-#define H3B_WRITE_HISTORY_SLOTS 256
+#define H3B_WRITE_HISTORY_SLOTS 2048
 #define H3B_SHADOW_SLOTS     32768
 #define H3B_POOL_TAG         'B3HS'
 #define H3B_MAX_HASH_PAGES_PER_IO 4
@@ -90,6 +90,16 @@ typedef struct _H3B_WRITE_RANGE
     ULONG Reserved;
 } H3B_WRITE_RANGE, *PH3B_WRITE_RANGE;
 
+typedef struct _H3B_WRITE_CONTEXT
+{
+    ULONGLONG Sequence;
+    ULONG PageCount;
+    BOOLEAN PreHashValid;
+    UCHAR Reserved[3];
+    ULONGLONG Hash1[H3B_MAX_HASH_PAGES_PER_IO];
+    ULONGLONG Hash2[H3B_MAX_HASH_PAGES_PER_IO];
+} H3B_WRITE_CONTEXT, *PH3B_WRITE_CONTEXT;
+
 typedef struct _H3B_PAGEFILE_STATE
 {
     PFLT_INSTANCE Instance;
@@ -118,6 +128,8 @@ H3B_PAGEFILE_OBJECT g_PagefileObjects[H3B_MAX_PAGEFILE_OBJECTS];
 
 KSPIN_LOCK g_ShadowLock;
 PH3B_SHADOW_ENTRY g_ShadowTable;
+NPAGED_LOOKASIDE_LIST g_WriteContextLookaside;
+BOOLEAN g_WriteContextLookasideInitialized;
 volatile LONG g_ShadowGeneration;
 volatile LONG64 g_WriteSequence;
 
@@ -1186,19 +1198,91 @@ H3BGetWriteBuffer (
 
 static
 VOID
+H3BCapturePreWriteHashes (
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _Inout_ PH3B_WRITE_CONTEXT Context
+    )
+{
+    PVOID mappedBuffer;
+    PUCHAR bytes;
+    LONGLONG signedOffset;
+    ULONG length;
+    ULONG pageCount;
+    ULONG i;
+
+    Context->PageCount = 0;
+    Context->PreHashValid = FALSE;
+
+    if (KeGetCurrentIrql() > DISPATCH_LEVEL)
+    {
+        return;
+    }
+
+    signedOffset = Data->Iopb->Parameters.Write.ByteOffset.QuadPart;
+    length = Data->Iopb->Parameters.Write.Length;
+
+    if ((signedOffset < 0) ||
+        (length == 0) ||
+        (((ULONGLONG)signedOffset & (PAGE_SIZE - 1)) != 0) ||
+        ((length & (PAGE_SIZE - 1)) != 0))
+    {
+        return;
+    }
+
+    mappedBuffer = H3BGetWriteBuffer(Data);
+    if (mappedBuffer == NULL)
+    {
+        return;
+    }
+
+    bytes = (PUCHAR)mappedBuffer;
+    pageCount = length / PAGE_SIZE;
+    if (pageCount > H3B_MAX_HASH_PAGES_PER_IO)
+    {
+        pageCount = H3B_MAX_HASH_PAGES_PER_IO;
+    }
+
+    __try
+    {
+        for (i = 0; i < pageCount; i++)
+        {
+            Context->Hash1[i] = H3BHashPage(
+                bytes + ((SIZE_T)i * PAGE_SIZE),
+                0x9E3779B97F4A7C15ULL);
+
+            Context->Hash2[i] = H3BHashPage(
+                bytes + ((SIZE_T)i * PAGE_SIZE),
+                0xD6E8FEB86659FD93ULL);
+        }
+
+        Context->PageCount = pageCount;
+        Context->PreHashValid = TRUE;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        Context->PageCount = 0;
+        Context->PreHashValid = FALSE;
+    }
+}
+
+static
+VOID
 H3BShadowCompletedWrite (
     _Inout_ PFLT_CALLBACK_DATA Data,
-    _In_ ULONGLONG WriteSequence
+    _In_ PH3B_WRITE_CONTEXT Context
     )
 {
     PVOID mappedBuffer;
     PUCHAR bytes;
     ULONGLONG baseOffset;
+    ULONGLONG writeSequence;
     ULONG_PTR completedBytes;
     ULONG pageCount;
     ULONG i;
     ULONG writeGeneration;
     ULONG identityIndex;
+
+    writeSequence = Context->Sequence;
 
     if (KeGetCurrentIrql() > DISPATCH_LEVEL)
     {
@@ -1255,6 +1339,12 @@ H3BShadowCompletedWrite (
         return;
     }
 
+    if (!Context->PreHashValid || (Context->PageCount == 0))
+    {
+        InterlockedIncrement64(&g_ShadowPublishSkipped);
+        return;
+    }
+
     bytes = (PUCHAR)mappedBuffer;
     pageCount = (ULONG)(completedBytes / PAGE_SIZE);
 
@@ -1263,28 +1353,47 @@ H3BShadowCompletedWrite (
         pageCount = H3B_MAX_HASH_PAGES_PER_IO;
     }
 
+    if (pageCount > Context->PageCount)
+    {
+        pageCount = Context->PageCount;
+    }
+
     __try
     {
         for (i = 0; i < pageCount; i++)
         {
-            ULONGLONG hash1;
-            ULONGLONG hash2;
+            ULONGLONG postHash1;
+            ULONGLONG postHash2;
             ULONGLONG offset;
 
-            hash1 = H3BHashPage(
+            postHash1 = H3BHashPage(
                 bytes + ((SIZE_T)i * PAGE_SIZE),
                 0x9E3779B97F4A7C15ULL);
 
-            hash2 = H3BHashPage(
+            postHash2 = H3BHashPage(
                 bytes + ((SIZE_T)i * PAGE_SIZE),
                 0xD6E8FEB86659FD93ULL);
+
+            /*
+             * The lower storage stack may consume the paging buffer while the
+             * originating memory remains mutable.  Publish only when the page
+             * fingerprint is identical before and after the I/O.  This turns
+             * buffer instability into an explicit skipped sample instead of a
+             * false shadow mismatch later.
+             */
+            if ((postHash1 != Context->Hash1[i]) ||
+                (postHash2 != Context->Hash2[i]))
+            {
+                InterlockedIncrement64(&g_ShadowPublishSkipped);
+                continue;
+            }
 
             offset = baseOffset + ((ULONGLONG)i * PAGE_SIZE);
 
             if (!H3BHistoryAllowsPublish(
                     identityIndex,
                     offset,
-                    WriteSequence,
+                    writeSequence,
                     &writeGeneration))
             {
                 InterlockedIncrement64(&g_ShadowPublishSkipped);
@@ -1295,9 +1404,9 @@ H3BShadowCompletedWrite (
                     identityIndex,
                     Data->Iopb->TargetFileObject,
                     offset,
-                    hash1,
-                    hash2,
-                    WriteSequence,
+                    Context->Hash1[i],
+                    Context->Hash2[i],
+                    writeSequence,
                     writeGeneration))
             {
                 InterlockedIncrement64(&g_ShadowWritePages);
@@ -1542,6 +1651,7 @@ H3BPreWrite (
 {
     ULONG length;
     ULONGLONG writeSequence;
+    PH3B_WRITE_CONTEXT writeContext;
 
     if (!H3BEnsureKnownPagefile(Data, FltObjects))
     {
@@ -1550,18 +1660,37 @@ H3BPreWrite (
 
     length = Data->Iopb->Parameters.Write.Length;
 
+    writeContext = (PH3B_WRITE_CONTEXT)
+        ExAllocateFromNPagedLookasideList(&g_WriteContextLookaside);
+
+    if (writeContext == NULL)
+    {
+        InterlockedIncrement64(&g_ShadowBufferUnavailable);
+        InterlockedIncrement64(&g_PagefileWrites);
+        InterlockedAdd64(&g_PagefileWriteBytes, length);
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    RtlZeroMemory(writeContext, sizeof(*writeContext));
+
     if (!H3BRecordWriteRange(
             Data->Iopb->TargetFileObject,
             Data->Iopb->Parameters.Write.ByteOffset.QuadPart,
             length,
             &writeSequence))
     {
+        ExFreeToNPagedLookasideList(
+            &g_WriteContextLookaside,
+            writeContext);
+
         InterlockedIncrement64(&g_PagefileWrites);
         InterlockedAdd64(&g_PagefileWriteBytes, length);
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
-    *CompletionContext = (PVOID)(ULONG_PTR)writeSequence;
+    writeContext->Sequence = writeSequence;
+    H3BCapturePreWriteHashes(Data, writeContext);
+    *CompletionContext = writeContext;
 
     InterlockedIncrement64(&g_PagefileWrites);
     InterlockedAdd64(&g_PagefileWriteBytes, length);
@@ -1577,14 +1706,24 @@ H3BPostWrite (
     _In_ FLT_POST_OPERATION_FLAGS Flags
     )
 {
+    PH3B_WRITE_CONTEXT writeContext;
     ULONGLONG writeSequence;
 
     UNREFERENCED_PARAMETER(FltObjects);
 
-    writeSequence = (ULONGLONG)(ULONG_PTR)CompletionContext;
+    writeContext = (PH3B_WRITE_CONTEXT)CompletionContext;
+    if (writeContext == NULL)
+    {
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+
+    writeSequence = writeContext->Sequence;
 
     if (FlagOn(Flags, FLTFL_POST_OPERATION_DRAINING))
     {
+        ExFreeToNPagedLookasideList(
+            &g_WriteContextLookaside,
+            writeContext);
         return FLT_POSTOP_FINISHED_PROCESSING;
     }
 
@@ -1603,14 +1742,21 @@ H3BPostWrite (
             InterlockedIncrement64(&g_ShadowPublishSkipped);
         }
 
+        ExFreeToNPagedLookasideList(
+            &g_WriteContextLookaside,
+            writeContext);
         return FLT_POSTOP_FINISHED_PROCESSING;
     }
 
     if (NT_SUCCESS(Data->IoStatus.Status) &&
         (Data->IoStatus.Information != 0))
     {
-        H3BShadowCompletedWrite(Data, writeSequence);
+        H3BShadowCompletedWrite(Data, writeContext);
     }
+
+    ExFreeToNPagedLookasideList(
+        &g_WriteContextLookaside,
+        writeContext);
 
     return FLT_POSTOP_FINISHED_PROCESSING;
 }
@@ -1825,6 +1971,12 @@ H3BUnload (
 
     H3BReleasePagefiles();
 
+    if (g_WriteContextLookasideInitialized)
+    {
+        ExDeleteNPagedLookasideList(&g_WriteContextLookaside);
+        g_WriteContextLookasideInitialized = FALSE;
+    }
+
     if (g_ShadowTable != NULL)
     {
         ExFreePoolWithTag(g_ShadowTable, H3B_POOL_TAG);
@@ -1897,6 +2049,7 @@ DriverEntry (
     g_ServerPort = NULL;
     g_ClientPort = NULL;
     g_ShadowTable = NULL;
+    g_WriteContextLookasideInitialized = FALSE;
     g_ShadowGeneration = 1;
     g_WriteSequence = 1;
     g_TrackingCompromised = 0;
@@ -1995,10 +2148,22 @@ DriverEntry (
         return status;
     }
 
+    ExInitializeNPagedLookasideList(
+        &g_WriteContextLookaside,
+        NULL,
+        NULL,
+        0,
+        sizeof(H3B_WRITE_CONTEXT),
+        H3B_POOL_TAG,
+        0);
+    g_WriteContextLookasideInitialized = TRUE;
+
     status = FltStartFiltering(g_Filter);
 
     if (!NT_SUCCESS(status))
     {
+        ExDeleteNPagedLookasideList(&g_WriteContextLookaside);
+        g_WriteContextLookasideInitialized = FALSE;
         FltCloseCommunicationPort(g_ServerPort);
         g_ServerPort = NULL;
         FltUnregisterFilter(g_Filter);
