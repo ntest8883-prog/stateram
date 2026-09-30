@@ -10,6 +10,7 @@ on:
       - h3-pagefile-shadow-b51
       - h3-payload-mirror-c1
       - h3-payload-mirror-c2
+      - h3-intervention-d0
     paths:
       - "h3/pagefile-shadow-verifier/**"
       - ".github/workflows/stateram-h3b-shadow.yml"
