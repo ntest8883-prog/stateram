@@ -1584,47 +1584,6 @@ H3BCopyLatestVerifiedPayload (
 
 static
 BOOLEAN
-H3BCopyPayload (
-    _In_ ULONG IdentityIndex,
-    _In_ ULONGLONG Offset,
-    _In_ ULONGLONG WriteSequence,
-    _Out_writes_bytes_(PAGE_SIZE) UCHAR* Destination
-    )
-{
-    KIRQL oldIrql;
-    ULONG baseIndex;
-    ULONG i;
-    LONG generation;
-    PH3B_PAYLOAD_ENTRY entry;
-    BOOLEAN found;
-
-    found = FALSE;
-    generation = InterlockedCompareExchange(&g_ShadowGeneration, 0, 0);
-    baseIndex = H3BPayloadWriteBase(WriteSequence);
-
-    KeAcquireSpinLock(&g_PayloadLock, &oldIrql);
-
-    for (i = 0; i < H3B_MAX_HASH_PAGES_PER_IO; i++)
-    {
-        entry = &g_PayloadTable[baseIndex + i];
-
-        if ((entry->Generation == (ULONG)generation) &&
-            (entry->IdentityIndex == IdentityIndex) &&
-            (entry->Offset == Offset) &&
-            (entry->WriteSequence == WriteSequence))
-        {
-            RtlCopyMemory(Destination, entry->Bytes, PAGE_SIZE);
-            found = TRUE;
-            break;
-        }
-    }
-
-    KeReleaseSpinLock(&g_PayloadLock, oldIrql);
-    return found;
-}
-
-static
-BOOLEAN
 H3BInterventionEligible (
     VOID
     )
