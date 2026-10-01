@@ -2816,12 +2816,7 @@ H3BVerifyCompletedRead (
         InterlockedIncrement64(&g_ShadowBufferUnavailable);
     }
 
-    if (payloadScratch != NULL)
-    {
-        ExFreePoolWithTag(
-            payloadScratch,
-            H3B_POOL_TAG);
-    }
+
 }
 
 FLT_PREOP_CALLBACK_STATUS
