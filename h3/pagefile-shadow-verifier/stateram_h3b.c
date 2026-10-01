@@ -1,6 +1,6 @@
 #include <fltKernel.h>
 
-#define H3B_PROTOCOL_VERSION 6
+#define H3B_PROTOCOL_VERSION 7
 #define H3B_COMMAND_QUERY    1
 #define H3B_COMMAND_RESET    2
 #define H3B_COMMAND_ARM      3
@@ -14,6 +14,10 @@
 #define H3B_PAYLOAD_WRITES_RETAINED (H3B_PAYLOAD_SLOTS / H3B_MAX_HASH_PAGES_PER_IO)
 #define H3B_POOL_TAG         'B3HS'
 #define H3B_MAX_HASH_PAGES_PER_IO 4
+#define H3B_MAX_TAG_SCAN_PAGES 64
+#define H3B_TAG_MAGIC1 0x535441544552414DULL
+#define H3B_TAG_MAGIC2 0x5441475041474531ULL
+#define H3B_TAG_CHECK_XOR 0xD1A6D1A6D1A6D1A6ULL
 #define H3B_WRITE_STATE_INFLIGHT  1
 #define H3B_WRITE_STATE_COMPLETED 2
 #define H3B_WRITE_FLAG_CONCURRENT_OVERLAP 0x00000001UL
@@ -110,10 +114,19 @@ typedef struct _H3B_COUNTERS
     LONG64 DiagActualHash2;
     LONG64 DiagWriterSameObject;
     LONG64 DiagGeneration;
+
+    LONG64 TaggedWritePages;
+    LONG64 TaggedReadPages;
+    LONG64 TaggedFirstWriteOffset;
+    LONG64 TaggedFirstReadOffset;
+    LONG64 TaggedFirstWritePageIndex;
+    LONG64 TaggedFirstReadPageIndex;
+    LONG64 TaggedFirstWriteSequence;
+    LONG64 TaggedFirstReadIdentityIndex;
 } H3B_COUNTERS, *PH3B_COUNTERS;
 
 C_ASSERT(sizeof(H3B_COMMAND) == 8);
-C_ASSERT(sizeof(H3B_COUNTERS) == 624);
+C_ASSERT(sizeof(H3B_COUNTERS) == 688);
 
 typedef struct _H3B_SHADOW_ENTRY
 {
@@ -277,6 +290,17 @@ volatile LONG64 g_DiagActualHash2;
 volatile LONG64 g_DiagWriterSameObject;
 volatile LONG64 g_DiagGeneration;
 
+volatile LONG64 g_TaggedWritePages;
+volatile LONG64 g_TaggedReadPages;
+volatile LONG64 g_TaggedFirstWriteOffset;
+volatile LONG64 g_TaggedFirstReadOffset;
+volatile LONG64 g_TaggedFirstWritePageIndex;
+volatile LONG64 g_TaggedFirstReadPageIndex;
+volatile LONG64 g_TaggedFirstWriteSequence;
+volatile LONG64 g_TaggedFirstReadIdentityIndex;
+volatile LONG g_TaggedWriteCaptured;
+volatile LONG g_TaggedReadCaptured;
+
 volatile LONG g_TrackingCompromised;
 
 DRIVER_INITIALIZE DriverEntry;
@@ -373,6 +397,17 @@ H3BResetCounters (
     InterlockedExchange64(&g_DiagActualHash2, 0);
     InterlockedExchange64(&g_DiagWriterSameObject, 0);
     InterlockedExchange64(&g_DiagGeneration, 0);
+
+    InterlockedExchange64(&g_TaggedWritePages, 0);
+    InterlockedExchange64(&g_TaggedReadPages, 0);
+    InterlockedExchange64(&g_TaggedFirstWriteOffset, 0);
+    InterlockedExchange64(&g_TaggedFirstReadOffset, 0);
+    InterlockedExchange64(&g_TaggedFirstWritePageIndex, 0);
+    InterlockedExchange64(&g_TaggedFirstReadPageIndex, 0);
+    InterlockedExchange64(&g_TaggedFirstWriteSequence, 0);
+    InterlockedExchange64(&g_TaggedFirstReadIdentityIndex, 0);
+    InterlockedExchange(&g_TaggedWriteCaptured, 0);
+    InterlockedExchange(&g_TaggedReadCaptured, 0);
 
     generation = InterlockedIncrement(&g_ShadowGeneration);
 
@@ -1873,6 +1908,131 @@ H3BCapturePreWriteHashes (
 }
 
 static
+BOOLEAN
+H3BGetTaggedPageIndex (
+    _In_reads_bytes_(PAGE_SIZE) const UCHAR* Page,
+    _Out_ PULONGLONG PageIndex
+    )
+{
+    ULONGLONG magic1;
+    ULONGLONG magic2;
+    ULONGLONG index;
+    ULONGLONG check;
+
+    RtlCopyMemory(&magic1, Page, sizeof(magic1));
+    RtlCopyMemory(&magic2, Page + sizeof(ULONGLONG), sizeof(magic2));
+    RtlCopyMemory(&index, Page + (2 * sizeof(ULONGLONG)), sizeof(index));
+    RtlCopyMemory(&check, Page + (3 * sizeof(ULONGLONG)), sizeof(check));
+
+    if ((magic1 != H3B_TAG_MAGIC1) ||
+        (magic2 != H3B_TAG_MAGIC2) ||
+        (check != (H3B_TAG_MAGIC1 ^
+                   H3B_TAG_MAGIC2 ^
+                   index ^
+                   H3B_TAG_CHECK_XOR)))
+    {
+        return FALSE;
+    }
+
+    *PageIndex = index;
+    return TRUE;
+}
+
+static
+VOID
+H3BScanTaggedWritePages (
+    _In_reads_bytes_(AccessibleBytes) const UCHAR* Bytes,
+    _In_ ULONG AccessibleBytes,
+    _In_ ULONGLONG BaseOffset,
+    _In_ ULONGLONG WriteSequence
+    )
+{
+    ULONG pageCount;
+    ULONG i;
+
+    pageCount = AccessibleBytes / PAGE_SIZE;
+    if (pageCount > H3B_MAX_TAG_SCAN_PAGES)
+    {
+        pageCount = H3B_MAX_TAG_SCAN_PAGES;
+    }
+
+    for (i = 0; i < pageCount; i++)
+    {
+        ULONGLONG pageIndex;
+
+        if (H3BGetTaggedPageIndex(
+                Bytes + ((SIZE_T)i * PAGE_SIZE),
+                &pageIndex))
+        {
+            InterlockedIncrement64(&g_TaggedWritePages);
+
+            if (InterlockedCompareExchange(
+                    &g_TaggedWriteCaptured,
+                    1,
+                    0) == 0)
+            {
+                InterlockedExchange64(
+                    &g_TaggedFirstWriteOffset,
+                    (LONG64)(BaseOffset + ((ULONGLONG)i * PAGE_SIZE)));
+                InterlockedExchange64(
+                    &g_TaggedFirstWritePageIndex,
+                    (LONG64)pageIndex);
+                InterlockedExchange64(
+                    &g_TaggedFirstWriteSequence,
+                    (LONG64)WriteSequence);
+            }
+        }
+    }
+}
+
+static
+VOID
+H3BScanTaggedReadPages (
+    _In_reads_bytes_(AccessibleBytes) const UCHAR* Bytes,
+    _In_ ULONG AccessibleBytes,
+    _In_ ULONGLONG BaseOffset,
+    _In_ ULONG IdentityIndex
+    )
+{
+    ULONG pageCount;
+    ULONG i;
+
+    pageCount = AccessibleBytes / PAGE_SIZE;
+    if (pageCount > H3B_MAX_TAG_SCAN_PAGES)
+    {
+        pageCount = H3B_MAX_TAG_SCAN_PAGES;
+    }
+
+    for (i = 0; i < pageCount; i++)
+    {
+        ULONGLONG pageIndex;
+
+        if (H3BGetTaggedPageIndex(
+                Bytes + ((SIZE_T)i * PAGE_SIZE),
+                &pageIndex))
+        {
+            InterlockedIncrement64(&g_TaggedReadPages);
+
+            if (InterlockedCompareExchange(
+                    &g_TaggedReadCaptured,
+                    1,
+                    0) == 0)
+            {
+                InterlockedExchange64(
+                    &g_TaggedFirstReadOffset,
+                    (LONG64)(BaseOffset + ((ULONGLONG)i * PAGE_SIZE)));
+                InterlockedExchange64(
+                    &g_TaggedFirstReadPageIndex,
+                    (LONG64)pageIndex);
+                InterlockedExchange64(
+                    &g_TaggedFirstReadIdentityIndex,
+                    (LONG64)IdentityIndex);
+            }
+        }
+    }
+}
+
+static
 VOID
 H3BShadowCompletedWrite (
     _Inout_ PFLT_CALLBACK_DATA Data,
@@ -1956,6 +2116,30 @@ H3BShadowCompletedWrite (
     }
 
     bytes = (PUCHAR)mappedBuffer;
+
+    {
+        ULONG taggedAccessibleBytes;
+
+        taggedAccessibleBytes = (ULONG)completedBytes;
+        mdl = Data->Iopb->Parameters.Write.MdlAddress;
+
+        if (mdl != NULL)
+        {
+            ULONG mdlBytes;
+
+            mdlBytes = MmGetMdlByteCount(mdl);
+            if (mdlBytes < taggedAccessibleBytes)
+            {
+                taggedAccessibleBytes = mdlBytes;
+            }
+        }
+
+        H3BScanTaggedWritePages(
+            bytes,
+            taggedAccessibleBytes,
+            baseOffset,
+            writeSequence);
+    }
 
 #pragma warning(push)
 #pragma warning(disable:4996)
@@ -2242,6 +2426,30 @@ H3BVerifyCompletedRead (
     }
 
     bytes = (PUCHAR)mappedBuffer;
+
+    {
+        ULONG taggedAccessibleBytes;
+
+        taggedAccessibleBytes = (ULONG)completedBytes;
+        mdl = Data->Iopb->Parameters.Read.MdlAddress;
+
+        if (mdl != NULL)
+        {
+            ULONG mdlBytes;
+
+            mdlBytes = MmGetMdlByteCount(mdl);
+            if (mdlBytes < taggedAccessibleBytes)
+            {
+                taggedAccessibleBytes = mdlBytes;
+            }
+        }
+
+        H3BScanTaggedReadPages(
+            bytes,
+            taggedAccessibleBytes,
+            baseOffset,
+            identityIndex);
+    }
 
 #pragma warning(push)
 #pragma warning(disable:4996)
@@ -2853,6 +3061,19 @@ H3BMessage (
         reply->DiagWriterSameObject = H3BReadCounter(&g_DiagWriterSameObject);
         reply->DiagGeneration = H3BReadCounter(&g_DiagGeneration);
     }
+
+    reply->TaggedWritePages = H3BReadCounter(&g_TaggedWritePages);
+    reply->TaggedReadPages = H3BReadCounter(&g_TaggedReadPages);
+    reply->TaggedFirstWriteOffset = H3BReadCounter(&g_TaggedFirstWriteOffset);
+    reply->TaggedFirstReadOffset = H3BReadCounter(&g_TaggedFirstReadOffset);
+    reply->TaggedFirstWritePageIndex =
+        H3BReadCounter(&g_TaggedFirstWritePageIndex);
+    reply->TaggedFirstReadPageIndex =
+        H3BReadCounter(&g_TaggedFirstReadPageIndex);
+    reply->TaggedFirstWriteSequence =
+        H3BReadCounter(&g_TaggedFirstWriteSequence);
+    reply->TaggedFirstReadIdentityIndex =
+        H3BReadCounter(&g_TaggedFirstReadIdentityIndex);
 
     *ReturnOutputBufferLength = sizeof(*reply);
     return STATUS_SUCCESS;
