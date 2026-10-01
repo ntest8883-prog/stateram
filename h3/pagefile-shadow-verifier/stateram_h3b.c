@@ -1,6 +1,6 @@
 #include <fltKernel.h>
 
-#define H3B_PROTOCOL_VERSION 7
+#define H3B_PROTOCOL_VERSION 8
 #define H3B_COMMAND_QUERY    1
 #define H3B_COMMAND_RESET    2
 #define H3B_COMMAND_ARM      3
@@ -124,10 +124,20 @@ typedef struct _H3B_COUNTERS
     LONG64 TaggedFirstReadPageIndex;
     LONG64 TaggedFirstWriteSequence;
     LONG64 TaggedFirstReadIdentityIndex;
+
+    LONG64 CompressionSamplePages;
+    LONG64 CompressionRawBytes;
+    LONG64 CompressionStoredBytes;
+    LONG64 CompressionEligiblePages;
+    LONG64 CompressionLe25Pages;
+    LONG64 CompressionLe50Pages;
+    LONG64 CompressionLe75Pages;
+    LONG64 CompressionLe90Pages;
+    LONG64 CompressionGt90Pages;
 } H3B_COUNTERS, *PH3B_COUNTERS;
 
 C_ASSERT(sizeof(H3B_COMMAND) == 8);
-C_ASSERT(sizeof(H3B_COUNTERS) == 688);
+C_ASSERT(sizeof(H3B_COUNTERS) == 760);
 
 typedef struct _H3B_SHADOW_ENTRY
 {
@@ -304,6 +314,16 @@ volatile LONG64 g_TaggedFirstReadIdentityIndex;
 volatile LONG g_TaggedWriteCaptured;
 volatile LONG g_TaggedReadCaptured;
 
+volatile LONG64 g_CompressionSamplePages;
+volatile LONG64 g_CompressionRawBytes;
+volatile LONG64 g_CompressionStoredBytes;
+volatile LONG64 g_CompressionEligiblePages;
+volatile LONG64 g_CompressionLe25Pages;
+volatile LONG64 g_CompressionLe50Pages;
+volatile LONG64 g_CompressionLe75Pages;
+volatile LONG64 g_CompressionLe90Pages;
+volatile LONG64 g_CompressionGt90Pages;
+
 volatile LONG g_TrackingCompromised;
 
 DRIVER_INITIALIZE DriverEntry;
@@ -411,6 +431,16 @@ H3BResetCounters (
     InterlockedExchange64(&g_TaggedFirstReadIdentityIndex, 0);
     InterlockedExchange(&g_TaggedWriteCaptured, 0);
     InterlockedExchange(&g_TaggedReadCaptured, 0);
+
+    InterlockedExchange64(&g_CompressionSamplePages, 0);
+    InterlockedExchange64(&g_CompressionRawBytes, 0);
+    InterlockedExchange64(&g_CompressionStoredBytes, 0);
+    InterlockedExchange64(&g_CompressionEligiblePages, 0);
+    InterlockedExchange64(&g_CompressionLe25Pages, 0);
+    InterlockedExchange64(&g_CompressionLe50Pages, 0);
+    InterlockedExchange64(&g_CompressionLe75Pages, 0);
+    InterlockedExchange64(&g_CompressionLe90Pages, 0);
+    InterlockedExchange64(&g_CompressionGt90Pages, 0);
 
     generation = InterlockedIncrement(&g_ShadowGeneration);
 
@@ -1187,6 +1217,174 @@ H3BHashPage (
     }
 
     return hash;
+}
+
+/*
+ * H4 passive capacity probe.
+ *
+ * This is a bounded LZ-style size estimator for one 4 KiB page. It uses a
+ * 256-entry hash table (512 bytes) and models a concrete token format:
+ *
+ *   literal: 1-byte header + 1..128 literal bytes
+ *   match:   1-byte header + 2-byte backward distance, length 4..130
+ *
+ * No allocation is performed and no paging I/O is modified. The estimator
+ * exists only to answer whether real pagefile traffic is compressible enough
+ * to justify a later bounded compressed-RAM paging tier.
+ */
+static
+ULONG
+H4EstimatePackedBytes (
+    _In_reads_bytes_(PAGE_SIZE) const UCHAR* Source
+    )
+{
+    USHORT last[256];
+    ULONG input;
+    ULONG literalStart;
+    ULONG output;
+    ULONG i;
+
+    for (i = 0; i < RTL_NUMBER_OF(last); i++)
+    {
+        last[i] = 0xFFFF;
+    }
+
+    input = 0;
+    literalStart = 0;
+    output = 0;
+
+    while ((input + 4) <= PAGE_SIZE)
+    {
+        ULONG value;
+        ULONG hash;
+        USHORT previous;
+        ULONG matchLength;
+
+        RtlCopyMemory(&value, Source + input, sizeof(value));
+        hash = (ULONG)(((ULONGLONG)value * 2654435761ULL) >> 24) & 0xFF;
+        previous = last[hash];
+        last[hash] = (USHORT)input;
+
+        matchLength = 0;
+
+        if ((previous != 0xFFFF) &&
+            ((ULONG)previous < input) &&
+            ((input - (ULONG)previous) <= 0xFFFF) &&
+            (RtlCompareMemory(Source + previous, Source + input, 4) == 4))
+        {
+            matchLength = 4;
+
+            while ((matchLength < 130) &&
+                   ((input + matchLength) < PAGE_SIZE) &&
+                   (Source[(ULONG)previous + matchLength] ==
+                    Source[input + matchLength]))
+            {
+                matchLength++;
+            }
+        }
+
+        if (matchLength >= 4)
+        {
+            ULONG literalLength;
+
+            literalLength = input - literalStart;
+
+            while (literalLength != 0)
+            {
+                ULONG chunk;
+
+                chunk = (literalLength > 128) ? 128 : literalLength;
+                output += 1 + chunk;
+                literalLength -= chunk;
+            }
+
+            output += 3;
+            input += matchLength;
+            literalStart = input;
+
+            if (output > (PAGE_SIZE + 64))
+            {
+                return output;
+            }
+
+            continue;
+        }
+
+        input++;
+    }
+
+    if (literalStart < PAGE_SIZE)
+    {
+        ULONG literalLength;
+
+        literalLength = PAGE_SIZE - literalStart;
+
+        while (literalLength != 0)
+        {
+            ULONG chunk;
+
+            chunk = (literalLength > 128) ? 128 : literalLength;
+            output += 1 + chunk;
+            literalLength -= chunk;
+        }
+    }
+
+    return output;
+}
+
+static
+VOID
+H4SampleCompressionPage (
+    _In_ ULONG IdentityIndex,
+    _In_ ULONGLONG Offset,
+    _In_reads_bytes_(PAGE_SIZE) const UCHAR* Source
+    )
+{
+    ULONG packed;
+    ULONG stored;
+
+    /*
+     * Deterministically sample about one quarter of pagefile pages so the
+     * probe remains cheap on the target Celeron while covering every region
+     * of the pagefile instead of always sampling the first page in a cluster.
+     */
+    if ((((Offset >> PAGE_SHIFT) ^ IdentityIndex) & 3ULL) != 0)
+    {
+        return;
+    }
+
+    packed = H4EstimatePackedBytes(Source);
+    stored = (packed < PAGE_SIZE) ? packed : PAGE_SIZE;
+
+    InterlockedIncrement64(&g_CompressionSamplePages);
+    InterlockedAdd64(&g_CompressionRawBytes, PAGE_SIZE);
+    InterlockedAdd64(&g_CompressionStoredBytes, stored);
+
+    if (packed <= (PAGE_SIZE - 512))
+    {
+        InterlockedIncrement64(&g_CompressionEligiblePages);
+    }
+
+    if (packed <= (PAGE_SIZE / 4))
+    {
+        InterlockedIncrement64(&g_CompressionLe25Pages);
+    }
+    else if (packed <= (PAGE_SIZE / 2))
+    {
+        InterlockedIncrement64(&g_CompressionLe50Pages);
+    }
+    else if (packed <= ((PAGE_SIZE * 3) / 4))
+    {
+        InterlockedIncrement64(&g_CompressionLe75Pages);
+    }
+    else if (packed <= ((PAGE_SIZE * 9) / 10))
+    {
+        InterlockedIncrement64(&g_CompressionLe90Pages);
+    }
+    else
+    {
+        InterlockedIncrement64(&g_CompressionGt90Pages);
+    }
 }
 
 static
@@ -2370,6 +2568,11 @@ H3BShadowCompletedWrite (
 
             offset = baseOffset + ((ULONGLONG)i * PAGE_SIZE);
 
+            H4SampleCompressionPage(
+                identityIndex,
+                offset,
+                bytes + ((SIZE_T)i * PAGE_SIZE));
+
             if (!H3BHistoryAllowsPublish(
                     identityIndex,
                     offset,
@@ -3296,6 +3499,25 @@ H3BMessage (
         H3BReadCounter(&g_TaggedFirstWriteSequence);
     reply->TaggedFirstReadIdentityIndex =
         H3BReadCounter(&g_TaggedFirstReadIdentityIndex);
+
+    reply->CompressionSamplePages =
+        H3BReadCounter(&g_CompressionSamplePages);
+    reply->CompressionRawBytes =
+        H3BReadCounter(&g_CompressionRawBytes);
+    reply->CompressionStoredBytes =
+        H3BReadCounter(&g_CompressionStoredBytes);
+    reply->CompressionEligiblePages =
+        H3BReadCounter(&g_CompressionEligiblePages);
+    reply->CompressionLe25Pages =
+        H3BReadCounter(&g_CompressionLe25Pages);
+    reply->CompressionLe50Pages =
+        H3BReadCounter(&g_CompressionLe50Pages);
+    reply->CompressionLe75Pages =
+        H3BReadCounter(&g_CompressionLe75Pages);
+    reply->CompressionLe90Pages =
+        H3BReadCounter(&g_CompressionLe90Pages);
+    reply->CompressionGt90Pages =
+        H3BReadCounter(&g_CompressionGt90Pages);
 
     *ReturnOutputBufferLength = sizeof(*reply);
     return STATUS_SUCCESS;
