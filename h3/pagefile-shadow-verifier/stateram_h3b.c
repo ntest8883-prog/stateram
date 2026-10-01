@@ -1,6 +1,6 @@
 #include <fltKernel.h>
 
-#define H3B_PROTOCOL_VERSION 5
+#define H3B_PROTOCOL_VERSION 6
 #define H3B_COMMAND_QUERY    1
 #define H3B_COMMAND_RESET    2
 #define H3B_COMMAND_ARM      3
@@ -85,10 +85,35 @@ typedef struct _H3B_COUNTERS
     LONG64 InterventionPayloadMisses;
     LONG64 InterventionHashRejects;
     LONG64 InterventionCapacity;
+
+    LONG64 DiagCaptured;
+    LONG64 DiagIdentityIndex;
+    LONG64 DiagReadBaseOffset;
+    LONG64 DiagPageOffset;
+    LONG64 DiagReadRequestedBytes;
+    LONG64 DiagReadCompletedBytes;
+    LONG64 DiagReadMdlBytes;
+    LONG64 DiagReadPageOrdinal;
+    LONG64 DiagReadIrpFlags;
+    LONG64 DiagReadOperationFlags;
+    LONG64 DiagReadDataFlags;
+    LONG64 DiagWriteSequence;
+    LONG64 DiagWriteIoLength;
+    LONG64 DiagWriteMdlBytes;
+    LONG64 DiagWritePageOrdinal;
+    LONG64 DiagWriteIrpFlags;
+    LONG64 DiagWriteOperationFlags;
+    LONG64 DiagWriteDataFlags;
+    LONG64 DiagExpectedHash1;
+    LONG64 DiagExpectedHash2;
+    LONG64 DiagActualHash1;
+    LONG64 DiagActualHash2;
+    LONG64 DiagWriterSameObject;
+    LONG64 DiagGeneration;
 } H3B_COUNTERS, *PH3B_COUNTERS;
 
 C_ASSERT(sizeof(H3B_COMMAND) == 8);
-C_ASSERT(sizeof(H3B_COUNTERS) == 432);
+C_ASSERT(sizeof(H3B_COUNTERS) == 624);
 
 typedef struct _H3B_SHADOW_ENTRY
 {
@@ -101,6 +126,12 @@ typedef struct _H3B_SHADOW_ENTRY
     ULONG Generation;
     ULONG Reserved2;
     ULONGLONG WriteSequence;
+    ULONG WriteIoLength;
+    ULONG WriteMdlBytes;
+    ULONG WritePageOrdinal;
+    ULONG WriteIrpFlags;
+    ULONG WriteOperationFlags;
+    ULONG WriteDataFlags;
 } H3B_SHADOW_ENTRY, *PH3B_SHADOW_ENTRY;
 
 typedef struct _H3B_PAYLOAD_ENTRY
@@ -221,6 +252,31 @@ volatile LONG64 g_InterventionPayloadMisses;
 volatile LONG64 g_InterventionHashRejects;
 UCHAR g_InterventionBuffer[PAGE_SIZE];
 
+volatile LONG g_DiagCaptureState;
+volatile LONG64 g_DiagIdentityIndex;
+volatile LONG64 g_DiagReadBaseOffset;
+volatile LONG64 g_DiagPageOffset;
+volatile LONG64 g_DiagReadRequestedBytes;
+volatile LONG64 g_DiagReadCompletedBytes;
+volatile LONG64 g_DiagReadMdlBytes;
+volatile LONG64 g_DiagReadPageOrdinal;
+volatile LONG64 g_DiagReadIrpFlags;
+volatile LONG64 g_DiagReadOperationFlags;
+volatile LONG64 g_DiagReadDataFlags;
+volatile LONG64 g_DiagWriteSequence;
+volatile LONG64 g_DiagWriteIoLength;
+volatile LONG64 g_DiagWriteMdlBytes;
+volatile LONG64 g_DiagWritePageOrdinal;
+volatile LONG64 g_DiagWriteIrpFlags;
+volatile LONG64 g_DiagWriteOperationFlags;
+volatile LONG64 g_DiagWriteDataFlags;
+volatile LONG64 g_DiagExpectedHash1;
+volatile LONG64 g_DiagExpectedHash2;
+volatile LONG64 g_DiagActualHash1;
+volatile LONG64 g_DiagActualHash2;
+volatile LONG64 g_DiagWriterSameObject;
+volatile LONG64 g_DiagGeneration;
+
 volatile LONG g_TrackingCompromised;
 
 DRIVER_INITIALIZE DriverEntry;
@@ -292,6 +348,31 @@ H3BResetCounters (
     InterlockedExchange64(&g_InterventionPayloadMisses, 0);
     InterlockedExchange64(&g_InterventionHashRejects, 0);
     RtlZeroMemory(g_InterventionBuffer, sizeof(g_InterventionBuffer));
+
+    InterlockedExchange(&g_DiagCaptureState, 0);
+    InterlockedExchange64(&g_DiagIdentityIndex, 0);
+    InterlockedExchange64(&g_DiagReadBaseOffset, 0);
+    InterlockedExchange64(&g_DiagPageOffset, 0);
+    InterlockedExchange64(&g_DiagReadRequestedBytes, 0);
+    InterlockedExchange64(&g_DiagReadCompletedBytes, 0);
+    InterlockedExchange64(&g_DiagReadMdlBytes, 0);
+    InterlockedExchange64(&g_DiagReadPageOrdinal, 0);
+    InterlockedExchange64(&g_DiagReadIrpFlags, 0);
+    InterlockedExchange64(&g_DiagReadOperationFlags, 0);
+    InterlockedExchange64(&g_DiagReadDataFlags, 0);
+    InterlockedExchange64(&g_DiagWriteSequence, 0);
+    InterlockedExchange64(&g_DiagWriteIoLength, 0);
+    InterlockedExchange64(&g_DiagWriteMdlBytes, 0);
+    InterlockedExchange64(&g_DiagWritePageOrdinal, 0);
+    InterlockedExchange64(&g_DiagWriteIrpFlags, 0);
+    InterlockedExchange64(&g_DiagWriteOperationFlags, 0);
+    InterlockedExchange64(&g_DiagWriteDataFlags, 0);
+    InterlockedExchange64(&g_DiagExpectedHash1, 0);
+    InterlockedExchange64(&g_DiagExpectedHash2, 0);
+    InterlockedExchange64(&g_DiagActualHash1, 0);
+    InterlockedExchange64(&g_DiagActualHash2, 0);
+    InterlockedExchange64(&g_DiagWriterSameObject, 0);
+    InterlockedExchange64(&g_DiagGeneration, 0);
 
     generation = InterlockedIncrement(&g_ShadowGeneration);
 
@@ -1095,7 +1176,13 @@ H3BStoreShadow (
     _In_ ULONGLONG Hash1,
     _In_ ULONGLONG Hash2,
     _In_ ULONGLONG WriteSequence,
-    _In_ ULONG WriteGeneration
+    _In_ ULONG WriteGeneration,
+    _In_ ULONG WriteIoLength,
+    _In_ ULONG WriteMdlBytes,
+    _In_ ULONG WritePageOrdinal,
+    _In_ ULONG WriteIrpFlags,
+    _In_ ULONG WriteOperationFlags,
+    _In_ ULONG WriteDataFlags
     )
 {
     KIRQL oldIrql;
@@ -1134,6 +1221,12 @@ H3BStoreShadow (
     entry->Hash2 = Hash2;
     entry->Generation = (ULONG)generation;
     entry->WriteSequence = WriteSequence;
+    entry->WriteIoLength = WriteIoLength;
+    entry->WriteMdlBytes = WriteMdlBytes;
+    entry->WritePageOrdinal = WritePageOrdinal;
+    entry->WriteIrpFlags = WriteIrpFlags;
+    entry->WriteOperationFlags = WriteOperationFlags;
+    entry->WriteDataFlags = WriteDataFlags;
 
     KeReleaseSpinLock(&g_ShadowLock, oldIrql);
     return TRUE;
@@ -1147,7 +1240,8 @@ H3BLookupShadow (
     _Out_ PULONGLONG Hash1,
     _Out_ PULONGLONG Hash2,
     _Out_ PULONGLONG WriteSequence,
-    _Out_ PFILE_OBJECT* WriterFileObject
+    _Out_ PFILE_OBJECT* WriterFileObject,
+    _Out_opt_ PH3B_SHADOW_ENTRY Snapshot
     )
 {
     KIRQL oldIrql;
@@ -1172,6 +1266,10 @@ H3BLookupShadow (
         *Hash2 = entry->Hash2;
         *WriteSequence = entry->WriteSequence;
         *WriterFileObject = entry->WriterFileObject;
+        if (Snapshot != NULL)
+        {
+            *Snapshot = *entry;
+        }
         found = TRUE;
     }
 
@@ -1364,37 +1462,11 @@ H3BInterventionEligible (
     VOID
     )
 {
-    if (InterlockedCompareExchange(&g_InterventionUsed, 0, 0) != 0)
-    {
-        return FALSE;
-    }
-
-    if (InterlockedCompareExchange(&g_TrackingCompromised, 0, 0) != 0)
-    {
-        return FALSE;
-    }
-
-    if ((H3BReadCounter(&g_ShadowMismatches) != 0) ||
-        (H3BReadCounter(&g_PayloadMismatches) != 0) ||
-        (H3BReadCounter(&g_PagefileTableFull) != 0) ||
-        (H3BReadCounter(&g_DroppedInflightOutstanding) != 0))
-    {
-        return FALSE;
-    }
-
     /*
-     * D1 is deliberately not allowed to serve until this exact driver session
-     * has already observed at least one normal pagefile read whose bytes match
-     * a retained payload byte-for-byte.
+     * Diagnostic build: intervention is intentionally disabled.
+     * This build exists only to capture the first verifier mismatch context.
      */
-    if ((H3BReadCounter(&g_PayloadMatches) <= 0) ||
-        (H3BReadCounter(&g_PayloadWritePages) <= 0) ||
-        (H3BReadCounter(&g_KnownPagefiles) <= 0))
-    {
-        return FALSE;
-    }
-
-    return TRUE;
+    return FALSE;
 }
 
 static
@@ -1518,7 +1590,8 @@ H3BTrySinglePageIntervention (
             &expected1,
             &expected2,
             &writeSequence,
-            &writerFileObject))
+            &writerFileObject,
+            NULL))
     {
         return FALSE;
     }
@@ -1963,7 +2036,13 @@ H3BShadowCompletedWrite (
                     Context->Hash1[i],
                     Context->Hash2[i],
                     writeSequence,
-                    writeGeneration))
+                    writeGeneration,
+                    Data->Iopb->Parameters.Write.Length,
+                    (mdl != NULL) ? MmGetMdlByteCount(mdl) : 0,
+                    i,
+                    Data->Iopb->IrpFlags,
+                    Data->Iopb->OperationFlags,
+                    Data->Flags))
             {
                 InterlockedIncrement64(&g_ShadowWritePages);
 
@@ -2020,6 +2099,74 @@ H3BShadowCompletedWrite (
             payloadScratch,
             H3B_POOL_TAG);
     }
+}
+
+static
+VOID
+H3BCaptureFirstMismatch (
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ ULONG IdentityIndex,
+    _In_ ULONGLONG ReadBaseOffset,
+    _In_ ULONG_PTR CompletedBytes,
+    _In_ ULONG PageOrdinal,
+    _In_ const H3B_SHADOW_ENTRY* Shadow,
+    _In_ ULONGLONG ActualHash1,
+    _In_ ULONGLONG ActualHash2
+    )
+{
+    PMDL mdl;
+    ULONG mdlBytes;
+
+    if (InterlockedCompareExchange(&g_DiagCaptureState, 1, 0) != 0)
+    {
+        return;
+    }
+
+    mdl = Data->Iopb->Parameters.Read.MdlAddress;
+    mdlBytes = (mdl != NULL) ? MmGetMdlByteCount(mdl) : 0;
+
+    InterlockedExchange64(&g_DiagIdentityIndex, (LONG64)IdentityIndex);
+    InterlockedExchange64(&g_DiagReadBaseOffset, (LONG64)ReadBaseOffset);
+    InterlockedExchange64(
+        &g_DiagPageOffset,
+        (LONG64)(ReadBaseOffset + ((ULONGLONG)PageOrdinal * PAGE_SIZE)));
+    InterlockedExchange64(
+        &g_DiagReadRequestedBytes,
+        (LONG64)Data->Iopb->Parameters.Read.Length);
+    InterlockedExchange64(&g_DiagReadCompletedBytes, (LONG64)CompletedBytes);
+    InterlockedExchange64(&g_DiagReadMdlBytes, (LONG64)mdlBytes);
+    InterlockedExchange64(&g_DiagReadPageOrdinal, (LONG64)PageOrdinal);
+    InterlockedExchange64(&g_DiagReadIrpFlags, (LONG64)Data->Iopb->IrpFlags);
+    InterlockedExchange64(
+        &g_DiagReadOperationFlags,
+        (LONG64)Data->Iopb->OperationFlags);
+    InterlockedExchange64(&g_DiagReadDataFlags, (LONG64)Data->Flags);
+
+    InterlockedExchange64(
+        &g_DiagWriteSequence,
+        (LONG64)Shadow->WriteSequence);
+    InterlockedExchange64(&g_DiagWriteIoLength, (LONG64)Shadow->WriteIoLength);
+    InterlockedExchange64(&g_DiagWriteMdlBytes, (LONG64)Shadow->WriteMdlBytes);
+    InterlockedExchange64(
+        &g_DiagWritePageOrdinal,
+        (LONG64)Shadow->WritePageOrdinal);
+    InterlockedExchange64(&g_DiagWriteIrpFlags, (LONG64)Shadow->WriteIrpFlags);
+    InterlockedExchange64(
+        &g_DiagWriteOperationFlags,
+        (LONG64)Shadow->WriteOperationFlags);
+    InterlockedExchange64(&g_DiagWriteDataFlags, (LONG64)Shadow->WriteDataFlags);
+
+    InterlockedExchange64(&g_DiagExpectedHash1, (LONG64)Shadow->Hash1);
+    InterlockedExchange64(&g_DiagExpectedHash2, (LONG64)Shadow->Hash2);
+    InterlockedExchange64(&g_DiagActualHash1, (LONG64)ActualHash1);
+    InterlockedExchange64(&g_DiagActualHash2, (LONG64)ActualHash2);
+    InterlockedExchange64(
+        &g_DiagWriterSameObject,
+        (Shadow->WriterFileObject == Data->Iopb->TargetFileObject) ? 1 : 0);
+    InterlockedExchange64(&g_DiagGeneration, (LONG64)Shadow->Generation);
+
+    KeMemoryBarrier();
+    InterlockedExchange(&g_DiagCaptureState, 2);
 }
 
 static
@@ -2139,10 +2286,12 @@ H3BVerifyCompletedRead (
             ULONGLONG offset;
             ULONGLONG writeSequence;
             PFILE_OBJECT writerFileObject;
+            H3B_SHADOW_ENTRY shadowSnapshot;
             BOOLEAN crossObject;
 
             offset = baseOffset + ((ULONGLONG)i * PAGE_SIZE);
             writerFileObject = NULL;
+            RtlZeroMemory(&shadowSnapshot, sizeof(shadowSnapshot));
 
             if (!H3BLookupShadow(
                     identityIndex,
@@ -2150,7 +2299,8 @@ H3BVerifyCompletedRead (
                     &expected1,
                     &expected2,
                     &writeSequence,
-                    &writerFileObject))
+                    &writerFileObject,
+                    &shadowSnapshot))
             {
                 InterlockedIncrement64(&g_ShadowUntracked);
                 continue;
@@ -2236,6 +2386,16 @@ H3BVerifyCompletedRead (
             }
             else
             {
+                H3BCaptureFirstMismatch(
+                    Data,
+                    identityIndex,
+                    baseOffset,
+                    completedBytes,
+                    i,
+                    &shadowSnapshot,
+                    actual1,
+                    actual2);
+
                 InterlockedIncrement64(&g_ShadowMismatches);
                 InterlockedExchange(&g_InterventionArmed, 0);
 
@@ -2665,6 +2825,34 @@ H3BMessage (
     reply->InterventionPayloadMisses = H3BReadCounter(&g_InterventionPayloadMisses);
     reply->InterventionHashRejects = H3BReadCounter(&g_InterventionHashRejects);
     reply->InterventionCapacity = 1;
+
+    if (InterlockedCompareExchange(&g_DiagCaptureState, 0, 0) == 2)
+    {
+        reply->DiagCaptured = 1;
+        reply->DiagIdentityIndex = H3BReadCounter(&g_DiagIdentityIndex);
+        reply->DiagReadBaseOffset = H3BReadCounter(&g_DiagReadBaseOffset);
+        reply->DiagPageOffset = H3BReadCounter(&g_DiagPageOffset);
+        reply->DiagReadRequestedBytes = H3BReadCounter(&g_DiagReadRequestedBytes);
+        reply->DiagReadCompletedBytes = H3BReadCounter(&g_DiagReadCompletedBytes);
+        reply->DiagReadMdlBytes = H3BReadCounter(&g_DiagReadMdlBytes);
+        reply->DiagReadPageOrdinal = H3BReadCounter(&g_DiagReadPageOrdinal);
+        reply->DiagReadIrpFlags = H3BReadCounter(&g_DiagReadIrpFlags);
+        reply->DiagReadOperationFlags = H3BReadCounter(&g_DiagReadOperationFlags);
+        reply->DiagReadDataFlags = H3BReadCounter(&g_DiagReadDataFlags);
+        reply->DiagWriteSequence = H3BReadCounter(&g_DiagWriteSequence);
+        reply->DiagWriteIoLength = H3BReadCounter(&g_DiagWriteIoLength);
+        reply->DiagWriteMdlBytes = H3BReadCounter(&g_DiagWriteMdlBytes);
+        reply->DiagWritePageOrdinal = H3BReadCounter(&g_DiagWritePageOrdinal);
+        reply->DiagWriteIrpFlags = H3BReadCounter(&g_DiagWriteIrpFlags);
+        reply->DiagWriteOperationFlags = H3BReadCounter(&g_DiagWriteOperationFlags);
+        reply->DiagWriteDataFlags = H3BReadCounter(&g_DiagWriteDataFlags);
+        reply->DiagExpectedHash1 = H3BReadCounter(&g_DiagExpectedHash1);
+        reply->DiagExpectedHash2 = H3BReadCounter(&g_DiagExpectedHash2);
+        reply->DiagActualHash1 = H3BReadCounter(&g_DiagActualHash1);
+        reply->DiagActualHash2 = H3BReadCounter(&g_DiagActualHash2);
+        reply->DiagWriterSameObject = H3BReadCounter(&g_DiagWriterSameObject);
+        reply->DiagGeneration = H3BReadCounter(&g_DiagGeneration);
+    }
 
     *ReturnOutputBufferLength = sizeof(*reply);
     return STATUS_SUCCESS;
