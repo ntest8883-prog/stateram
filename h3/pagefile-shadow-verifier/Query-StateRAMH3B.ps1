@@ -273,10 +273,10 @@ try {
         DiagWriteIrpFlagsHex       = ("0x{0:X}" -f [uint64]$reply.DiagWriteIrpFlags)
         DiagWriteOperationFlagsHex = ("0x{0:X}" -f [uint64]$reply.DiagWriteOperationFlags)
         DiagWriteDataFlagsHex      = ("0x{0:X}" -f [uint64]$reply.DiagWriteDataFlags)
-        DiagExpectedHash1Hex       = ("0x{0:X16}" -f [uint64]$reply.DiagExpectedHash1)
-        DiagExpectedHash2Hex       = ("0x{0:X16}" -f [uint64]$reply.DiagExpectedHash2)
-        DiagActualHash1Hex         = ("0x{0:X16}" -f [uint64]$reply.DiagActualHash1)
-        DiagActualHash2Hex         = ("0x{0:X16}" -f [uint64]$reply.DiagActualHash2)
+        DiagExpectedHash1Hex       = ("0x{0:X16}" -f [BitConverter]::ToUInt64([BitConverter]::GetBytes([int64]$reply.DiagExpectedHash1), 0))
+        DiagExpectedHash2Hex       = ("0x{0:X16}" -f [BitConverter]::ToUInt64([BitConverter]::GetBytes([int64]$reply.DiagExpectedHash2), 0))
+        DiagActualHash1Hex         = ("0x{0:X16}" -f [BitConverter]::ToUInt64([BitConverter]::GetBytes([int64]$reply.DiagActualHash1), 0))
+        DiagActualHash2Hex         = ("0x{0:X16}" -f [BitConverter]::ToUInt64([BitConverter]::GetBytes([int64]$reply.DiagActualHash2), 0))
         DiagWriterSameObject       = $reply.DiagWriterSameObject
         DiagGeneration             = $reply.DiagGeneration
 
