@@ -9,10 +9,10 @@
 #include <psapi.h>
 #pragma comment(lib, "psapi.lib")
 
-// H3-D1 passive-evidence pressure harness (protocol v5).
+// H3-D1 diagnostic passive pressure harness (protocol v6).
 // This harness only issues QUERY commands. It never arms intervention.
 static const wchar_t* kPortName = L"\\StateRAMH3BPort";
-static const uint32_t kProtocolVersion = 5;
+static const uint32_t kProtocolVersion = 6;
 static const uint32_t kCommandQuery = 1;
 static const SIZE_T kMiB = 1024ull * 1024ull;
 static const SIZE_T kPressureChunk = 32ull * kMiB;
@@ -98,11 +98,36 @@ struct H3B_COUNTERS
     int64_t InterventionPayloadMisses;
     int64_t InterventionHashRejects;
     int64_t InterventionCapacity;
+
+    int64_t DiagCaptured;
+    int64_t DiagIdentityIndex;
+    int64_t DiagReadBaseOffset;
+    int64_t DiagPageOffset;
+    int64_t DiagReadRequestedBytes;
+    int64_t DiagReadCompletedBytes;
+    int64_t DiagReadMdlBytes;
+    int64_t DiagReadPageOrdinal;
+    int64_t DiagReadIrpFlags;
+    int64_t DiagReadOperationFlags;
+    int64_t DiagReadDataFlags;
+    int64_t DiagWriteSequence;
+    int64_t DiagWriteIoLength;
+    int64_t DiagWriteMdlBytes;
+    int64_t DiagWritePageOrdinal;
+    int64_t DiagWriteIrpFlags;
+    int64_t DiagWriteOperationFlags;
+    int64_t DiagWriteDataFlags;
+    int64_t DiagExpectedHash1;
+    int64_t DiagExpectedHash2;
+    int64_t DiagActualHash1;
+    int64_t DiagActualHash2;
+    int64_t DiagWriterSameObject;
+    int64_t DiagGeneration;
 };
 #pragma pack(pop)
 
 static_assert(sizeof(H3B_COMMAND) == 8, "H3B command ABI drift");
-static_assert(sizeof(H3B_COUNTERS) == 432, "H3B counter ABI drift");
+static_assert(sizeof(H3B_COUNTERS) == 624, "H3B counter ABI drift");
 
 typedef HRESULT (WINAPI *PFN_FILTER_CONNECT_COMMUNICATION_PORT)(
     LPCWSTR, DWORD, LPVOID, WORD, LPSECURITY_ATTRIBUTES, HANDLE*);
@@ -247,6 +272,51 @@ static bool QueryH3B(H3B_COUNTERS& out)
     }
 
     return true;
+}
+
+static void PrintDiag(const H3B_COUNTERS& c)
+{
+    if (c.DiagCaptured == 0)
+    {
+        wprintf(L"DIAG_CAPTURED=0\n");
+        return;
+    }
+
+    wprintf(L"DIAG_CAPTURED=1 identity=%lld readBase=%lld pageOffset=%lld "
+            L"readRequested=%lld readCompleted=%lld readMdlBytes=%lld readPageOrdinal=%lld\n",
+        c.DiagIdentityIndex,
+        c.DiagReadBaseOffset,
+        c.DiagPageOffset,
+        c.DiagReadRequestedBytes,
+        c.DiagReadCompletedBytes,
+        c.DiagReadMdlBytes,
+        c.DiagReadPageOrdinal);
+
+    wprintf(L"DIAG_READ_FLAGS irp=0x%llX operation=0x%llX data=0x%llX\n",
+        static_cast<unsigned long long>(c.DiagReadIrpFlags),
+        static_cast<unsigned long long>(c.DiagReadOperationFlags),
+        static_cast<unsigned long long>(c.DiagReadDataFlags));
+
+    wprintf(L"DIAG_WRITE sequence=%lld ioLength=%lld mdlBytes=%lld pageOrdinal=%lld "
+            L"sameObject=%lld generation=%lld\n",
+        c.DiagWriteSequence,
+        c.DiagWriteIoLength,
+        c.DiagWriteMdlBytes,
+        c.DiagWritePageOrdinal,
+        c.DiagWriterSameObject,
+        c.DiagGeneration);
+
+    wprintf(L"DIAG_WRITE_FLAGS irp=0x%llX operation=0x%llX data=0x%llX\n",
+        static_cast<unsigned long long>(c.DiagWriteIrpFlags),
+        static_cast<unsigned long long>(c.DiagWriteOperationFlags),
+        static_cast<unsigned long long>(c.DiagWriteDataFlags));
+
+    wprintf(L"DIAG_HASH expected1=0x%016llX expected2=0x%016llX "
+            L"actual1=0x%016llX actual2=0x%016llX\n",
+        static_cast<unsigned long long>(c.DiagExpectedHash1),
+        static_cast<unsigned long long>(c.DiagExpectedHash2),
+        static_cast<unsigned long long>(c.DiagActualHash1),
+        static_cast<unsigned long long>(c.DiagActualHash2));
 }
 
 static void PrintDelta(const H3B_COUNTERS& before, const H3B_COUNTERS& after)
@@ -559,7 +629,7 @@ static int TargetMode(DWORD parentPid, SIZE_T targetMiB)
 
 static int SelfTest()
 {
-    if ((sizeof(H3B_COMMAND) != 8) || (sizeof(H3B_COUNTERS) != 432))
+    if ((sizeof(H3B_COMMAND) != 8) || (sizeof(H3B_COUNTERS) != 624))
     {
         fwprintf(stderr, L"SELFTEST=FAIL ABI\n");
         return 2;
@@ -1028,6 +1098,7 @@ static int ParentMode()
                         probe.ShadowMismatches - before.ShadowMismatches,
                         probe.PayloadMismatches - before.PayloadMismatches,
                         static_cast<unsigned long long>(allocatedMiB));
+                    PrintDiag(probe);
                     stopForMismatch = true;
                     break;
                 }
@@ -1114,6 +1185,7 @@ static int ParentMode()
         if (stopForMismatch)
         {
             fwprintf(stderr, L"RESULT=STOP_MISMATCH phase=pressure\n");
+            PrintDiag(mid);
             result = 40;
             break;
         }
@@ -1150,6 +1222,7 @@ static int ParentMode()
                 L"RESULT=STOP_MISMATCH phase=before-read shadowDelta=%lld payloadDelta=%lld\n",
                 mid.ShadowMismatches - before.ShadowMismatches,
                 mid.PayloadMismatches - before.PayloadMismatches);
+            PrintDiag(mid);
             result = 40;
             break;
         }
@@ -1260,6 +1333,7 @@ static int ParentMode()
                 L"RESULT=STOP_MISMATCH shadowDelta=%lld payloadDelta=%lld\n",
                 after.ShadowMismatches - before.ShadowMismatches,
                 after.PayloadMismatches - before.PayloadMismatches);
+            PrintDiag(after);
             result = 42;
             break;
         }
