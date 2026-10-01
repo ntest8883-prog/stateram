@@ -407,7 +407,7 @@ static int TargetMode(DWORD parentPid, SIZE_T targetMiB)
 
     HANDLE ready = OpenEventW(EVENT_MODIFY_STATE, FALSE, readyName.c_str());
     HANDLE cold = OpenEventW(EVENT_MODIFY_STATE, FALSE, coldName.c_str());
-    HANDLE go = OpenEventW(SYNCHRONIZE, FALSE, goName.c_str());
+    HANDLE go = OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, goName.c_str());
     HANDLE done = OpenEventW(EVENT_MODIFY_STATE, FALSE, doneName.c_str());
 
     if (!ready || !cold || !go || !done)
@@ -580,9 +580,56 @@ static int TargetMode(DWORD parentPid, SIZE_T targetMiB)
     bool valid = VerifyRegion(target, bytes, seed);
     wprintf(L"TARGET_VERIFY=%s\n", valid ? L"PASS" : L"FAIL");
 
+    if (!valid)
+    {
+        SetEvent(done);
+        VirtualFree(target, 0, MEM_RELEASE);
+        CloseHandle(ready);
+        CloseHandle(cold);
+        CloseHandle(go);
+        CloseHandle(done);
+        return 24;
+    }
+
+    /*
+     * First read is the learning pass: natural pagefile completion verifies
+     * retained payload bytes. Keep the exact same private pages alive, trim
+     * them again while parent pressure is still resident, then fault them a
+     * second time. The second read can therefore be served only from payloads
+     * that Windows already proved byte-for-byte during the first read.
+     */
+    if (!ResetEvent(go) || !ResetEvent(cold))
+    {
+        fwprintf(stderr, L"TARGET_ERROR reset-events=%lu\n", GetLastError());
+        SetEvent(done);
+        VirtualFree(target, 0, MEM_RELEASE);
+        CloseHandle(ready);
+        CloseHandle(cold);
+        CloseHandle(go);
+        CloseHandle(done);
+        return 28;
+    }
+
+    if (!SetProcessWorkingSetSize(
+            GetCurrentProcess(),
+            static_cast<SIZE_T>(-1),
+            static_cast<SIZE_T>(-1)))
+    {
+        fwprintf(stderr, L"TARGET_ERROR second-working-set-trim=%lu\n", GetLastError());
+        SetEvent(done);
+        VirtualFree(target, 0, MEM_RELEASE);
+        CloseHandle(ready);
+        CloseHandle(cold);
+        CloseHandle(go);
+        CloseHandle(done);
+        return 29;
+    }
+
+    wprintf(L"TARGET_RETRIMMED_FOR_SECOND_READ=YES\n");
+
     if (!SetEvent(done))
     {
-        fwprintf(stderr, L"TARGET_ERROR signal-done=%lu\n", GetLastError());
+        fwprintf(stderr, L"TARGET_ERROR signal-first-done=%lu\n", GetLastError());
         VirtualFree(target, 0, MEM_RELEASE);
         CloseHandle(ready);
         CloseHandle(cold);
@@ -591,13 +638,103 @@ static int TargetMode(DWORD parentPid, SIZE_T targetMiB)
         return 26;
     }
 
+    waitStart = GetTickCount64();
+    coldSignaled = false;
+    wait = WAIT_TIMEOUT;
+
+    for (;;)
+    {
+        wait = WaitForSingleObject(go, kResidencyPollMs);
+
+        if (wait == WAIT_OBJECT_0)
+        {
+            break;
+        }
+
+        if (wait != WAIT_TIMEOUT)
+        {
+            fwprintf(stderr, L"TARGET_ERROR second-wait-go=%lu\n", wait);
+            VirtualFree(target, 0, MEM_RELEASE);
+            CloseHandle(ready);
+            CloseHandle(cold);
+            CloseHandle(go);
+            CloseHandle(done);
+            return 30;
+        }
+
+        SIZE_T residentSamples = 0;
+        SIZE_T totalSamples = 0;
+
+        if (GetSampledResidency(
+                target,
+                bytes,
+                residentSamples,
+                totalSamples))
+        {
+            const ULONG residentPercent =
+                totalSamples == 0 ? 100 :
+                static_cast<ULONG>(
+                    (residentSamples * 100) / totalSamples);
+
+            if (!coldSignaled &&
+                residentPercent <= kColdPercent)
+            {
+                if (!SetEvent(cold))
+                {
+                    fwprintf(stderr,
+                        L"TARGET_ERROR signal-second-cold=%lu\n",
+                        GetLastError());
+                    VirtualFree(target, 0, MEM_RELEASE);
+                    CloseHandle(ready);
+                    CloseHandle(cold);
+                    CloseHandle(go);
+                    CloseHandle(done);
+                    return 31;
+                }
+
+                coldSignaled = true;
+                wprintf(L"TARGET_COLD_SECOND residentSamples=%zu totalSamples=%zu "
+                        L"residentPercent=%lu\n",
+                    residentSamples,
+                    totalSamples,
+                    static_cast<unsigned long>(residentPercent));
+            }
+        }
+
+        if ((GetTickCount64() - waitStart) >= kTargetGoWaitMs)
+        {
+            fwprintf(stderr, L"TARGET_ERROR second-wait-go=TIMEOUT\n");
+            VirtualFree(target, 0, MEM_RELEASE);
+            CloseHandle(ready);
+            CloseHandle(cold);
+            CloseHandle(go);
+            CloseHandle(done);
+            return 30;
+        }
+    }
+
+    wprintf(L"TARGET_VERIFY_SECOND_BEGIN\n");
+    bool validSecond = VerifyRegion(target, bytes, seed);
+    wprintf(L"TARGET_VERIFY_SECOND=%s\n", validSecond ? L"PASS" : L"FAIL");
+
+    if (!SetEvent(done))
+    {
+        fwprintf(stderr, L"TARGET_ERROR signal-second-done=%lu\n", GetLastError());
+        VirtualFree(target, 0, MEM_RELEASE);
+        CloseHandle(ready);
+        CloseHandle(cold);
+        CloseHandle(go);
+        CloseHandle(done);
+        return 32;
+    }
+
     VirtualFree(target, 0, MEM_RELEASE);
     CloseHandle(ready);
     CloseHandle(cold);
     CloseHandle(go);
     CloseHandle(done);
 
-    return valid ? 0 : 24;
+    return validSecond ? 0 : 33;
 }
 
 static int SelfTest()
