@@ -22,6 +22,7 @@
 #include <vector>
 
 #pragma comment(lib, "Psapi.lib")
+#pragma comment(lib, "User32.lib")
 
 static constexpr uint64_t MiB = 1024ull * 1024ull;
 static constexpr uint64_t PAGE_BYTES = 4096ull;
