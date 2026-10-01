@@ -1279,6 +1279,80 @@ static int ParentMode()
             }
         }
 
+        /*
+         * If the target is already cold but Windows has not yet emitted any
+         * tagged pagefile write, keep the existing pressure resident for a
+         * short bounded dwell. This gives the modified-page writer/compression
+         * pipeline time to flush the low-priority target without allocating
+         * more memory. Abort the dwell immediately on mismatch or if available
+         * physical memory falls below the secondary safety floor.
+         */
+        if (!stopForMismatch &&
+            (WaitForSingleObject(cold, 0) == WAIT_OBJECT_0) &&
+            ((mid.TaggedWritePages - before.TaggedWritePages) == 0))
+        {
+            const DWORD kTaggedDwellMs = 10000;
+            const uint64_t kDwellAbortAvailMiB = 160;
+            ULONGLONG dwellStart = GetTickCount64();
+
+            wprintf(L"PRESSURE_DWELL_BEGIN reason=TARGET_COLD_NO_TAGGED_WRITE "
+                    L"allocated=%llu MiB\n",
+                static_cast<unsigned long long>(allocatedMiB));
+
+            while ((GetTickCount64() - dwellStart) < kTaggedDwellMs)
+            {
+                MemSnapshot dwellMem = {};
+                H3B_COUNTERS dwell = {};
+
+                if (!GetMemorySnapshot(dwellMem))
+                {
+                    wprintf(L"PRESSURE_DWELL_STOP reason=MEMORY_STATUS\n");
+                    break;
+                }
+
+                if (dwellMem.availPhysMiB < kDwellAbortAvailMiB)
+                {
+                    wprintf(L"PRESSURE_DWELL_STOP reason=SECONDARY_SAFETY "
+                            L"available=%llu MiB\n",
+                        static_cast<unsigned long long>(dwellMem.availPhysMiB));
+                    break;
+                }
+
+                if (!QueryH3B(dwell))
+                {
+                    wprintf(L"PRESSURE_DWELL_STOP reason=H3B_QUERY_FAILED\n");
+                    break;
+                }
+
+                mid = dwell;
+
+                if ((dwell.ShadowMismatches != before.ShadowMismatches) ||
+                    (dwell.PayloadMismatches != before.PayloadMismatches))
+                {
+                    wprintf(L"PRESSURE_DWELL_STOP reason=MISMATCH "
+                            L"shadowDelta=%lld payloadDelta=%lld\n",
+                        dwell.ShadowMismatches - before.ShadowMismatches,
+                        dwell.PayloadMismatches - before.PayloadMismatches);
+                    PrintDiag(dwell);
+                    stopForMismatch = true;
+                    break;
+                }
+
+                if ((dwell.TaggedWritePages - before.TaggedWritePages) > 0)
+                {
+                    wprintf(L"PRESSURE_DWELL_STOP reason=TAGGED_TARGET_WRITTEN "
+                            L"taggedWrites=%lld firstPage=%lld firstOffset=%lld\n",
+                        dwell.TaggedWritePages - before.TaggedWritePages,
+                        dwell.TaggedFirstWritePageIndex,
+                        dwell.TaggedFirstWriteOffset);
+                    stopForEvidence = true;
+                    break;
+                }
+
+                Sleep(100);
+            }
+        }
+
         MemSnapshot pressurePeak = {};
         GetMemorySnapshot(pressurePeak);
 
