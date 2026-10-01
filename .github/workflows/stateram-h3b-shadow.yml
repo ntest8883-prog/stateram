@@ -12,6 +12,7 @@ on:
       - h3-payload-mirror-c2
       - h3-intervention-d1
       - h3-d1-diag
+      - h3-d1-tagdiag
       - h3-intervention-d1-mdlfix
     paths:
       - "h3/pagefile-shadow-verifier/**"
