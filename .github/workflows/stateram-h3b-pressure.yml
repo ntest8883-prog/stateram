@@ -11,6 +11,7 @@ on:
       - h3-d1-tagdiag
       - h3-d1-prewrite-invalidate
       - h3-d1-payload-authority
+      - h3-d1-payload-earlyarm32
     paths:
       - "h3/pagefile-read-pressure/**"
       - ".github/workflows/stateram-h3b-pressure.yml"
