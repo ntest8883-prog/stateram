@@ -12,6 +12,7 @@ on:
       - h3-d1-prewrite-invalidate
       - h3-d1-payload-authority
       - h3-d1-payload-earlyarm32
+      - h3-d1-double-fault
     paths:
       - "h3/pagefile-read-pressure/**"
       - ".github/workflows/stateram-h3b-pressure.yml"
