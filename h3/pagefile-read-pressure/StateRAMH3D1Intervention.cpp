@@ -1010,6 +1010,42 @@ static int ParentMode()
         H3B_COUNTERS mid = before;
 
         /*
+         * If this session already has naturally verified retained payloads,
+         * arm before pressure starts. The previous D1 run proved that useful
+         * pagefile reads can occur during pressure and then stop before a
+         * late arm command, leaving InterventionAttempts at zero.
+         */
+        if (before.InterventionEligible == 1)
+        {
+            H3B_COUNTERS prePressureArm = {};
+
+            if (!SendH3BCommand(kCommandArm, prePressureArm) ||
+                (prePressureArm.InterventionArmed != 1) ||
+                (prePressureArm.InterventionEligible != 1) ||
+                (prePressureArm.InterventionServedPages != before.InterventionServedPages) ||
+                (prePressureArm.PayloadMismatches != before.PayloadMismatches))
+            {
+                fwprintf(stderr,
+                    L"RESULT=ABORT reason=PRE_PRESSURE_ARM_REJECTED eligible=%lld armed=%lld "
+                    L"served=%lld payloadMismatches=%lld\n",
+                    prePressureArm.InterventionEligible,
+                    prePressureArm.InterventionArmed,
+                    prePressureArm.InterventionServedPages,
+                    prePressureArm.PayloadMismatches);
+                result = 54;
+                break;
+            }
+
+            armedDuringPressure = true;
+            mid = prePressureArm;
+
+            wprintf(L"INTERVENTION_ARM_BEFORE_PRESSURE=PASS "
+                    L"capacity=%lld payloadMatches=%lld\n",
+                prePressureArm.InterventionCapacity,
+                prePressureArm.PayloadMatches);
+        }
+
+        /*
          * Do not blindly allocate all pressure and then inspect the verifier.
          * Check it every 64 MiB once meaningful pressure exists.  This lets us
          * trigger the target read while fresh write history is still available,
