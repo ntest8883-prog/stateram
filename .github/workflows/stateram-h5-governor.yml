@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - h5-adaptive-governor
+      - h5-1-adaptive-governor
     paths:
       - "windows/h5-governor/**"
       - ".github/workflows/stateram-h5-governor.yml"
