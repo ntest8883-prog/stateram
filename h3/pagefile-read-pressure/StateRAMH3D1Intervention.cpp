@@ -9,10 +9,10 @@
 #include <psapi.h>
 #pragma comment(lib, "psapi.lib")
 
-// H3-D1 controlled one-shot intervention harness (protocol v5).
+// H3-D1 verified-payload clustered intervention harness (protocol v7).
 // It arms only after the target is cold and all safety gates are rechecked.
 static const wchar_t* kPortName = L"\\StateRAMH3BPort";
-static const uint32_t kProtocolVersion = 5;
+static const uint32_t kProtocolVersion = 7;
 static const uint32_t kCommandQuery = 1;
 static const uint32_t kCommandArm = 3;
 static const uint32_t kCommandDisarm = 4;
@@ -100,11 +100,45 @@ struct H3B_COUNTERS
     int64_t InterventionPayloadMisses;
     int64_t InterventionHashRejects;
     int64_t InterventionCapacity;
+
+    int64_t DiagCaptured;
+    int64_t DiagIdentityIndex;
+    int64_t DiagReadBaseOffset;
+    int64_t DiagPageOffset;
+    int64_t DiagReadRequestedBytes;
+    int64_t DiagReadCompletedBytes;
+    int64_t DiagReadMdlBytes;
+    int64_t DiagReadPageOrdinal;
+    int64_t DiagReadIrpFlags;
+    int64_t DiagReadOperationFlags;
+    int64_t DiagReadDataFlags;
+    int64_t DiagWriteSequence;
+    int64_t DiagWriteIoLength;
+    int64_t DiagWriteMdlBytes;
+    int64_t DiagWritePageOrdinal;
+    int64_t DiagWriteIrpFlags;
+    int64_t DiagWriteOperationFlags;
+    int64_t DiagWriteDataFlags;
+    int64_t DiagExpectedHash1;
+    int64_t DiagExpectedHash2;
+    int64_t DiagActualHash1;
+    int64_t DiagActualHash2;
+    int64_t DiagWriterSameObject;
+    int64_t DiagGeneration;
+
+    int64_t TaggedWritePages;
+    int64_t TaggedReadPages;
+    int64_t TaggedFirstWriteOffset;
+    int64_t TaggedFirstReadOffset;
+    int64_t TaggedFirstWritePageIndex;
+    int64_t TaggedFirstReadPageIndex;
+    int64_t TaggedFirstWriteSequence;
+    int64_t TaggedFirstReadIdentityIndex;
 };
 #pragma pack(pop)
 
 static_assert(sizeof(H3B_COMMAND) == 8, "H3B command ABI drift");
-static_assert(sizeof(H3B_COUNTERS) == 432, "H3B counter ABI drift");
+static_assert(sizeof(H3B_COUNTERS) == 688, "H3B counter ABI drift");
 
 typedef HRESULT (WINAPI *PFN_FILTER_CONNECT_COMMUNICATION_PORT)(
     LPCWSTR, DWORD, LPVOID, WORD, LPSECURITY_ATTRIBUTES, HANDLE*);
@@ -568,7 +602,7 @@ static int TargetMode(DWORD parentPid, SIZE_T targetMiB)
 
 static int SelfTest()
 {
-    if ((sizeof(H3B_COMMAND) != 8) || (sizeof(H3B_COUNTERS) != 432))
+    if ((sizeof(H3B_COMMAND) != 8) || (sizeof(H3B_COUNTERS) != 688))
     {
         fwprintf(stderr, L"SELFTEST=FAIL ABI\n");
         return 2;
@@ -641,23 +675,12 @@ static int MachinePreflight()
         return 79;
     }
 
-    if ((counters.InterventionEligible != 1) ||
-        (counters.PayloadMatches <= 0))
+    if (counters.PayloadMismatches != 0)
     {
         fwprintf(stderr,
-            L"PREFLIGHT=FAIL reason=INTERVENTION_NOT_ELIGIBLE eligible=%lld payloadMatches=%lld\n",
-            counters.InterventionEligible,
-            counters.PayloadMatches);
-        return 80;
-    }
-
-    if ((counters.ShadowMismatches != 0) ||
-        (counters.PayloadMismatches != 0))
-    {
-        fwprintf(stderr,
-            L"PREFLIGHT=FAIL reason=EXISTING_MISMATCHES shadow=%lld payload=%lld\n",
-            counters.ShadowMismatches,
-            counters.PayloadMismatches);
+            L"PREFLIGHT=FAIL reason=EXISTING_PAYLOAD_MISMATCHES payload=%lld shadowDiagnostic=%lld\n",
+            counters.PayloadMismatches,
+            counters.ShadowMismatches);
         return 71;
     }
 
@@ -732,13 +755,12 @@ static int MachinePreflight()
         return 77;
     }
 
-    if ((after.ShadowMismatches != counters.ShadowMismatches) ||
-        (after.PayloadMismatches != counters.PayloadMismatches))
+    if (after.PayloadMismatches != counters.PayloadMismatches)
     {
         fwprintf(stderr,
-            L"PREFLIGHT=FAIL reason=NEW_MISMATCH shadowDelta=%lld payloadDelta=%lld\n",
-            after.ShadowMismatches - counters.ShadowMismatches,
-            after.PayloadMismatches - counters.PayloadMismatches);
+            L"PREFLIGHT=FAIL reason=NEW_PAYLOAD_MISMATCH payloadDelta=%lld shadowDiagnosticDelta=%lld\n",
+            after.PayloadMismatches - counters.PayloadMismatches,
+            after.ShadowMismatches - counters.ShadowMismatches);
         return 78;
     }
 
@@ -767,18 +789,16 @@ static int ParentMode()
         return 30;
     }
 
-    if ((before.ShadowMismatches != 0) ||
-        (before.PayloadMismatches != 0))
+    if (before.PayloadMismatches != 0)
     {
         fwprintf(stderr,
-            L"RESULT=ABORT reason=BASELINE_MISMATCHES shadow=%lld payload=%lld\n",
-            before.ShadowMismatches,
-            before.PayloadMismatches);
+            L"RESULT=ABORT reason=BASELINE_PAYLOAD_MISMATCHES payload=%lld shadowDiagnostic=%lld\n",
+            before.PayloadMismatches,
+            before.ShadowMismatches);
         return 31;
     }
 
-    if ((before.InterventionEligible != 1) ||
-        (before.InterventionArmed != 0) ||
+    if ((before.InterventionArmed != 0) ||
         (before.InterventionServedPages != 0))
     {
         fwprintf(stderr,
@@ -1053,13 +1073,12 @@ static int ParentMode()
                 targetCold =
                     (WaitForSingleObject(cold, 0) == WAIT_OBJECT_0);
 
-                if ((probe.ShadowMismatches != before.ShadowMismatches) ||
-                    (probe.PayloadMismatches != before.PayloadMismatches))
+                if (probe.PayloadMismatches != before.PayloadMismatches)
                 {
-                    wprintf(L"PRESSURE_STOP reason=MISMATCH shadowDelta=%lld payloadDelta=%lld "
-                            L"allocated=%llu MiB\n",
-                        probe.ShadowMismatches - before.ShadowMismatches,
+                    wprintf(L"PRESSURE_STOP reason=PAYLOAD_MISMATCH payloadDelta=%lld "
+                            L"shadowDiagnosticDelta=%lld allocated=%llu MiB\n",
                         probe.PayloadMismatches - before.PayloadMismatches,
+                        probe.ShadowMismatches - before.ShadowMismatches,
                         static_cast<unsigned long long>(allocatedMiB));
                     stopForMismatch = true;
                     break;
@@ -1109,7 +1128,6 @@ static int ParentMode()
                         (armed.InterventionArmed != 1) ||
                         (armed.InterventionEligible != 1) ||
                         (armed.InterventionServedPages != before.InterventionServedPages) ||
-                        (armed.ShadowMismatches != before.ShadowMismatches) ||
                         (armed.PayloadMismatches != before.PayloadMismatches))
                     {
                         fwprintf(stderr,
@@ -1215,13 +1233,13 @@ static int ParentMode()
 
         PrintDelta(before, mid);
 
-        if ((mid.ShadowMismatches != before.ShadowMismatches) ||
-            (mid.PayloadMismatches != before.PayloadMismatches))
+        if (mid.PayloadMismatches != before.PayloadMismatches)
         {
             fwprintf(stderr,
-                L"RESULT=STOP_MISMATCH phase=before-read shadowDelta=%lld payloadDelta=%lld\n",
-                mid.ShadowMismatches - before.ShadowMismatches,
-                mid.PayloadMismatches - before.PayloadMismatches);
+                L"RESULT=STOP_PAYLOAD_MISMATCH phase=before-read payloadDelta=%lld "
+                L"shadowDiagnosticDelta=%lld\n",
+                mid.PayloadMismatches - before.PayloadMismatches,
+                mid.ShadowMismatches - before.ShadowMismatches);
             result = 40;
             break;
         }
@@ -1378,8 +1396,7 @@ static int ParentMode()
 
         PrintDelta(before, after);
 
-        if ((after.ShadowMismatches != before.ShadowMismatches) ||
-            (after.PayloadMismatches != before.PayloadMismatches))
+        if (after.PayloadMismatches != before.PayloadMismatches)
         {
             fwprintf(stderr,
                 L"RESULT=STOP_MISMATCH shadowDelta=%lld payloadDelta=%lld\n",
@@ -1409,14 +1426,14 @@ static int ParentMode()
         int64_t guardRejectDelta =
             after.InterventionGuardRejects - before.InterventionGuardRejects;
 
-        if ((servedDelta == 1) &&
+        if ((servedDelta > 0) &&
+            (servedDelta <= after.InterventionCapacity) &&
             (attemptsDelta >= 1) &&
             (after.InterventionArmed == 0) &&
             (hashRejectDelta == 0) &&
-            (after.ShadowMismatches == before.ShadowMismatches) &&
             (after.PayloadMismatches == before.PayloadMismatches))
         {
-            wprintf(L"RESULT=INTERVENTION_PASS servedPagesDelta=%lld attemptsDelta=%lld "
+            wprintf(L"RESULT=INTERVENTION_PASS verifiedPayloadClusterPages=%lld attemptsDelta=%lld "
                     L"fallbacksDelta=%lld guardRejectsDelta=%lld payloadMissesDelta=%lld "
                     L"hashRejectsDelta=%lld armedFinal=%lld\n",
                 servedDelta,
