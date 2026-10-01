@@ -1313,6 +1313,78 @@ H3BLookupShadow (
 }
 
 static
+VOID
+H3BInvalidateShadowRange (
+    _In_ ULONG IdentityIndex,
+    _In_ LONGLONG ByteOffset,
+    _In_ ULONG Length
+    )
+{
+    ULONGLONG start;
+    ULONGLONG endExclusive;
+    ULONGLONG pageOffset;
+    LONG generation;
+
+    if ((IdentityIndex >= H3B_MAX_PAGEFILE_IDENTITIES) ||
+        (ByteOffset < 0) ||
+        (Length == 0) ||
+        ((ULONGLONG)ByteOffset > (~0ULL - (ULONGLONG)Length)))
+    {
+        return;
+    }
+
+    start = (ULONGLONG)ByteOffset;
+    endExclusive = start + (ULONGLONG)Length;
+    pageOffset = start & ~((ULONGLONG)PAGE_SIZE - 1ULL);
+    generation = InterlockedCompareExchange(&g_ShadowGeneration, 0, 0);
+
+    /*
+     * A write invalidates the old expectation as soon as we observe the
+     * pre-write callback.  This is deliberately independent of history-ring
+     * bookkeeping, completion-context allocation, and later payload capture.
+     * If the write subsequently publishes trustworthy replacement bytes, a
+     * fresh shadow entry will be installed by H3BShadowCompletedWrite.
+     */
+    while (pageOffset < endExclusive)
+    {
+        KIRQL oldIrql;
+        ULONG index;
+        PH3B_SHADOW_ENTRY entry;
+        BOOLEAN invalidated;
+
+        invalidated = FALSE;
+        index = H3BShadowIndex(IdentityIndex, pageOffset);
+
+        KeAcquireSpinLock(&g_ShadowLock, &oldIrql);
+
+        entry = &g_ShadowTable[index];
+
+        if ((entry->Generation == (ULONG)generation) &&
+            (entry->IdentityIndex == IdentityIndex) &&
+            (entry->Offset == pageOffset))
+        {
+            entry->Generation = 0;
+            invalidated = TRUE;
+        }
+
+        KeReleaseSpinLock(&g_ShadowLock, oldIrql);
+
+        if (invalidated)
+        {
+            InterlockedDecrement64(&g_ShadowTableEntries);
+            InterlockedIncrement64(&g_ShadowVerifyInvalidated);
+        }
+
+        if (pageOffset > (~0ULL - PAGE_SIZE))
+        {
+            break;
+        }
+
+        pageOffset += PAGE_SIZE;
+    }
+}
+
+static
 ULONG
 H3BPayloadWriteBase (
     _In_ ULONGLONG WriteSequence
@@ -2703,6 +2775,29 @@ H3BPreWrite (
     }
 
     length = Data->Iopb->Parameters.Write.Length;
+
+    {
+        ULONG identityIndex;
+
+        /*
+         * Invalidate any previously trusted bytes before this write is sent
+         * below us.  Do this before allocating completion context so even an
+         * allocation failure cannot leave a stale shadow entry trusted.
+         */
+        if (H3BGetPagefileIdentityIndex(
+                Data->Iopb->TargetFileObject,
+                &identityIndex))
+        {
+            H3BInvalidateShadowRange(
+                identityIndex,
+                Data->Iopb->Parameters.Write.ByteOffset.QuadPart,
+                length);
+        }
+        else
+        {
+            InterlockedExchange(&g_TrackingCompromised, 1);
+        }
+    }
 
 #pragma warning(push)
 #pragma warning(disable:4996)
