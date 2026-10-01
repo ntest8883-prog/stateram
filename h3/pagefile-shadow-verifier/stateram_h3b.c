@@ -15,6 +15,8 @@
 #define H3B_POOL_TAG         'B3HS'
 #define H3B_MAX_HASH_PAGES_PER_IO 4
 #define H3B_MAX_TAG_SCAN_PAGES 64
+#define H3B_TAG_CACHE_SLOTS 512
+#define H3B_TAG_MAX_INTERVENTION_PAGES 64
 #define H3B_TAG_MAGIC1 0x535441544552414DULL
 #define H3B_TAG_MAGIC2 0x5441475041474531ULL
 #define H3B_TAG_CHECK_XOR 0xD1A6D1A6D1A6D1A6ULL
@@ -156,6 +158,16 @@ typedef struct _H3B_PAYLOAD_ENTRY
     UCHAR Bytes[PAGE_SIZE];
 } H3B_PAYLOAD_ENTRY, *PH3B_PAYLOAD_ENTRY;
 
+typedef struct _H3B_TAG_CACHE_ENTRY
+{
+    ULONG Valid;
+    ULONG IdentityIndex;
+    ULONGLONG Offset;
+    ULONGLONG PageIndex;
+    ULONGLONG WriteSequence;
+    UCHAR Bytes[PAGE_SIZE];
+} H3B_TAG_CACHE_ENTRY, *PH3B_TAG_CACHE_ENTRY;
+
 typedef struct _H3B_WRITE_RANGE
 {
     ULONGLONG Start;
@@ -207,6 +219,10 @@ KSPIN_LOCK g_ShadowLock;
 PH3B_SHADOW_ENTRY g_ShadowTable;
 KSPIN_LOCK g_PayloadLock;
 H3B_PAYLOAD_ENTRY g_PayloadTable[H3B_PAYLOAD_SLOTS];
+KSPIN_LOCK g_TagCacheLock;
+PH3B_TAG_CACHE_ENTRY g_TagCache;
+ULONG g_TagCacheNext;
+volatile LONG g_TagCacheValidCount;
 volatile LONG g_ShadowGeneration;
 volatile LONG64 g_WriteSequence;
 
@@ -408,6 +424,19 @@ H3BResetCounters (
     InterlockedExchange64(&g_TaggedFirstReadIdentityIndex, 0);
     InterlockedExchange(&g_TaggedWriteCaptured, 0);
     InterlockedExchange(&g_TaggedReadCaptured, 0);
+
+    if (g_TagCache != NULL)
+    {
+        KIRQL tagIrql;
+
+        KeAcquireSpinLock(&g_TagCacheLock, &tagIrql);
+        RtlZeroMemory(
+            g_TagCache,
+            sizeof(H3B_TAG_CACHE_ENTRY) * H3B_TAG_CACHE_SLOTS);
+        g_TagCacheNext = 0;
+        InterlockedExchange(&g_TagCacheValidCount, 0);
+        KeReleaseSpinLock(&g_TagCacheLock, tagIrql);
+    }
 
     generation = InterlockedIncrement(&g_ShadowGeneration);
 
