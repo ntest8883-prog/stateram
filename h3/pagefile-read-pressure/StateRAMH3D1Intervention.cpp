@@ -1153,6 +1153,8 @@ static int ParentMode()
             break;
         }
 
+        PrintDelta(before, afterPass1);
+
         const int64_t pass1ReadDelta =
             afterPass1.PayloadReadPages - prePass1.PayloadReadPages;
         const int64_t pass1MatchDelta =
