@@ -1242,18 +1242,15 @@ static int ParentMode()
                     break;
                 }
 
-                if ((payloadReadDelta > 0) &&
-                    (payloadMatchDelta > 0) &&
-                    (payloadMismatchDelta == 0))
-                {
-                    wprintf(L"PRESSURE_STOP reason=PAYLOAD_ALREADY_MATCHED "
-                            L"payloadReads=%lld payloadMatches=%lld allocated=%llu MiB\n",
-                        payloadReadDelta,
-                        payloadMatchDelta,
-                        static_cast<unsigned long long>(allocatedMiB));
-                    stopForEvidence = true;
-                    break;
-                }
+                /*
+                 * Tagged diagnostic: an unrelated payload match is not enough
+                 * evidence. Keep pressure until the tagged target itself is
+                 * observed in a pagefile write, or until a safety/history
+                 * guard stops the run.
+                 */
+                UNREFERENCED_PARAMETER(payloadReadDelta);
+                UNREFERENCED_PARAMETER(payloadMatchDelta);
+                UNREFERENCED_PARAMETER(payloadMismatchDelta);
 
                 if (historyDropDelta > 0)
                 {
