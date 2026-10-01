@@ -2278,6 +2278,7 @@ H3BShadowCompletedWrite (
 {
     PVOID mappedBuffer;
     PUCHAR bytes;
+    PUCHAR payloadScratch;
     ULONGLONG baseOffset;
     ULONGLONG writeSequence;
     ULONG_PTR completedBytes;
@@ -2597,7 +2598,6 @@ H3BVerifyCompletedRead (
 {
     PVOID mappedBuffer;
     PUCHAR bytes;
-    PUCHAR payloadScratch;
     ULONGLONG baseOffset;
     ULONG_PTR completedBytes;
     ULONG pageCount;
