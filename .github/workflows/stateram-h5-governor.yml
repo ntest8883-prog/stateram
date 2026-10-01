@@ -5,6 +5,7 @@ on:
     branches:
       - h5-adaptive-governor
       - h5-1-adaptive-governor
+      - h5-2-lean-governor
     paths:
       - "windows/h5-governor/**"
       - ".github/workflows/stateram-h5-governor.yml"
