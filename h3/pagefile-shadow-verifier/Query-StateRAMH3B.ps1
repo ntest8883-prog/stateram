@@ -113,6 +113,16 @@ public static class StateRAMH3BNative
         public Int64 TaggedFirstReadPageIndex;
         public Int64 TaggedFirstWriteSequence;
         public Int64 TaggedFirstReadIdentityIndex;
+
+        public Int64 CompressionSamplePages;
+        public Int64 CompressionRawBytes;
+        public Int64 CompressionStoredBytes;
+        public Int64 CompressionEligiblePages;
+        public Int64 CompressionLe25Pages;
+        public Int64 CompressionLe50Pages;
+        public Int64 CompressionLe75Pages;
+        public Int64 CompressionLe90Pages;
+        public Int64 CompressionGt90Pages;
     }
 
     [DllImport("fltlib.dll", CharSet = CharSet.Unicode)]
@@ -150,11 +160,11 @@ if ($SelfTest) {
         throw "Protocol self-test failed: Command size is $commandSize, expected 8."
     }
 
-    if ($counterSize -ne 688) {
-        throw "Protocol self-test failed: Counters size is $counterSize, expected 688."
+    if ($counterSize -ne 760) {
+        throw "Protocol self-test failed: Counters size is $counterSize, expected 760."
     }
 
-    Write-Host "StateRAMH3B query protocol self-test: PASS (Command=8, Counters=688)"
+    Write-Host "StateRAMH3B query protocol self-test: PASS (Command=8, Counters=760)"
     exit 0
 }
 
@@ -173,7 +183,7 @@ if ($hr -ne 0) {
 
 try {
     $cmd = New-Object StateRAMH3BNative+Command
-    $cmd.Version = 7
+    $cmd.Version = 8
     $cmd.CommandId = switch ($Command) {
         "query"  { 1 }
         "reset"  { 2 }
@@ -194,6 +204,23 @@ try {
 
     if ($hr -ne 0) {
         throw ("FilterSendMessage failed: 0x{0:X8}" -f ([uint32]$hr))
+    }
+
+    $compressionRatio = 0.0
+    $compressionSavingsPercent = 0.0
+    $compressionEligiblePercent = 0.0
+    $projectedLogicalPer256MiB = 0.0
+    $projectedNetGainPer256MiB = 0.0
+
+    if ($reply.CompressionStoredBytes -gt 0) {
+        $compressionRatio = $reply.CompressionRawBytes / [double]$reply.CompressionStoredBytes
+        $compressionSavingsPercent = 100.0 * (1.0 - ($reply.CompressionStoredBytes / [double]$reply.CompressionRawBytes))
+        $projectedLogicalPer256MiB = 256.0 * $compressionRatio
+        $projectedNetGainPer256MiB = $projectedLogicalPer256MiB - 256.0
+    }
+
+    if ($reply.CompressionSamplePages -gt 0) {
+        $compressionEligiblePercent = 100.0 * ($reply.CompressionEligiblePages / [double]$reply.CompressionSamplePages)
     }
 
     [pscustomobject]@{
@@ -288,6 +315,21 @@ try {
         TaggedFirstReadPageIndex    = $reply.TaggedFirstReadPageIndex
         TaggedFirstWriteSequence    = $reply.TaggedFirstWriteSequence
         TaggedFirstReadIdentityIndex = $reply.TaggedFirstReadIdentityIndex
+
+        CompressionSamplePages       = $reply.CompressionSamplePages
+        CompressionRawMiB            = [math]::Round($reply.CompressionRawBytes / 1MB, 3)
+        CompressionStoredMiB         = [math]::Round($reply.CompressionStoredBytes / 1MB, 3)
+        CompressionRatio             = [math]::Round($compressionRatio, 3)
+        CompressionSavingsPercent    = [math]::Round($compressionSavingsPercent, 1)
+        CompressionEligiblePages     = $reply.CompressionEligiblePages
+        CompressionEligiblePercent   = [math]::Round($compressionEligiblePercent, 1)
+        CompressionLe25Pages         = $reply.CompressionLe25Pages
+        CompressionLe50Pages         = $reply.CompressionLe50Pages
+        CompressionLe75Pages         = $reply.CompressionLe75Pages
+        CompressionLe90Pages         = $reply.CompressionLe90Pages
+        CompressionGt90Pages         = $reply.CompressionGt90Pages
+        ProjectedLogicalPer256MiB    = [math]::Round($projectedLogicalPer256MiB, 1)
+        ProjectedNetGainPer256MiB    = [math]::Round($projectedNetGainPer256MiB, 1)
     } | Format-List
 }
 finally {
