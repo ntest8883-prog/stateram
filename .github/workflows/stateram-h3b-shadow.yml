@@ -13,6 +13,7 @@ on:
       - h3-intervention-d1
       - h3-d1-diag
       - h3-d1-tagdiag
+      - h3-d1-prewrite-invalidate
       - h3-intervention-d1-mdlfix
     paths:
       - "h3/pagefile-shadow-verifier/**"
