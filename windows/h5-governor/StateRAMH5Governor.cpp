@@ -30,11 +30,15 @@ static constexpr DWORD LOOP_MS = 500;
 static constexpr uint64_t HOT_CAPTURE_INTERVAL_MS = 5000;
 static constexpr uint64_t RECENT_FOREGROUND_MS = 5000;
 static constexpr uint64_t RED_IDLE_TRIM_MS = 20000;
-static constexpr uint64_t TRIM_COOLDOWN_MS = 45000;
+static constexpr uint64_t ORANGE_IDLE_TRIM_MS = 30000;
+static constexpr uint64_t TRIM_COOLDOWN_MS = 30000;
 static constexpr uint64_t STATE_EXPIRY_MS = 30000;
 static constexpr uint64_t PER_PROCESS_HOTSET_CAP = 128ull * MiB;
 static constexpr uint64_t GROUP_PREFETCH_CAP = 256ull * MiB;
 static constexpr uint64_t MIN_TRIM_WORKING_SET = 160ull * MiB;
+static constexpr uint64_t ORANGE_MIN_TRIM_WORKING_SET = 256ull * MiB;
+static constexpr uint64_t ORANGE_TRIM_AVAILABLE = 640ull * MiB;
+static constexpr size_t PREFETCH_BATCH_RANGES = 64;
 
 static std::atomic<bool> g_stop{false};
 static std::mutex g_log_mu;
@@ -238,7 +242,7 @@ struct ProcState {
 
 static HANDLE open_process_for_observe(DWORD pid) {
     return OpenProcess(
-        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE,
+        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
         FALSE, pid);
 }
 
@@ -634,6 +638,15 @@ static void launch_prefetch(
 
                 if (!h) {
                     ++failures;
+
+                    std::ostringstream fail;
+                    fail
+                        << "PREFETCH_FAIL pid=" << item.pid
+                        << " name=" << narrow(item.name)
+                        << " stage=OPEN_PROCESS"
+                        << " error=" << GetLastError();
+
+                    log_line(fail.str());
                     continue;
                 }
 
@@ -646,20 +659,78 @@ static void launch_prefetch(
                         remaining,
                         selected);
 
-                if (!ranges.empty() && selected != 0) {
+                if (ranges.empty() || selected == 0) {
+                    CloseHandle(h);
+                    continue;
+                }
+
+                uint64_t process_selected = 0;
+                bool any_success = false;
+                bool process_failed = false;
+
+                for (size_t base = 0;
+                     base < ranges.size();
+                     base += PREFETCH_BATCH_RANGES)
+                {
+                    const size_t count =
+                        std::min<size_t>(
+                            PREFETCH_BATCH_RANGES,
+                            ranges.size() - base);
+
+                    uint64_t batch_bytes = 0;
+
+                    for (size_t j = 0; j < count; ++j) {
+                        batch_bytes +=
+                            ranges[base + j].NumberOfBytes;
+                    }
+
+                    SetLastError(ERROR_SUCCESS);
+
                     if (PrefetchVirtualMemory(
                             h,
-                            ranges.size(),
-                            ranges.data(),
+                            static_cast<ULONG_PTR>(count),
+                            ranges.data() + base,
                             0))
                     {
-                        ++successes;
-                        total_selected += selected;
-                        remaining -= selected;
+                        any_success = true;
+                        process_selected += batch_bytes;
                     }
                     else {
-                        ++failures;
+                        const DWORD err = GetLastError();
+                        process_failed = true;
+
+                        std::ostringstream fail;
+                        fail
+                            << "PREFETCH_FAIL pid=" << item.pid
+                            << " name=" << narrow(item.name)
+                            << " stage=API"
+                            << " error=" << err
+                            << " ranges=" << count
+                            << " batchMiB="
+                            << std::fixed
+                            << std::setprecision(1)
+                            << (static_cast<double>(
+                                    batch_bytes) / MiB);
+
+                        log_line(fail.str());
+                        break;
                     }
+                }
+
+                if (any_success) {
+                    ++successes;
+                    total_selected += process_selected;
+
+                    if (process_selected < remaining) {
+                        remaining -= process_selected;
+                    }
+                    else {
+                        remaining = 0;
+                    }
+                }
+
+                if (process_failed) {
+                    ++failures;
                 }
 
                 CloseHandle(h);
@@ -764,18 +835,78 @@ static int selftest() {
         return 3;
     }
 
+    const SIZE_T test_bytes = 1ull * MiB;
+    void* test_region = VirtualAlloc(
+        nullptr,
+        test_bytes,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE);
+
+    if (!test_region) {
+        std::cout
+            << "SELFTEST=FAIL reason=TEST_ALLOC"
+            << " error=" << GetLastError()
+            << "\n";
+        return 4;
+    }
+
+    volatile unsigned char* test =
+        static_cast<volatile unsigned char*>(
+            test_region);
+
+    for (SIZE_T off = 0;
+         off < test_bytes;
+         off += PAGE_BYTES)
+    {
+        test[off] =
+            static_cast<unsigned char>(
+                (off / PAGE_BYTES) & 0xFF);
+    }
+
+    WIN32_MEMORY_RANGE_ENTRY self_range{};
+    self_range.VirtualAddress = test_region;
+    self_range.NumberOfBytes = test_bytes;
+
+    SetLastError(ERROR_SUCCESS);
+
+    const BOOL prefetch_self_ok =
+        PrefetchVirtualMemory(
+            GetCurrentProcess(),
+            1,
+            &self_range,
+            0);
+
+    const DWORD prefetch_self_error =
+        prefetch_self_ok
+            ? ERROR_SUCCESS
+            : GetLastError();
+
+    VirtualFree(
+        test_region,
+        0,
+        MEM_RELEASE);
+
+    if (!prefetch_self_ok) {
+        std::cout
+            << "SELFTEST=FAIL reason=PREFETCH_SELF"
+            << " error=" << prefetch_self_error
+            << "\n";
+        return 5;
+    }
+
     MEMORYSTATUSEX ms{};
     ms.dwLength = sizeof(ms);
 
     if (!GlobalMemoryStatusEx(&ms)) {
         std::cout
             << "SELFTEST=FAIL reason=MEMORY_STATUS\n";
-        return 4;
+        return 6;
     }
 
     std::cout
         << "SELFTEST=PASS"
         << " prefetch=YES"
+        << " prefetchSelf=PASS"
         << " memoryPriority=YES"
         << " currentPriority=" << priority
         << " totalPhysMiB=" << (ms.ullTotalPhys / MiB)
@@ -818,12 +949,12 @@ int wmain(int argc, wchar_t** argv) {
     uint64_t priority_changes = 0;
 
     std::cout
-        << "StateRAM H5 Adaptive Governor\n"
+        << "StateRAM H5.1 Adaptive Governor\n"
         << "mode="
         << (dry_run ? "DRY_RUN" : "ACTIVE")
         << "\n"
         << "policy="
-        << "foreground-hotset+idle-background-memory-priority+critical-trim"
+        << "foreground-hotset+batched-prefetch+idle-priority+proactive-trim"
         << "\n"
         << "stop=Ctrl+C\n";
 
@@ -1045,7 +1176,8 @@ int wmain(int argc, wchar_t** argv) {
                     256ull * MiB,
                     mem.total / 10);
 
-            if (mem.pressure == 3 &&
+            const bool critical_trim_candidate =
+                mem.pressure == 3 &&
                 mem.available <= critical_floor &&
                 (now - st.last_foreground) >=
                     RED_IDLE_TRIM_MS &&
@@ -1053,7 +1185,22 @@ int wmain(int argc, wchar_t** argv) {
                     TRIM_COOLDOWN_MS &&
                 st.cpu_pct < 0.5 &&
                 st.working_set >=
-                    MIN_TRIM_WORKING_SET)
+                    MIN_TRIM_WORKING_SET;
+
+            const bool proactive_trim_candidate =
+                mem.pressure == 2 &&
+                mem.available <=
+                    ORANGE_TRIM_AVAILABLE &&
+                (now - st.last_foreground) >=
+                    ORANGE_IDLE_TRIM_MS &&
+                (now - st.last_trim) >=
+                    TRIM_COOLDOWN_MS &&
+                st.cpu_pct < 0.5 &&
+                st.working_set >=
+                    ORANGE_MIN_TRIM_WORKING_SET;
+
+            if (critical_trim_candidate ||
+                proactive_trim_candidate)
             {
                 if (!trim_candidate ||
                     st.working_set >
@@ -1083,7 +1230,9 @@ int wmain(int argc, wchar_t** argv) {
                 std::ostringstream oss;
 
                 oss
-                    << "CRITICAL_TRIM pid="
+                    << ((mem.pressure >= 3)
+                        ? "CRITICAL_TRIM pid="
+                        : "PROACTIVE_TRIM pid=")
                     << trim_candidate->pid
                     << " name="
                     << narrow(
