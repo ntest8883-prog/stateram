@@ -2776,14 +2776,80 @@ H3BPreWrite (
 
     length = Data->Iopb->Parameters.Write.Length;
 
+#pragma warning(push)
+#pragma warning(disable:4996)
+    writeContext = (PH3B_WRITE_CONTEXT)ExAllocatePoolWithTag(
+        NonPagedPoolNx,
+        sizeof(H3B_WRITE_CONTEXT),
+        H3B_POOL_TAG);
+#pragma warning(pop)
+
+    if (writeContext == NULL)
     {
         ULONG identityIndex;
 
         /*
-         * Invalidate any previously trusted bytes before this write is sent
-         * below us.  Do this before allocating completion context so even an
-         * allocation failure cannot leave a stale shadow entry trusted.
+         * We cannot create the history record that makes an in-flight write
+         * visible to concurrent readers.  Invalidate any old expectation and
+         * permanently mark this diagnostic session unfit for intervention.
          */
+        if (H3BGetPagefileIdentityIndex(
+                Data->Iopb->TargetFileObject,
+                &identityIndex))
+        {
+            H3BInvalidateShadowRange(
+                identityIndex,
+                Data->Iopb->Parameters.Write.ByteOffset.QuadPart,
+                length);
+        }
+
+        InterlockedExchange(&g_TrackingCompromised, 1);
+        InterlockedIncrement64(&g_ShadowBufferUnavailable);
+        InterlockedIncrement64(&g_PagefileWrites);
+        InterlockedAdd64(&g_PagefileWriteBytes, length);
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    RtlZeroMemory(writeContext, sizeof(*writeContext));
+
+    /*
+     * Publish the in-flight history barrier BEFORE removing the old shadow.
+     * A concurrent read that copied the old entry just before invalidation
+     * will then see this newer overlapping write in H3BHistoryAllowsVerify
+     * and refuse the stale comparison.
+     */
+    if (!H3BRecordWriteRange(
+            Data->Iopb->TargetFileObject,
+            Data->Iopb->Parameters.Write.ByteOffset.QuadPart,
+            length,
+            &writeSequence))
+    {
+        ULONG identityIndex;
+
+        if (H3BGetPagefileIdentityIndex(
+                Data->Iopb->TargetFileObject,
+                &identityIndex))
+        {
+            H3BInvalidateShadowRange(
+                identityIndex,
+                Data->Iopb->Parameters.Write.ByteOffset.QuadPart,
+                length);
+        }
+
+        InterlockedExchange(&g_TrackingCompromised, 1);
+
+        ExFreePoolWithTag(
+            writeContext,
+            H3B_POOL_TAG);
+
+        InterlockedIncrement64(&g_PagefileWrites);
+        InterlockedAdd64(&g_PagefileWriteBytes, length);
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    {
+        ULONG identityIndex;
+
         if (H3BGetPagefileIdentityIndex(
                 Data->Iopb->TargetFileObject,
                 &identityIndex))
@@ -2797,39 +2863,6 @@ H3BPreWrite (
         {
             InterlockedExchange(&g_TrackingCompromised, 1);
         }
-    }
-
-#pragma warning(push)
-#pragma warning(disable:4996)
-    writeContext = (PH3B_WRITE_CONTEXT)ExAllocatePoolWithTag(
-        NonPagedPoolNx,
-        sizeof(H3B_WRITE_CONTEXT),
-        H3B_POOL_TAG);
-#pragma warning(pop)
-
-    if (writeContext == NULL)
-    {
-        InterlockedIncrement64(&g_ShadowBufferUnavailable);
-        InterlockedIncrement64(&g_PagefileWrites);
-        InterlockedAdd64(&g_PagefileWriteBytes, length);
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
-    }
-
-    RtlZeroMemory(writeContext, sizeof(*writeContext));
-
-    if (!H3BRecordWriteRange(
-            Data->Iopb->TargetFileObject,
-            Data->Iopb->Parameters.Write.ByteOffset.QuadPart,
-            length,
-            &writeSequence))
-    {
-        ExFreePoolWithTag(
-            writeContext,
-            H3B_POOL_TAG);
-
-        InterlockedIncrement64(&g_PagefileWrites);
-        InterlockedAdd64(&g_PagefileWriteBytes, length);
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
     writeContext->Sequence = writeSequence;
