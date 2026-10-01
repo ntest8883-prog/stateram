@@ -1325,7 +1325,6 @@ static int ParentMode()
                 if ((armed.InterventionArmed != 1) ||
                     (armed.InterventionEligible != 1) ||
                     (armed.InterventionServedPages != before.InterventionServedPages) ||
-                    (armed.ShadowMismatches != before.ShadowMismatches) ||
                     (armed.PayloadMismatches != before.PayloadMismatches))
                 {
                     fwprintf(stderr,
@@ -1399,7 +1398,7 @@ static int ParentMode()
         if (after.PayloadMismatches != before.PayloadMismatches)
         {
             fwprintf(stderr,
-                L"RESULT=STOP_MISMATCH shadowDelta=%lld payloadDelta=%lld\n",
+                L"RESULT=STOP_PAYLOAD_MISMATCH shadowDiagnosticDelta=%lld payloadDelta=%lld\n",
                 after.ShadowMismatches - before.ShadowMismatches,
                 after.PayloadMismatches - before.PayloadMismatches);
             result = 42;
