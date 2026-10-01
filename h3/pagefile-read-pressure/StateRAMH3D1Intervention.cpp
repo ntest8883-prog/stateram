@@ -1539,7 +1539,138 @@ static int ParentMode()
         if ((wait != WAIT_OBJECT_0) &&
             (wait != (WAIT_OBJECT_0 + 1)))
         {
-            fwprintf(stderr, L"RESULT=ABORT reason=TARGET_VERIFY_TIMEOUT wait=%lu\n", wait);
+            fwprintf(stderr, L"RESULT=ABORT reason=TARGET_FIRST_VERIFY_TIMEOUT wait=%lu\n", wait);
+            break;
+        }
+
+        if (wait == (WAIT_OBJECT_0 + 1))
+        {
+            DWORD earlyCode = STILL_ACTIVE;
+            GetExitCodeProcess(pi.hProcess, &earlyCode);
+            fwprintf(stderr,
+                L"RESULT=ABORT reason=TARGET_EXITED_DURING_FIRST_VERIFY code=%lu\n",
+                static_cast<unsigned long>(earlyCode));
+            result = 41;
+            break;
+        }
+
+        H3B_COUNTERS afterFirst = {};
+        if (!QueryH3B(afterFirst))
+        {
+            fwprintf(stderr, L"RESULT=ABORT reason=FIRST_VERIFY_QUERY_FAILED\n");
+            break;
+        }
+
+        const int64_t firstServedDelta =
+            afterFirst.InterventionServedPages - before.InterventionServedPages;
+        const int64_t firstPayloadMatchDelta =
+            afterFirst.PayloadMatches - mid.PayloadMatches;
+
+        wprintf(L"FIRST_READ_LEARNING payloadMatchesDelta=%lld "
+                L"servedPagesDelta=%lld attemptsDelta=%lld payloadMissesDelta=%lld\n",
+            firstPayloadMatchDelta,
+            firstServedDelta,
+            afterFirst.InterventionAttempts - before.InterventionAttempts,
+            afterFirst.InterventionPayloadMisses - before.InterventionPayloadMisses);
+
+        if (afterFirst.PayloadMismatches != before.PayloadMismatches)
+        {
+            fwprintf(stderr,
+                L"RESULT=STOP_PAYLOAD_MISMATCH phase=first-read payloadDelta=%lld\n",
+                afterFirst.PayloadMismatches - before.PayloadMismatches);
+            result = 42;
+            break;
+        }
+
+        if ((firstServedDelta == 0) && (firstPayloadMatchDelta <= 0))
+        {
+            fwprintf(stderr,
+                L"RESULT=ABORT reason=NO_VERIFIED_PAYLOADS_AFTER_FIRST_READ\n");
+            result = 55;
+            break;
+        }
+
+        if (!ResetEvent(done))
+        {
+            fwprintf(stderr, L"RESULT=ABORT reason=RESET_DONE_FOR_SECOND_READ error=%lu\n",
+                GetLastError());
+            result = 56;
+            break;
+        }
+
+        HANDLE secondColdWaitHandles[2] = { cold, pi.hProcess };
+        wait = WaitForMultipleObjects(
+            2,
+            secondColdWaitHandles,
+            FALSE,
+            kTargetReadyWaitMs);
+
+        if (wait == (WAIT_OBJECT_0 + 1))
+        {
+            DWORD earlyCode = STILL_ACTIVE;
+            GetExitCodeProcess(pi.hProcess, &earlyCode);
+            fwprintf(stderr,
+                L"RESULT=ABORT reason=TARGET_EXITED_BEFORE_SECOND_COLD code=%lu\n",
+                static_cast<unsigned long>(earlyCode));
+            result = 57;
+            break;
+        }
+
+        if (wait != WAIT_OBJECT_0)
+        {
+            fwprintf(stderr,
+                L"RESULT=ABORT reason=SECOND_TARGET_COLD_TIMEOUT wait=%lu\n",
+                wait);
+            result = 58;
+            break;
+        }
+
+        wprintf(L"TARGET_COLD_BEFORE_SECOND_READ=YES\n");
+
+        if (firstServedDelta == 0)
+        {
+            H3B_COUNTERS secondArm = afterFirst;
+
+            if (afterFirst.InterventionArmed != 1)
+            {
+                if (!SendH3BCommand(kCommandArm, secondArm) ||
+                    (secondArm.InterventionArmed != 1) ||
+                    (secondArm.InterventionEligible != 1) ||
+                    (secondArm.PayloadMismatches != before.PayloadMismatches))
+                {
+                    fwprintf(stderr,
+                        L"RESULT=ABORT reason=SECOND_ARM_REJECTED eligible=%lld armed=%lld "
+                        L"payloadMismatches=%lld\n",
+                        secondArm.InterventionEligible,
+                        secondArm.InterventionArmed,
+                        secondArm.PayloadMismatches);
+                    result = 59;
+                    break;
+                }
+            }
+
+            wprintf(L"INTERVENTION_ARM_FOR_SECOND_READ=PASS "
+                    L"payloadMatches=%lld attempts=%lld\n",
+                secondArm.PayloadMatches,
+                secondArm.InterventionAttempts);
+        }
+        else
+        {
+            wprintf(L"INTERVENTION_ALREADY_SERVED_ON_FIRST_READ=YES\n");
+        }
+
+        SetEvent(go);
+
+        wait = WaitForMultipleObjects(
+            2,
+            verifyWaitHandles,
+            FALSE,
+            kTargetVerifyWaitMs);
+
+        if ((wait != WAIT_OBJECT_0) &&
+            (wait != (WAIT_OBJECT_0 + 1)))
+        {
+            fwprintf(stderr, L"RESULT=ABORT reason=TARGET_SECOND_VERIFY_TIMEOUT wait=%lu\n", wait);
             break;
         }
 
@@ -1553,7 +1684,7 @@ static int ParentMode()
 
         if (childCode != 0)
         {
-            fwprintf(stderr, L"RESULT=ABORT reason=TARGET_VERIFY_FAILED code=%lu\n",
+            fwprintf(stderr, L"RESULT=ABORT reason=TARGET_SECOND_VERIFY_FAILED code=%lu\n",
                 static_cast<unsigned long>(childCode));
             result = 41;
             break;
