@@ -4,7 +4,6 @@
 #include <windows.h>
 #include <psapi.h>
 #include <tlhelp32.h>
-#include <memoryapi.h>
 #include <processthreadsapi.h>
 
 #include <algorithm>
@@ -27,25 +26,19 @@
 static constexpr uint64_t MiB = 1024ull * 1024ull;
 static constexpr uint64_t PAGE_BYTES = 4096ull;
 static constexpr DWORD LOOP_MS = 500;
-static constexpr uint64_t HOT_CAPTURE_INTERVAL_MS = 5000;
 static constexpr uint64_t RECENT_FOREGROUND_MS = 5000;
-static constexpr uint64_t RED_IDLE_TRIM_MS = 20000;
-static constexpr uint64_t ORANGE_IDLE_TRIM_MS = 30000;
+static constexpr uint64_t RED_IDLE_TRIM_MS = 12000;
+static constexpr uint64_t ORANGE_IDLE_TRIM_MS = 15000;
 static constexpr uint64_t TRIM_COOLDOWN_MS = 30000;
+static constexpr uint64_t GLOBAL_TRIM_COOLDOWN_MS = 8000;
 static constexpr uint64_t STATE_EXPIRY_MS = 30000;
-static constexpr uint64_t PER_PROCESS_HOTSET_CAP = 128ull * MiB;
-static constexpr uint64_t GROUP_PREFETCH_CAP = 256ull * MiB;
 static constexpr uint64_t MIN_TRIM_WORKING_SET = 160ull * MiB;
-static constexpr uint64_t ORANGE_MIN_TRIM_WORKING_SET = 256ull * MiB;
-static constexpr uint64_t ORANGE_TRIM_AVAILABLE = 640ull * MiB;
-static constexpr size_t PREFETCH_BATCH_RANGES = 64;
+static constexpr uint64_t ORANGE_MIN_TRIM_WORKING_SET = 192ull * MiB;
+static constexpr uint64_t ORANGE_TRIM_AVAILABLE = 720ull * MiB;
 
 static std::atomic<bool> g_stop{false};
 static std::mutex g_log_mu;
-static std::atomic<bool> g_prefetch_busy{false};
-static std::atomic<uint64_t> g_prefetch_total_bytes{0};
-static std::atomic<uint64_t> g_prefetch_calls{0};
-static std::atomic<uint64_t> g_prefetch_failures{0};
+static std::atomic<uint64_t> g_trimmed_working_set_bytes{0};
 
 static uint64_t tick_ms() { return GetTickCount64(); }
 
@@ -235,8 +228,6 @@ struct ProcState {
     ULONG original_mem_priority = 5;
     ULONG current_mem_priority = 5;
     bool have_original_priority = false;
-    std::vector<HotRange> hot;
-    uint64_t hot_bytes = 0;
     uint64_t working_set = 0;
 };
 
@@ -378,395 +369,6 @@ static void restore_mem_priority(ProcState& st) {
     CloseHandle(h);
 }
 
-struct WsPage {
-    uintptr_t addr = 0;
-    bool shared = false;
-};
-
-static bool capture_hotset(ProcState& st, uint64_t cap_bytes) {
-    HANDLE h = open_process_for_observe(st.pid);
-    if (!h) return false;
-
-    PROCESS_MEMORY_COUNTERS_EX pmc{};
-    pmc.cb = sizeof(pmc);
-
-    if (!GetProcessMemoryInfo(
-            h,
-            reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
-            sizeof(pmc)))
-    {
-        CloseHandle(h);
-        return false;
-    }
-
-    size_t estimated_pages =
-        static_cast<size_t>(pmc.WorkingSetSize / PAGE_BYTES) + 16384;
-
-    estimated_pages = std::max<size_t>(estimated_pages, 16384);
-
-    size_t buffer_bytes =
-        sizeof(PSAPI_WORKING_SET_INFORMATION) +
-        estimated_pages * sizeof(PSAPI_WORKING_SET_BLOCK);
-
-    std::vector<unsigned char> buffer(buffer_bytes);
-
-    bool ok = false;
-    for (int attempt = 0; attempt < 4; ++attempt) {
-        if (QueryWorkingSet(
-                h,
-                buffer.data(),
-                static_cast<DWORD>(buffer.size())))
-        {
-            ok = true;
-            break;
-        }
-
-        const DWORD err = GetLastError();
-        if (err != ERROR_BAD_LENGTH &&
-            err != ERROR_INSUFFICIENT_BUFFER)
-        {
-            break;
-        }
-
-        buffer.resize(buffer.size() * 2);
-    }
-
-    CloseHandle(h);
-    if (!ok) return false;
-
-    auto* ws =
-        reinterpret_cast<PSAPI_WORKING_SET_INFORMATION*>(buffer.data());
-
-    std::vector<WsPage> private_pages;
-    std::vector<WsPage> shared_pages;
-
-    private_pages.reserve(
-        static_cast<size_t>(ws->NumberOfEntries));
-
-    for (ULONG_PTR i = 0; i < ws->NumberOfEntries; ++i) {
-        const auto& block = ws->WorkingSetInfo[i];
-
-        WsPage page{};
-        page.addr =
-            static_cast<uintptr_t>(block.VirtualPage) *
-            static_cast<uintptr_t>(PAGE_BYTES);
-        page.shared = block.Shared != 0;
-
-        if (page.shared) shared_pages.push_back(page);
-        else private_pages.push_back(page);
-    }
-
-    auto by_addr = [](const WsPage& a, const WsPage& b) {
-        return a.addr < b.addr;
-    };
-
-    std::sort(private_pages.begin(), private_pages.end(), by_addr);
-    std::sort(shared_pages.begin(), shared_pages.end(), by_addr);
-
-    const size_t cap_pages =
-        static_cast<size_t>(cap_bytes / PAGE_BYTES);
-
-    std::vector<uintptr_t> selected;
-    selected.reserve(std::min<size_t>(
-        cap_pages,
-        private_pages.size() + shared_pages.size()));
-
-    for (const auto& page : private_pages) {
-        if (selected.size() >= cap_pages) break;
-        selected.push_back(page.addr);
-    }
-
-    for (const auto& page : shared_pages) {
-        if (selected.size() >= cap_pages) break;
-        selected.push_back(page.addr);
-    }
-
-    std::sort(selected.begin(), selected.end());
-    selected.erase(
-        std::unique(selected.begin(), selected.end()),
-        selected.end());
-
-    std::vector<HotRange> ranges;
-
-    if (!selected.empty()) {
-        uintptr_t start = selected[0];
-        uintptr_t previous = selected[0];
-
-        for (size_t i = 1; i < selected.size(); ++i) {
-            if (selected[i] == previous + PAGE_BYTES) {
-                previous = selected[i];
-                continue;
-            }
-
-            ranges.push_back({
-                start,
-                static_cast<size_t>(
-                    previous - start + PAGE_BYTES)
-            });
-
-            start = previous = selected[i];
-        }
-
-        ranges.push_back({
-            start,
-            static_cast<size_t>(
-                previous - start + PAGE_BYTES)
-        });
-    }
-
-    st.hot = std::move(ranges);
-    st.hot_bytes =
-        static_cast<uint64_t>(selected.size()) * PAGE_BYTES;
-    st.last_capture = tick_ms();
-
-    return true;
-}
-
-static std::vector<WIN32_MEMORY_RANGE_ENTRY>
-validate_prefetch_ranges(
-    HANDLE h,
-    const std::vector<HotRange>& hot,
-    uint64_t cap_bytes,
-    uint64_t& selected_bytes)
-{
-    std::vector<WIN32_MEMORY_RANGE_ENTRY> out;
-    selected_bytes = 0;
-
-    for (const auto& range : hot) {
-        uintptr_t cursor = range.base;
-        const uintptr_t end = range.base + range.bytes;
-
-        while (cursor < end &&
-               selected_bytes < cap_bytes)
-        {
-            MEMORY_BASIC_INFORMATION mbi{};
-
-            if (VirtualQueryEx(
-                    h,
-                    reinterpret_cast<LPCVOID>(cursor),
-                    &mbi,
-                    sizeof(mbi)) != sizeof(mbi))
-            {
-                break;
-            }
-
-            const uintptr_t mbi_begin =
-                reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-
-            const uintptr_t mbi_end =
-                mbi_begin + mbi.RegionSize;
-
-            const uintptr_t region_begin =
-                std::max<uintptr_t>(cursor, mbi_begin);
-
-            const uintptr_t region_end =
-                std::min<uintptr_t>(end, mbi_end);
-
-            if (region_end <= region_begin) break;
-
-            const bool accessible =
-                mbi.State == MEM_COMMIT &&
-                (mbi.Protect & PAGE_GUARD) == 0 &&
-                (mbi.Protect & PAGE_NOACCESS) == 0;
-
-            if (accessible) {
-                size_t bytes =
-                    static_cast<size_t>(
-                        region_end - region_begin);
-
-                const uint64_t remaining =
-                    cap_bytes - selected_bytes;
-
-                if (bytes > remaining) {
-                    bytes = static_cast<size_t>(
-                        remaining - (remaining % PAGE_BYTES));
-                }
-
-                if (bytes >= PAGE_BYTES) {
-                    WIN32_MEMORY_RANGE_ENTRY item{};
-                    item.VirtualAddress =
-                        reinterpret_cast<PVOID>(region_begin);
-                    item.NumberOfBytes = bytes;
-                    out.push_back(item);
-                    selected_bytes += bytes;
-                }
-            }
-
-            cursor = region_end;
-        }
-
-        if (selected_bytes >= cap_bytes) break;
-    }
-
-    return out;
-}
-
-struct PrefetchItem {
-    DWORD pid = 0;
-    std::wstring name;
-    std::vector<HotRange> hot;
-};
-
-static void launch_prefetch(
-    std::vector<PrefetchItem> items,
-    uint64_t cap_bytes)
-{
-    if (items.empty() || cap_bytes < PAGE_BYTES) return;
-
-    bool expected = false;
-    if (!g_prefetch_busy.compare_exchange_strong(
-            expected, true))
-    {
-        return;
-    }
-
-    std::thread(
-        [items = std::move(items), cap_bytes]() mutable
-        {
-            const uint64_t start = tick_ms();
-
-            uint64_t remaining = cap_bytes;
-            uint64_t total_selected = 0;
-            uint64_t successes = 0;
-            uint64_t failures = 0;
-
-            for (const auto& item : items) {
-                if (remaining < PAGE_BYTES) break;
-
-                HANDLE h =
-                    open_process_for_observe(item.pid);
-
-                if (!h) {
-                    ++failures;
-
-                    std::ostringstream fail;
-                    fail
-                        << "PREFETCH_FAIL pid=" << item.pid
-                        << " name=" << narrow(item.name)
-                        << " stage=OPEN_PROCESS"
-                        << " error=" << GetLastError();
-
-                    log_line(fail.str());
-                    continue;
-                }
-
-                uint64_t selected = 0;
-
-                auto ranges =
-                    validate_prefetch_ranges(
-                        h,
-                        item.hot,
-                        remaining,
-                        selected);
-
-                if (ranges.empty() || selected == 0) {
-                    CloseHandle(h);
-                    continue;
-                }
-
-                uint64_t process_selected = 0;
-                bool any_success = false;
-                bool process_failed = false;
-
-                for (size_t base = 0;
-                     base < ranges.size();
-                     base += PREFETCH_BATCH_RANGES)
-                {
-                    const size_t count =
-                        std::min<size_t>(
-                            PREFETCH_BATCH_RANGES,
-                            ranges.size() - base);
-
-                    uint64_t batch_bytes = 0;
-
-                    for (size_t j = 0; j < count; ++j) {
-                        batch_bytes +=
-                            ranges[base + j].NumberOfBytes;
-                    }
-
-                    SetLastError(ERROR_SUCCESS);
-
-                    if (PrefetchVirtualMemory(
-                            h,
-                            static_cast<ULONG_PTR>(count),
-                            ranges.data() + base,
-                            0))
-                    {
-                        any_success = true;
-                        process_selected += batch_bytes;
-                    }
-                    else {
-                        const DWORD err = GetLastError();
-                        process_failed = true;
-
-                        std::ostringstream fail;
-                        fail
-                            << "PREFETCH_FAIL pid=" << item.pid
-                            << " name=" << narrow(item.name)
-                            << " stage=API"
-                            << " error=" << err
-                            << " ranges=" << count
-                            << " batchMiB="
-                            << std::fixed
-                            << std::setprecision(1)
-                            << (static_cast<double>(
-                                    batch_bytes) / MiB);
-
-                        log_line(fail.str());
-                        break;
-                    }
-                }
-
-                if (any_success) {
-                    ++successes;
-                    total_selected += process_selected;
-
-                    if (process_selected < remaining) {
-                        remaining -= process_selected;
-                    }
-                    else {
-                        remaining = 0;
-                    }
-                }
-
-                if (process_failed) {
-                    ++failures;
-                }
-
-                CloseHandle(h);
-            }
-
-            g_prefetch_calls.fetch_add(
-                successes,
-                std::memory_order_relaxed);
-
-            g_prefetch_failures.fetch_add(
-                failures,
-                std::memory_order_relaxed);
-
-            g_prefetch_total_bytes.fetch_add(
-                total_selected,
-                std::memory_order_relaxed);
-
-            std::ostringstream oss;
-            oss
-                << "PREFETCH_END selectedMiB="
-                << std::fixed << std::setprecision(1)
-                << (static_cast<double>(
-                        total_selected) / MiB)
-                << " successProcesses=" << successes
-                << " failures=" << failures
-                << " elapsedMs="
-                << (tick_ms() - start);
-
-            log_line(oss.str());
-
-            g_prefetch_busy.store(
-                false,
-                std::memory_order_release);
-        }).detach();
-}
-
 static bool trim_process(ProcState& st) {
     HANDLE h = open_process_for_control(st.pid);
     if (!h) return false;
@@ -776,16 +378,6 @@ static bool trim_process(ProcState& st) {
 
     if (ok) st.last_trim = tick_ms();
     return ok != FALSE;
-}
-
-static uint64_t choose_prefetch_cap(
-    const MemState& mem)
-{
-    if (mem.available < 320ull * MiB) return 0;
-    if (mem.available < 600ull * MiB) return 64ull * MiB;
-    if (mem.available < 1000ull * MiB) return 128ull * MiB;
-    if (mem.available < 1600ull * MiB) return 192ull * MiB;
-    return GROUP_PREFETCH_CAP;
 }
 
 static DWORD foreground_pid() {
@@ -808,20 +400,6 @@ group_for_root(
 }
 
 static int selftest() {
-    auto* p1 = GetProcAddress(
-        GetModuleHandleW(L"kernel32.dll"),
-        "PrefetchVirtualMemory");
-
-    auto* p2 = GetProcAddress(
-        GetModuleHandleW(L"kernel32.dll"),
-        "SetProcessInformation");
-
-    if (!p1 || !p2) {
-        std::cout
-            << "SELFTEST=FAIL reason=API_MISSING\n";
-        return 2;
-    }
-
     ULONG priority = 0;
 
     if (!get_mem_priority(
@@ -832,66 +410,7 @@ static int selftest() {
             << "SELFTEST=FAIL reason=GET_MEMORY_PRIORITY"
             << " error=" << GetLastError()
             << "\n";
-        return 3;
-    }
-
-    const SIZE_T test_bytes = 1ull * MiB;
-    void* test_region = VirtualAlloc(
-        nullptr,
-        test_bytes,
-        MEM_RESERVE | MEM_COMMIT,
-        PAGE_READWRITE);
-
-    if (!test_region) {
-        std::cout
-            << "SELFTEST=FAIL reason=TEST_ALLOC"
-            << " error=" << GetLastError()
-            << "\n";
-        return 4;
-    }
-
-    volatile unsigned char* test =
-        static_cast<volatile unsigned char*>(
-            test_region);
-
-    for (SIZE_T off = 0;
-         off < test_bytes;
-         off += PAGE_BYTES)
-    {
-        test[off] =
-            static_cast<unsigned char>(
-                (off / PAGE_BYTES) & 0xFF);
-    }
-
-    WIN32_MEMORY_RANGE_ENTRY self_range{};
-    self_range.VirtualAddress = test_region;
-    self_range.NumberOfBytes = test_bytes;
-
-    SetLastError(ERROR_SUCCESS);
-
-    const BOOL prefetch_self_ok =
-        PrefetchVirtualMemory(
-            GetCurrentProcess(),
-            1,
-            &self_range,
-            0);
-
-    const DWORD prefetch_self_error =
-        prefetch_self_ok
-            ? ERROR_SUCCESS
-            : GetLastError();
-
-    VirtualFree(
-        test_region,
-        0,
-        MEM_RELEASE);
-
-    if (!prefetch_self_ok) {
-        std::cout
-            << "SELFTEST=FAIL reason=PREFETCH_SELF"
-            << " error=" << prefetch_self_error
-            << "\n";
-        return 5;
+        return 2;
     }
 
     MEMORYSTATUSEX ms{};
@@ -900,14 +419,14 @@ static int selftest() {
     if (!GlobalMemoryStatusEx(&ms)) {
         std::cout
             << "SELFTEST=FAIL reason=MEMORY_STATUS\n";
-        return 6;
+        return 3;
     }
 
     std::cout
         << "SELFTEST=PASS"
-        << " prefetch=YES"
-        << " prefetchSelf=PASS"
         << " memoryPriority=YES"
+        << " leanGovernor=YES"
+        << " crossProcessPrefetch=DISABLED"
         << " currentPriority=" << priority
         << " totalPhysMiB=" << (ms.ullTotalPhys / MiB)
         << " availableMiB=" << (ms.ullAvailPhys / MiB)
@@ -947,14 +466,15 @@ int wmain(int argc, wchar_t** argv) {
     uint64_t last_status = 0;
     uint64_t trims = 0;
     uint64_t priority_changes = 0;
+    uint64_t last_global_trim = 0;
 
     std::cout
-        << "StateRAM H5.1 Adaptive Governor\n"
+        << "StateRAM H5.2 Lean Governor\n"
         << "mode="
         << (dry_run ? "DRY_RUN" : "ACTIVE")
         << "\n"
         << "policy="
-        << "foreground-hotset+batched-prefetch+idle-priority+proactive-trim"
+        << "idle-background-memory-priority+early-lean-reclaim"
         << "\n"
         << "stop=Ctrl+C\n";
 
@@ -1019,47 +539,9 @@ int wmain(int argc, wchar_t** argv) {
             }
         }
 
-        if (fg_root != 0) {
-            uint64_t group_captured = 0;
-
-            for (DWORD pid : fg_group) {
-                auto it = states.find(pid);
-                if (it == states.end()) continue;
-
-                auto& st = it->second;
-
-                if (now - st.last_capture <
-                    HOT_CAPTURE_INTERVAL_MS)
-                {
-                    continue;
-                }
-
-                const uint64_t left =
-                    GROUP_PREFETCH_CAP -
-                    std::min<uint64_t>(
-                        GROUP_PREFETCH_CAP,
-                        group_captured);
-
-                const uint64_t cap =
-                    std::min<uint64_t>(
-                        PER_PROCESS_HOTSET_CAP,
-                        left);
-
-                if (cap < PAGE_BYTES) break;
-
-                if (capture_hotset(st, cap)) {
-                    group_captured +=
-                        st.hot_bytes;
-                }
-            }
-        }
-
         if (fg_root != 0 &&
             fg_root != last_fg_root)
         {
-            std::vector<PrefetchItem> items;
-            uint64_t remembered = 0;
-
             for (DWORD pid : fg_group) {
                 auto it = states.find(pid);
                 if (it == states.end()) continue;
@@ -1072,49 +554,24 @@ int wmain(int argc, wchar_t** argv) {
                 {
                     ++priority_changes;
                 }
-
-                if (!st.hot.empty()) {
-                    items.push_back({
-                        pid,
-                        st.name,
-                        st.hot
-                    });
-
-                    remembered +=
-                        st.hot_bytes;
-                }
             }
-
-            const uint64_t cap =
-                choose_prefetch_cap(mem);
 
             std::ostringstream oss;
 
             oss
                 << "FOREGROUND_SWITCH pid="
                 << fg_root
-                << " rememberedMiB="
-                << std::fixed
-                << std::setprecision(1)
-                << (static_cast<double>(
-                        remembered) / MiB)
-                << " prefetchCapMiB="
-                << (cap / MiB)
                 << " pressure="
-                << mem.pressure;
+                << mem.pressure
+                << " availableMiB="
+                << (mem.available / MiB);
 
             log_line(oss.str());
-
-            if (!dry_run && cap != 0) {
-                launch_prefetch(
-                    std::move(items),
-                    cap);
-            }
-
             last_fg_root = fg_root;
         }
 
         ProcState* trim_candidate = nullptr;
+
 
         for (auto& kv : states) {
             auto& st = kv.second;
@@ -1176,26 +633,32 @@ int wmain(int argc, wchar_t** argv) {
                     256ull * MiB,
                     mem.total / 10);
 
+            const bool global_trim_ready =
+                (now - last_global_trim) >=
+                    GLOBAL_TRIM_COOLDOWN_MS;
+
             const bool critical_trim_candidate =
+                global_trim_ready &&
                 mem.pressure == 3 &&
                 mem.available <= critical_floor &&
                 (now - st.last_foreground) >=
                     RED_IDLE_TRIM_MS &&
                 (now - st.last_trim) >=
                     TRIM_COOLDOWN_MS &&
-                st.cpu_pct < 0.5 &&
+                st.cpu_pct < 0.75 &&
                 st.working_set >=
                     MIN_TRIM_WORKING_SET;
 
             const bool proactive_trim_candidate =
-                mem.pressure == 2 &&
+                global_trim_ready &&
+                mem.pressure >= 2 &&
                 mem.available <=
                     ORANGE_TRIM_AVAILABLE &&
                 (now - st.last_foreground) >=
                     ORANGE_IDLE_TRIM_MS &&
                 (now - st.last_trim) >=
                     TRIM_COOLDOWN_MS &&
-                st.cpu_pct < 0.5 &&
+                st.cpu_pct < 0.75 &&
                 st.working_set >=
                     ORANGE_MIN_TRIM_WORKING_SET;
 
@@ -1212,20 +675,16 @@ int wmain(int argc, wchar_t** argv) {
         }
 
         if (trim_candidate && !dry_run) {
-            if (now -
-                    trim_candidate->last_capture >
-                2000)
-            {
-                capture_hotset(
-                    *trim_candidate,
-                    PER_PROCESS_HOTSET_CAP);
-            }
-
             const uint64_t ws_before =
                 trim_candidate->working_set;
 
             if (trim_process(*trim_candidate)) {
                 ++trims;
+                last_global_trim = now;
+
+                g_trimmed_working_set_bytes.fetch_add(
+                    ws_before,
+                    std::memory_order_relaxed);
 
                 std::ostringstream oss;
 
@@ -1242,12 +701,11 @@ int wmain(int argc, wchar_t** argv) {
                     << std::setprecision(1)
                     << (static_cast<double>(
                             ws_before) / MiB)
-                    << " rememberedMiB="
-                    << (static_cast<double>(
-                            trim_candidate->hot_bytes) /
-                        MiB)
                     << " availableMiB="
-                    << (mem.available / MiB);
+                    << (mem.available / MiB)
+                    << " cpuPct="
+                    << std::setprecision(2)
+                    << trim_candidate->cpu_pct;
 
                 log_line(oss.str());
             }
@@ -1287,15 +745,12 @@ int wmain(int argc, wchar_t** argv) {
         }
 
         if (now - last_status >= 5000) {
-            uint64_t captured = 0;
             size_t active_states = 0;
 
             for (const auto& kv : states) {
                 if (now - kv.second.last_seen <=
                     STATE_EXPIRY_MS)
                 {
-                    captured +=
-                        kv.second.hot_bytes;
                     ++active_states;
                 }
             }
@@ -1313,23 +768,16 @@ int wmain(int argc, wchar_t** argv) {
                 << fg_root
                 << " managed="
                 << active_states
-                << " rememberedMiB="
-                << std::fixed
-                << std::setprecision(1)
-                << (static_cast<double>(
-                        captured) / MiB)
-                << " prefetchMiB="
-                << (static_cast<double>(
-                        g_prefetch_total_bytes.load()) /
-                    MiB)
-                << " prefetchCalls="
-                << g_prefetch_calls.load()
-                << " prefetchFailures="
-                << g_prefetch_failures.load()
                 << " priorityChanges="
                 << priority_changes
                 << " trims="
-                << trims;
+                << trims
+                << " trimmedWsMiB="
+                << std::fixed
+                << std::setprecision(1)
+                << (static_cast<double>(
+                        g_trimmed_working_set_bytes.load()) /
+                    MiB);
 
             log_line(oss.str());
             last_status = now;
