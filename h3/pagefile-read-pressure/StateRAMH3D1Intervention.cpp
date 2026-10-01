@@ -401,33 +401,37 @@ static std::wstring EventName(DWORD parentPid, const wchar_t* suffix)
 static int TargetMode(DWORD parentPid, SIZE_T targetMiB)
 {
     std::wstring readyName = EventName(parentPid, L"ready");
-    std::wstring coldName = EventName(parentPid, L"cold");
-    std::wstring goName = EventName(parentPid, L"go");
-    std::wstring doneName = EventName(parentPid, L"done");
+    std::wstring cold1Name = EventName(parentPid, L"cold1");
+    std::wstring go1Name = EventName(parentPid, L"go1");
+    std::wstring done1Name = EventName(parentPid, L"done1");
+    std::wstring cold2Name = EventName(parentPid, L"cold2");
+    std::wstring go2Name = EventName(parentPid, L"go2");
+    std::wstring done2Name = EventName(parentPid, L"done2");
 
     HANDLE ready = OpenEventW(EVENT_MODIFY_STATE, FALSE, readyName.c_str());
-    HANDLE cold = OpenEventW(EVENT_MODIFY_STATE, FALSE, coldName.c_str());
-    HANDLE go = OpenEventW(SYNCHRONIZE, FALSE, goName.c_str());
-    HANDLE done = OpenEventW(EVENT_MODIFY_STATE, FALSE, doneName.c_str());
+    HANDLE cold1 = OpenEventW(EVENT_MODIFY_STATE, FALSE, cold1Name.c_str());
+    HANDLE go1 = OpenEventW(SYNCHRONIZE, FALSE, go1Name.c_str());
+    HANDLE done1 = OpenEventW(EVENT_MODIFY_STATE, FALSE, done1Name.c_str());
+    HANDLE cold2 = OpenEventW(EVENT_MODIFY_STATE, FALSE, cold2Name.c_str());
+    HANDLE go2 = OpenEventW(SYNCHRONIZE, FALSE, go2Name.c_str());
+    HANDLE done2 = OpenEventW(EVENT_MODIFY_STATE, FALSE, done2Name.c_str());
 
-    if (!ready || !cold || !go || !done)
+    if (!ready || !cold1 || !go1 || !done1 || !cold2 || !go2 || !done2)
     {
         fwprintf(stderr, L"TARGET_ERROR open events=%lu\n", GetLastError());
         if (ready) CloseHandle(ready);
-        if (cold) CloseHandle(cold);
-        if (go) CloseHandle(go);
-        if (done) CloseHandle(done);
+        if (cold1) CloseHandle(cold1);
+        if (go1) CloseHandle(go1);
+        if (done1) CloseHandle(done1);
+        if (cold2) CloseHandle(cold2);
+        if (go2) CloseHandle(go2);
+        if (done2) CloseHandle(done2);
         return 20;
     }
 
     const SIZE_T bytes = targetMiB * kMiB;
     const uint64_t seed = 0x535441544552414Dull ^ parentPid;
 
-    /*
-     * Set the child memory priority BEFORE committing/filling its target.
-     * This avoids depending on whether a later priority change is applied
-     * retroactively to pages that were already faulted in.
-     */
     HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
     auto setProcessInformation =
         reinterpret_cast<PFN_SET_PROCESS_INFORMATION_LOCAL>(
@@ -465,10 +469,8 @@ static int TargetMode(DWORD parentPid, SIZE_T targetMiB)
     {
         fwprintf(stderr, L"TARGET_ERROR VirtualAlloc(%zu MiB)=%lu\n",
             targetMiB, GetLastError());
-        CloseHandle(ready);
-        CloseHandle(cold);
-        CloseHandle(go);
-        CloseHandle(done);
+        CloseHandle(ready); CloseHandle(cold1); CloseHandle(go1); CloseHandle(done1);
+        CloseHandle(cold2); CloseHandle(go2); CloseHandle(done2);
         return 21;
     }
 
@@ -480,124 +482,164 @@ static int TargetMode(DWORD parentPid, SIZE_T targetMiB)
             static_cast<SIZE_T>(-1),
             static_cast<SIZE_T>(-1)))
     {
-        fwprintf(stderr, L"TARGET_ERROR working-set trim=%lu\n", GetLastError());
+        fwprintf(stderr, L"TARGET_ERROR initial-working-set-trim=%lu\n", GetLastError());
         VirtualFree(target, 0, MEM_RELEASE);
-        CloseHandle(ready);
-        CloseHandle(cold);
-        CloseHandle(go);
-        CloseHandle(done);
+        CloseHandle(ready); CloseHandle(cold1); CloseHandle(go1); CloseHandle(done1);
+        CloseHandle(cold2); CloseHandle(go2); CloseHandle(done2);
         return 22;
     }
 
-    wprintf(L"TARGET_TRIMMED=YES\n");
+    wprintf(L"TARGET_TRIMMED_PASS1=YES\n");
+
     if (!SetEvent(ready))
     {
         fwprintf(stderr, L"TARGET_ERROR signal-ready=%lu\n", GetLastError());
         VirtualFree(target, 0, MEM_RELEASE);
-        CloseHandle(ready);
-        CloseHandle(cold);
-        CloseHandle(go);
-        CloseHandle(done);
+        CloseHandle(ready); CloseHandle(cold1); CloseHandle(go1); CloseHandle(done1);
+        CloseHandle(cold2); CloseHandle(go2); CloseHandle(done2);
         return 25;
     }
 
-    ULONGLONG waitStart = GetTickCount64();
-    bool coldSignaled = false;
-    DWORD wait = WAIT_TIMEOUT;
-
-    for (;;)
+    auto waitForCold = [&](HANDLE coldEvent, const wchar_t* label) -> bool
     {
-        wait = WaitForSingleObject(go, kResidencyPollMs);
+        ULONGLONG waitStart = GetTickCount64();
 
-        if (wait == WAIT_OBJECT_0)
+        for (;;)
         {
-            break;
-        }
+            SIZE_T residentSamples = 0;
+            SIZE_T totalSamples = 0;
 
-        if (wait != WAIT_TIMEOUT)
-        {
-            fwprintf(stderr, L"TARGET_ERROR wait-go=%lu\n", wait);
-            VirtualFree(target, 0, MEM_RELEASE);
-            CloseHandle(ready);
-            CloseHandle(cold);
-            CloseHandle(go);
-            CloseHandle(done);
-            return 23;
-        }
-
-        SIZE_T residentSamples = 0;
-        SIZE_T totalSamples = 0;
-
-        if (GetSampledResidency(
-                target,
-                bytes,
-                residentSamples,
-                totalSamples))
-        {
-            const ULONG residentPercent =
-                totalSamples == 0 ? 100 :
-                static_cast<ULONG>(
-                    (residentSamples * 100) / totalSamples);
-
-            if (!coldSignaled &&
-                residentPercent <= kColdPercent)
-            {
-                if (!SetEvent(cold))
-                {
-                    fwprintf(stderr,
-                        L"TARGET_ERROR signal-cold=%lu\n",
-                        GetLastError());
-                    VirtualFree(target, 0, MEM_RELEASE);
-                    CloseHandle(ready);
-                    CloseHandle(cold);
-                    CloseHandle(go);
-                    CloseHandle(done);
-                    return 27;
-                }
-
-                coldSignaled = true;
-                wprintf(L"TARGET_COLD residentSamples=%zu totalSamples=%zu "
-                        L"residentPercent=%lu\n",
+            if (GetSampledResidency(
+                    target,
+                    bytes,
                     residentSamples,
-                    totalSamples,
-                    static_cast<unsigned long>(residentPercent));
-            }
-        }
+                    totalSamples))
+            {
+                const ULONG residentPercent =
+                    totalSamples == 0 ? 100 :
+                    static_cast<ULONG>(
+                        (residentSamples * 100) / totalSamples);
 
-        if ((GetTickCount64() - waitStart) >= kTargetGoWaitMs)
-        {
-            fwprintf(stderr, L"TARGET_ERROR wait-go=TIMEOUT\n");
-            VirtualFree(target, 0, MEM_RELEASE);
-            CloseHandle(ready);
-            CloseHandle(cold);
-            CloseHandle(go);
-            CloseHandle(done);
-            return 23;
+                if (residentPercent <= kColdPercent)
+                {
+                    if (!SetEvent(coldEvent))
+                    {
+                        fwprintf(stderr,
+                            L"TARGET_ERROR signal-%s-cold=%lu\n",
+                            label,
+                            GetLastError());
+                        return false;
+                    }
+
+                    wprintf(L"TARGET_%s_COLD residentSamples=%zu totalSamples=%zu residentPercent=%lu\n",
+                        label,
+                        residentSamples,
+                        totalSamples,
+                        static_cast<unsigned long>(residentPercent));
+                    return true;
+                }
+            }
+
+            if ((GetTickCount64() - waitStart) >= kTargetGoWaitMs)
+            {
+                fwprintf(stderr, L"TARGET_ERROR %s-cold=TIMEOUT\n", label);
+                return false;
+            }
+
+            Sleep(kResidencyPollMs);
         }
+    };
+
+    if (!waitForCold(cold1, L"PASS1"))
+    {
+        VirtualFree(target, 0, MEM_RELEASE);
+        CloseHandle(ready); CloseHandle(cold1); CloseHandle(go1); CloseHandle(done1);
+        CloseHandle(cold2); CloseHandle(go2); CloseHandle(done2);
+        return 23;
     }
 
-    wprintf(L"TARGET_VERIFY_BEGIN\n");
-    bool valid = VerifyRegion(target, bytes, seed);
-    wprintf(L"TARGET_VERIFY=%s\n", valid ? L"PASS" : L"FAIL");
-
-    if (!SetEvent(done))
+    if (WaitForSingleObject(go1, kTargetGoWaitMs) != WAIT_OBJECT_0)
     {
-        fwprintf(stderr, L"TARGET_ERROR signal-done=%lu\n", GetLastError());
+        fwprintf(stderr, L"TARGET_ERROR wait-go1\n");
         VirtualFree(target, 0, MEM_RELEASE);
-        CloseHandle(ready);
-        CloseHandle(cold);
-        CloseHandle(go);
-        CloseHandle(done);
+        CloseHandle(ready); CloseHandle(cold1); CloseHandle(go1); CloseHandle(done1);
+        CloseHandle(cold2); CloseHandle(go2); CloseHandle(done2);
+        return 23;
+    }
+
+    wprintf(L"TARGET_VERIFY_PASS1_BEGIN\n");
+    bool valid1 = VerifyRegion(target, bytes, seed);
+    wprintf(L"TARGET_VERIFY_PASS1=%s\n", valid1 ? L"PASS" : L"FAIL");
+
+    if (!valid1)
+    {
+        SetEvent(done1);
+        VirtualFree(target, 0, MEM_RELEASE);
+        CloseHandle(ready); CloseHandle(cold1); CloseHandle(go1); CloseHandle(done1);
+        CloseHandle(cold2); CloseHandle(go2); CloseHandle(done2);
+        return 24;
+    }
+
+    if (!SetEvent(done1))
+    {
+        fwprintf(stderr, L"TARGET_ERROR signal-done1=%lu\n", GetLastError());
+        VirtualFree(target, 0, MEM_RELEASE);
+        CloseHandle(ready); CloseHandle(cold1); CloseHandle(go1); CloseHandle(done1);
+        CloseHandle(cold2); CloseHandle(go2); CloseHandle(done2);
         return 26;
     }
 
-    VirtualFree(target, 0, MEM_RELEASE);
-    CloseHandle(ready);
-    CloseHandle(cold);
-    CloseHandle(go);
-    CloseHandle(done);
+    /*
+     * Keep the bytes unchanged. Re-trim the exact same target so the second
+     * access faults the same logical pages after their pagefile payloads have
+     * been naturally read and verified during pass 1.
+     */
+    if (!SetProcessWorkingSetSize(
+            GetCurrentProcess(),
+            static_cast<SIZE_T>(-1),
+            static_cast<SIZE_T>(-1)))
+    {
+        fwprintf(stderr, L"TARGET_ERROR second-working-set-trim=%lu\n", GetLastError());
+        VirtualFree(target, 0, MEM_RELEASE);
+        CloseHandle(ready); CloseHandle(cold1); CloseHandle(go1); CloseHandle(done1);
+        CloseHandle(cold2); CloseHandle(go2); CloseHandle(done2);
+        return 28;
+    }
 
-    return valid ? 0 : 24;
+    wprintf(L"TARGET_RETRIMMED_PASS2=YES\n");
+
+    if (!waitForCold(cold2, L"PASS2"))
+    {
+        VirtualFree(target, 0, MEM_RELEASE);
+        CloseHandle(ready); CloseHandle(cold1); CloseHandle(go1); CloseHandle(done1);
+        CloseHandle(cold2); CloseHandle(go2); CloseHandle(done2);
+        return 29;
+    }
+
+    if (WaitForSingleObject(go2, kTargetGoWaitMs) != WAIT_OBJECT_0)
+    {
+        fwprintf(stderr, L"TARGET_ERROR wait-go2\n");
+        VirtualFree(target, 0, MEM_RELEASE);
+        CloseHandle(ready); CloseHandle(cold1); CloseHandle(go1); CloseHandle(done1);
+        CloseHandle(cold2); CloseHandle(go2); CloseHandle(done2);
+        return 30;
+    }
+
+    wprintf(L"TARGET_VERIFY_PASS2_BEGIN\n");
+    bool valid2 = VerifyRegion(target, bytes, seed);
+    wprintf(L"TARGET_VERIFY_PASS2=%s\n", valid2 ? L"PASS" : L"FAIL");
+
+    if (!SetEvent(done2))
+    {
+        fwprintf(stderr, L"TARGET_ERROR signal-done2=%lu\n", GetLastError());
+        valid2 = false;
+    }
+
+    VirtualFree(target, 0, MEM_RELEASE);
+    CloseHandle(ready); CloseHandle(cold1); CloseHandle(go1); CloseHandle(done1);
+    CloseHandle(cold2); CloseHandle(go2); CloseHandle(done2);
+
+    return valid2 ? 0 : 31;
 }
 
 static int SelfTest()
@@ -798,64 +840,59 @@ static int ParentMode()
         return 31;
     }
 
-    if ((before.InterventionArmed != 0) ||
-        (before.InterventionServedPages != 0))
+    if ((before.KnownPagefiles <= 0) ||
+        (before.PagefileIdentities <= 0) ||
+        (before.PagingFileCreates <= 0) ||
+        (before.PagefileTableFull != 0) ||
+        (before.DroppedInflightOutstanding != 0))
     {
         fwprintf(stderr,
-            L"RESULT=ABORT reason=INTERVENTION_STATE eligible=%lld armed=%lld served=%lld\n",
-            before.InterventionEligible,
-            before.InterventionArmed,
-            before.InterventionServedPages);
-        return 49;
-    }
-
-    if (before.KnownPagefiles <= 0 ||
-        before.PagefileIdentities <= 0 ||
-        before.PagingFileCreates <= 0)
-    {
-        fwprintf(stderr,
-            L"RESULT=ABORT reason=PAGEFILES_NOT_OBSERVED objects=%lld identities=%lld creates=%lld\n",
+            L"RESULT=ABORT reason=PAGEFILE_STATE objects=%lld identities=%lld creates=%lld "
+            L"tableFull=%lld droppedInflightOutstanding=%lld\n",
             before.KnownPagefiles,
             before.PagefileIdentities,
-            before.PagingFileCreates);
+            before.PagingFileCreates,
+            before.PagefileTableFull,
+            before.DroppedInflightOutstanding);
         return 32;
     }
 
-    if (before.PagefileTableFull != 0)
+    /*
+     * Pass 1 must be completely natural. Disarm explicitly even if an earlier
+     * run left the verifier eligible; we want pass 1 to create target-specific
+     * verified payloads, not attempt intervention.
+     */
+    H3B_COUNTERS passive = {};
+    if (!SendH3BCommand(kCommandDisarm, passive))
     {
-        fwprintf(stderr,
-            L"RESULT=ABORT reason=PAGEFILE_TABLE_FULL value=%lld\n",
-            before.PagefileTableFull);
+        fwprintf(stderr, L"RESULT=ABORT reason=DISARM_BEFORE_PASS1_FAILED\n");
         return 33;
     }
 
-    if (before.DroppedInflightOutstanding != 0)
+    if (passive.InterventionArmed != 0)
     {
-        fwprintf(stderr,
-            L"RESULT=ABORT reason=DROPPED_INFLIGHT_OUTSTANDING value=%lld\n",
-            before.DroppedInflightOutstanding);
-        return 44;
+        fwprintf(stderr, L"RESULT=ABORT reason=DISARM_BEFORE_PASS1_NOT_PASSIVE\n");
+        return 34;
     }
+
+    before = passive;
 
     MemSnapshot initial = {};
     if (!GetMemorySnapshot(initial))
     {
         fwprintf(stderr, L"RESULT=ABORT reason=MEMORY_STATUS_FAILED\n");
-        return 34;
+        return 35;
     }
 
-    wprintf(L"BASELINE pagefileObjects=%lld identities=%lld creates=%lld shadowWrites=%lld "
-            L"shadowReads=%lld matches=%lld mismatches=%lld "
-            L"historyDrops=%lld concurrentOverlapSkips=%lld\n",
+    wprintf(L"BASELINE pagefileObjects=%lld identities=%lld creates=%lld payloadWrites=%lld "
+            L"payloadReads=%lld payloadMatches=%lld payloadMismatches=%lld\n",
         before.KnownPagefiles,
         before.PagefileIdentities,
         before.PagingFileCreates,
-        before.ShadowWritePages,
-        before.ShadowReadPages,
-        before.ShadowMatches,
-        before.ShadowMismatches,
-        before.HistoryRecordDrops,
-        before.ConcurrentOverlapSkips);
+        before.PayloadWritePages,
+        before.PayloadReadPages,
+        before.PayloadMatches,
+        before.PayloadMismatches);
 
     wprintf(L"MEMORY_INITIAL total=%llu MiB available=%llu MiB commitAvailable=%llu MiB\n",
         static_cast<unsigned long long>(initial.totalPhysMiB),
@@ -867,39 +904,46 @@ static int ParentMode()
         fwprintf(stderr,
             L"RESULT=ABORT reason=UNEXPECTED_SMALL_PHYSICAL_MEMORY total=%llu MiB\n",
             static_cast<unsigned long long>(initial.totalPhysMiB));
-        return 35;
+        return 36;
     }
 
     DWORD parentPid = GetCurrentProcessId();
     std::wstring readyName = EventName(parentPid, L"ready");
-    std::wstring coldName = EventName(parentPid, L"cold");
-    std::wstring goName = EventName(parentPid, L"go");
-    std::wstring doneName = EventName(parentPid, L"done");
+    std::wstring cold1Name = EventName(parentPid, L"cold1");
+    std::wstring go1Name = EventName(parentPid, L"go1");
+    std::wstring done1Name = EventName(parentPid, L"done1");
+    std::wstring cold2Name = EventName(parentPid, L"cold2");
+    std::wstring go2Name = EventName(parentPid, L"go2");
+    std::wstring done2Name = EventName(parentPid, L"done2");
 
     HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, readyName.c_str());
-    HANDLE cold = CreateEventW(nullptr, TRUE, FALSE, coldName.c_str());
-    HANDLE go = CreateEventW(nullptr, TRUE, FALSE, goName.c_str());
-    HANDLE done = CreateEventW(nullptr, TRUE, FALSE, doneName.c_str());
+    HANDLE cold1 = CreateEventW(nullptr, TRUE, FALSE, cold1Name.c_str());
+    HANDLE go1 = CreateEventW(nullptr, TRUE, FALSE, go1Name.c_str());
+    HANDLE done1 = CreateEventW(nullptr, TRUE, FALSE, done1Name.c_str());
+    HANDLE cold2 = CreateEventW(nullptr, TRUE, FALSE, cold2Name.c_str());
+    HANDLE go2 = CreateEventW(nullptr, TRUE, FALSE, go2Name.c_str());
+    HANDLE done2 = CreateEventW(nullptr, TRUE, FALSE, done2Name.c_str());
 
-    if (!ready || !cold || !go || !done)
+    if (!ready || !cold1 || !go1 || !done1 || !cold2 || !go2 || !done2)
     {
         fwprintf(stderr, L"RESULT=ABORT reason=CREATE_EVENTS error=%lu\n", GetLastError());
         if (ready) CloseHandle(ready);
-        if (cold) CloseHandle(cold);
-        if (go) CloseHandle(go);
-        if (done) CloseHandle(done);
-        return 36;
+        if (cold1) CloseHandle(cold1);
+        if (go1) CloseHandle(go1);
+        if (done1) CloseHandle(done1);
+        if (cold2) CloseHandle(cold2);
+        if (go2) CloseHandle(go2);
+        if (done2) CloseHandle(done2);
+        return 37;
     }
 
     wchar_t exe[MAX_PATH] = {};
     if (!GetModuleFileNameW(nullptr, exe, _countof(exe)))
     {
         fwprintf(stderr, L"RESULT=ABORT reason=GET_EXE error=%lu\n", GetLastError());
-        CloseHandle(ready);
-        CloseHandle(cold);
-        CloseHandle(go);
-        CloseHandle(done);
-        return 37;
+        CloseHandle(ready); CloseHandle(cold1); CloseHandle(go1); CloseHandle(done1);
+        CloseHandle(cold2); CloseHandle(go2); CloseHandle(done2);
+        return 38;
     }
 
     wchar_t commandLine[2 * MAX_PATH] = {};
@@ -929,14 +973,12 @@ static int ParentMode()
             &pi))
     {
         fwprintf(stderr, L"RESULT=ABORT reason=CREATE_TARGET error=%lu\n", GetLastError());
-        CloseHandle(ready);
-        CloseHandle(cold);
-        CloseHandle(go);
-        CloseHandle(done);
-        return 38;
+        CloseHandle(ready); CloseHandle(cold1); CloseHandle(go1); CloseHandle(done1);
+        CloseHandle(cold2); CloseHandle(go2); CloseHandle(done2);
+        return 39;
     }
 
-    int result = 39;
+    int result = 53;
     std::vector<void*> pressure;
 
     do
@@ -948,19 +990,9 @@ static int ParentMode()
             FALSE,
             kTargetReadyWaitMs);
 
-        if (wait == (WAIT_OBJECT_0 + 1))
-        {
-            DWORD childCode = STILL_ACTIVE;
-            GetExitCodeProcess(pi.hProcess, &childCode);
-            fwprintf(stderr,
-                L"RESULT=ABORT reason=TARGET_EXITED_BEFORE_READY code=%lu\n",
-                static_cast<unsigned long>(childCode));
-            break;
-        }
-
         if (wait != WAIT_OBJECT_0)
         {
-            fwprintf(stderr, L"RESULT=ABORT reason=TARGET_READY_TIMEOUT wait=%lu\n", wait);
+            fwprintf(stderr, L"RESULT=ABORT reason=TARGET_READY wait=%lu\n", wait);
             break;
         }
 
@@ -971,20 +1003,13 @@ static int ParentMode()
             break;
         }
 
-        uint64_t desiredPressureMiB =
-            afterTarget.availPhysMiB + 256;
-
-        desiredPressureMiB = std::max<uint64_t>(
-            desiredPressureMiB,
-            kMinPressureMiB);
-        desiredPressureMiB = std::min<uint64_t>(
-            desiredPressureMiB,
-            kMaxPressureMiB);
+        uint64_t desiredPressureMiB = afterTarget.availPhysMiB + 256;
+        desiredPressureMiB = std::max<uint64_t>(desiredPressureMiB, kMinPressureMiB);
+        desiredPressureMiB = std::min<uint64_t>(desiredPressureMiB, kMaxPressureMiB);
 
         if (afterTarget.availCommitMiB <= kCommitReserveMiB + 64)
         {
-            fwprintf(stderr,
-                L"RESULT=ABORT reason=LOW_COMMIT_HEADROOM available=%llu MiB\n",
+            fwprintf(stderr, L"RESULT=ABORT reason=LOW_COMMIT_HEADROOM available=%llu MiB\n",
                 static_cast<unsigned long long>(afterTarget.availCommitMiB));
             break;
         }
@@ -1001,63 +1026,39 @@ static int ParentMode()
 
         uint64_t allocatedMiB = 0;
         uint64_t blockNumber = 0;
-        bool stopForEvidence = false;
-        bool stopForMismatch = false;
-        bool targetCold = false;
-        bool coldEvidenceReported = false;
-        bool armedDuringPressure = false;
-        bool servedDuringPressure = false;
-        H3B_COUNTERS mid = before;
+        bool targetCold1 = false;
 
-        /*
-         * If this session already has naturally verified retained payloads,
-         * arm before pressure starts. The previous D1 run proved that useful
-         * pagefile reads can occur during pressure and then stop before a
-         * late arm command, leaving InterventionAttempts at zero.
-         */
-        if (before.InterventionEligible == 1)
-        {
-            H3B_COUNTERS prePressureArm = {};
-
-            if (!SendH3BCommand(kCommandArm, prePressureArm) ||
-                (prePressureArm.InterventionArmed != 1) ||
-                (prePressureArm.InterventionEligible != 1) ||
-                (prePressureArm.InterventionServedPages != before.InterventionServedPages) ||
-                (prePressureArm.PayloadMismatches != before.PayloadMismatches))
-            {
-                fwprintf(stderr,
-                    L"RESULT=ABORT reason=PRE_PRESSURE_ARM_REJECTED eligible=%lld armed=%lld "
-                    L"served=%lld payloadMismatches=%lld\n",
-                    prePressureArm.InterventionEligible,
-                    prePressureArm.InterventionArmed,
-                    prePressureArm.InterventionServedPages,
-                    prePressureArm.PayloadMismatches);
-                result = 54;
-                break;
-            }
-
-            armedDuringPressure = true;
-            mid = prePressureArm;
-
-            wprintf(L"INTERVENTION_ARM_BEFORE_PRESSURE=PASS "
-                    L"capacity=%lld payloadMatches=%lld\n",
-                prePressureArm.InterventionCapacity,
-                prePressureArm.PayloadMatches);
-        }
-
-        /*
-         * Do not blindly allocate all pressure and then inspect the verifier.
-         * Check it every 64 MiB once meaningful pressure exists.  This lets us
-         * trigger the target read while fresh write history is still available,
-         * instead of discovering history-ring expiry after the fact.
-         */
         while (allocatedMiB + (kPressureChunk / kMiB) <= desiredPressureMiB)
         {
             MemSnapshot now = {};
             if (!GetMemorySnapshot(now))
             {
-                fwprintf(stderr, L"PRESSURE_STOP reason=MEMORY_STATUS\n");
+                wprintf(L"PRESSURE_STOP reason=MEMORY_STATUS\n");
                 break;
+            }
+
+            targetCold1 = (WaitForSingleObject(cold1, 0) == WAIT_OBJECT_0);
+
+            if (targetCold1 && allocatedMiB >= 512)
+            {
+                H3B_COUNTERS probe = {};
+                if (QueryH3B(probe))
+                {
+                    const int64_t writeDelta =
+                        probe.PagefileWrites - before.PagefileWrites;
+                    const int64_t payloadWriteDelta =
+                        probe.PayloadWritePages - before.PayloadWritePages;
+
+                    if ((writeDelta > 0) && (payloadWriteDelta > 0))
+                    {
+                        wprintf(L"PRESSURE_STOP reason=PASS1_TARGET_COLD_WITH_PAYLOAD_WRITES "
+                                L"writes=%lld payloadWrites=%lld allocated=%llu MiB\n",
+                            writeDelta,
+                            payloadWriteDelta,
+                            static_cast<unsigned long long>(allocatedMiB));
+                        break;
+                    }
+                }
             }
 
             if ((now.availPhysMiB <= kEmergencyAvailMiB) &&
@@ -1095,153 +1096,6 @@ static int ParentMode()
             pressure.push_back(block);
             allocatedMiB += kPressureChunk / kMiB;
             ++blockNumber;
-
-            if ((allocatedMiB % 32) == 0)
-            {
-                H3B_COUNTERS probe = {};
-                if (!QueryH3B(probe))
-                {
-                    fwprintf(stderr, L"PRESSURE_STOP reason=H3B_QUERY_FAILED\n");
-                    break;
-                }
-
-                mid = probe;
-                targetCold =
-                    (WaitForSingleObject(cold, 0) == WAIT_OBJECT_0);
-
-                if (probe.PayloadMismatches != before.PayloadMismatches)
-                {
-                    wprintf(L"PRESSURE_STOP reason=PAYLOAD_MISMATCH payloadDelta=%lld "
-                            L"shadowDiagnosticDelta=%lld allocated=%llu MiB\n",
-                        probe.PayloadMismatches - before.PayloadMismatches,
-                        probe.ShadowMismatches - before.ShadowMismatches,
-                        static_cast<unsigned long long>(allocatedMiB));
-                    stopForMismatch = true;
-                    break;
-                }
-
-                if (probe.PagefileTableFull != 0)
-                {
-                    fwprintf(stderr,
-                        L"PRESSURE_STOP reason=PAGEFILE_TABLE_FULL value=%lld\n",
-                        probe.PagefileTableFull);
-                    stopForMismatch = true;
-                    break;
-                }
-
-                if (probe.DroppedInflightOutstanding != 0)
-                {
-                    wprintf(L"PRESSURE_STOP reason=DROPPED_INFLIGHT_OUTSTANDING "
-                            L"value=%lld allocated=%llu MiB\n",
-                        probe.DroppedInflightOutstanding,
-                        static_cast<unsigned long long>(allocatedMiB));
-                    stopForEvidence = true;
-                    break;
-                }
-
-                const int64_t writeDelta =
-                    probe.PagefileWrites - before.PagefileWrites;
-                const int64_t shadowDelta =
-                    probe.ShadowWritePages - before.ShadowWritePages;
-                const int64_t historyDropDelta =
-                    probe.HistoryRecordDrops - before.HistoryRecordDrops;
-                const int64_t payloadReadDelta =
-                    probe.PayloadReadPages - before.PayloadReadPages;
-                const int64_t payloadMatchDelta =
-                    probe.PayloadMatches - before.PayloadMatches;
-                const int64_t payloadMismatchDelta =
-                    probe.PayloadMismatches - before.PayloadMismatches;
-
-                if (!armedDuringPressure &&
-                    targetCold &&
-                    (payloadReadDelta > 0) &&
-                    (payloadMatchDelta > 0) &&
-                    (payloadMismatchDelta == 0))
-                {
-                    H3B_COUNTERS armed = {};
-
-                    if (!SendH3BCommand(kCommandArm, armed) ||
-                        (armed.InterventionArmed != 1) ||
-                        (armed.InterventionEligible != 1) ||
-                        (armed.InterventionServedPages != before.InterventionServedPages) ||
-                        (armed.PayloadMismatches != before.PayloadMismatches))
-                    {
-                        fwprintf(stderr,
-                            L"PRESSURE_STOP reason=ARM_REJECTED eligible=%lld armed=%lld "
-                            L"served=%lld shadowMismatches=%lld payloadMismatches=%lld\n",
-                            armed.InterventionEligible,
-                            armed.InterventionArmed,
-                            armed.InterventionServedPages,
-                            armed.ShadowMismatches,
-                            armed.PayloadMismatches);
-                        stopForMismatch = true;
-                        break;
-                    }
-
-                    armedDuringPressure = true;
-                    mid = armed;
-
-                    wprintf(L"INTERVENTION_ARM_DURING_PRESSURE=PASS "
-                            L"payloadReads=%lld payloadMatches=%lld allocated=%llu MiB\n",
-                        payloadReadDelta,
-                        payloadMatchDelta,
-                        static_cast<unsigned long long>(allocatedMiB));
-
-                    continue;
-                }
-
-                if (armedDuringPressure &&
-                    (probe.InterventionServedPages > before.InterventionServedPages))
-                {
-                    servedDuringPressure = true;
-                    stopForEvidence = true;
-                    wprintf(L"PRESSURE_STOP reason=INTERVENTION_SERVED "
-                            L"served=%lld attempts=%lld allocated=%llu MiB\n",
-                        probe.InterventionServedPages - before.InterventionServedPages,
-                        probe.InterventionAttempts - before.InterventionAttempts,
-                        static_cast<unsigned long long>(allocatedMiB));
-                    break;
-                }
-
-                if (historyDropDelta > 0)
-                {
-                    wprintf(L"PRESSURE_STOP reason=HISTORY_PRESSURE "
-                            L"drops=%lld allocated=%llu MiB\n",
-                        historyDropDelta,
-                        static_cast<unsigned long long>(allocatedMiB));
-                    stopForEvidence = true;
-                    break;
-                }
-
-                if (!coldEvidenceReported &&
-                    targetCold &&
-                    (allocatedMiB >= 256) &&
-                    (writeDelta >= kEvidencePagefileWrites) &&
-                    (shadowDelta >= kEvidenceShadowPages))
-                {
-                    wprintf(L"PRESSURE_CONTINUE reason=TARGET_COLD_AND_PAGEFILE_EVIDENCE "
-                            L"writes=%lld shadowPages=%lld allocated=%llu MiB "
-                            L"awaitingPayloadRead=YES\n",
-                        writeDelta,
-                        shadowDelta,
-                        static_cast<unsigned long long>(allocatedMiB));
-                    coldEvidenceReported = true;
-                }
-            }
-        }
-
-        MemSnapshot pressurePeak = {};
-        GetMemorySnapshot(pressurePeak);
-
-        wprintf(L"PRESSURE_ALLOCATED=%llu MiB availableAtPeak=%llu MiB\n",
-            static_cast<unsigned long long>(allocatedMiB),
-            static_cast<unsigned long long>(pressurePeak.availPhysMiB));
-
-        if (stopForMismatch)
-        {
-            fwprintf(stderr, L"RESULT=STOP_MISMATCH phase=pressure\n");
-            result = 40;
-            break;
         }
 
         if (allocatedMiB < 256)
@@ -1252,157 +1106,140 @@ static int ParentMode()
             break;
         }
 
+        if (WaitForSingleObject(cold1, 0) != WAIT_OBJECT_0)
+        {
+            fwprintf(stderr, L"RESULT=ABORT reason=PASS1_TARGET_NOT_COLD\n");
+            break;
+        }
+
+        H3B_COUNTERS prePass1 = {};
+        if (!QueryH3B(prePass1))
+        {
+            fwprintf(stderr, L"RESULT=ABORT reason=PRE_PASS1_QUERY_FAILED\n");
+            break;
+        }
+
+        if ((prePass1.PayloadMismatches != before.PayloadMismatches) ||
+            (prePass1.PagefileTableFull != 0) ||
+            (prePass1.DroppedInflightOutstanding != 0))
+        {
+            fwprintf(stderr,
+                L"RESULT=ABORT reason=PRE_PASS1_GUARD payloadMismatches=%lld tableFull=%lld "
+                L"droppedInflightOutstanding=%lld\n",
+                prePass1.PayloadMismatches,
+                prePass1.PagefileTableFull,
+                prePass1.DroppedInflightOutstanding);
+            break;
+        }
+
+        wprintf(L"PASS1_NATURAL_READ_BEGIN\n");
+        if (!SetEvent(go1))
+        {
+            fwprintf(stderr, L"RESULT=ABORT reason=SIGNAL_GO1\n");
+            break;
+        }
+
+        wait = WaitForSingleObject(done1, kTargetVerifyWaitMs);
+        if (wait != WAIT_OBJECT_0)
+        {
+            fwprintf(stderr, L"RESULT=ABORT reason=PASS1_VERIFY_TIMEOUT wait=%lu\n", wait);
+            break;
+        }
+
+        H3B_COUNTERS afterPass1 = {};
+        if (!QueryH3B(afterPass1))
+        {
+            fwprintf(stderr, L"RESULT=ABORT reason=AFTER_PASS1_QUERY_FAILED\n");
+            break;
+        }
+
+        const int64_t pass1ReadDelta =
+            afterPass1.PayloadReadPages - prePass1.PayloadReadPages;
+        const int64_t pass1MatchDelta =
+            afterPass1.PayloadMatches - prePass1.PayloadMatches;
+        const int64_t pass1MismatchDelta =
+            afterPass1.PayloadMismatches - prePass1.PayloadMismatches;
+
+        wprintf(L"PASS1_PAYLOAD_RESULT reads=%lld matches=%lld mismatches=%lld eligible=%lld\n",
+            pass1ReadDelta,
+            pass1MatchDelta,
+            pass1MismatchDelta,
+            afterPass1.InterventionEligible);
+
+        if ((pass1MatchDelta <= 0) ||
+            (pass1MismatchDelta != 0) ||
+            (afterPass1.InterventionEligible != 1))
+        {
+            fwprintf(stderr,
+                L"RESULT=ABORT reason=PASS1_DID_NOT_CREATE_VERIFIED_PAYLOADS "
+                L"reads=%lld matches=%lld mismatches=%lld eligible=%lld\n",
+                pass1ReadDelta,
+                pass1MatchDelta,
+                pass1MismatchDelta,
+                afterPass1.InterventionEligible);
+            break;
+        }
+
         /*
-         * One short settling interval is enough.  A four-second blind wait can
-         * create extra pagefile writes and evict the very history we need.
+         * The child re-trims the same unchanged target after signaling done1.
+         * Wait until that exact target is cold again before arming intervention.
          */
-        if (!stopForEvidence)
-        {
-            Sleep(750);
-        }
-
-        if (!QueryH3B(mid))
-        {
-            fwprintf(stderr, L"RESULT=ABORT reason=MID_QUERY_FAILED\n");
-            break;
-        }
-
-        PrintDelta(before, mid);
-
-        if (mid.PayloadMismatches != before.PayloadMismatches)
-        {
-            fwprintf(stderr,
-                L"RESULT=STOP_PAYLOAD_MISMATCH phase=before-read payloadDelta=%lld "
-                L"shadowDiagnosticDelta=%lld\n",
-                mid.PayloadMismatches - before.PayloadMismatches,
-                mid.ShadowMismatches - before.ShadowMismatches);
-            result = 40;
-            break;
-        }
-
-        if (mid.PagefileTableFull != 0)
-        {
-            fwprintf(stderr,
-                L"RESULT=ABORT reason=PAGEFILE_TABLE_FULL_BEFORE_READ value=%lld\n",
-                mid.PagefileTableFull);
-            result = 45;
-            break;
-        }
-
-        if (mid.DroppedInflightOutstanding != 0)
-        {
-            /*
-             * H3-B5 deliberately suppresses verification while a dropped
-             * in-flight range is unresolved.  Give already-issued writes a
-             * short chance to complete while keeping pressure resident.
-             */
-            for (int settle = 0;
-                 settle < 20 && mid.DroppedInflightOutstanding != 0;
-                 ++settle)
-            {
-                Sleep(25);
-                if (!QueryH3B(mid))
-                {
-                    fwprintf(stderr,
-                        L"RESULT=ABORT reason=SETTLE_QUERY_FAILED\n");
-                    result = 46;
-                    break;
-                }
-            }
-
-            if (result == 46)
-            {
-                break;
-            }
-
-            if (mid.DroppedInflightOutstanding != 0)
-            {
-                fwprintf(stderr,
-                    L"RESULT=ABORT reason=DROPPED_INFLIGHT_STUCK value=%lld\n",
-                    mid.DroppedInflightOutstanding);
-                result = 47;
-                break;
-            }
-        }
-
-        if (mid.HistoryRecordDrops != before.HistoryRecordDrops)
-        {
-            wprintf(L"NOTICE history-ring-drops-before-read=%lld; "
-                    L"triggering target read immediately\n",
-                mid.HistoryRecordDrops - before.HistoryRecordDrops);
-        }
-
-        targetCold =
-            (WaitForSingleObject(cold, 0) == WAIT_OBJECT_0);
-
-        wprintf(L"TARGET_COLD_BEFORE_READ=%s\n",
-            targetCold ? L"YES" : L"NO");
-
-        if (!targetCold)
-        {
-            fwprintf(stderr, L"RESULT=ABORT reason=TARGET_NOT_COLD_FOR_INTERVENTION\n");
-            result = 50;
-            break;
-        }
-
-        H3B_COUNTERS armed = mid;
-
-        if (!servedDuringPressure)
-        {
-            if (!armedDuringPressure)
-            {
-                if (!SendH3BCommand(kCommandArm, armed))
-                {
-                    fwprintf(stderr, L"RESULT=ABORT reason=ARM_COMMAND_FAILED\n");
-                    result = 51;
-                    break;
-                }
-
-                if ((armed.InterventionArmed != 1) ||
-                    (armed.InterventionEligible != 1) ||
-                    (armed.InterventionServedPages != before.InterventionServedPages) ||
-                    (armed.PayloadMismatches != before.PayloadMismatches))
-                {
-                    fwprintf(stderr,
-                        L"RESULT=ABORT reason=ARM_REJECTED eligible=%lld armed=%lld served=%lld "
-                        L"shadowMismatches=%lld payloadMismatches=%lld\n",
-                        armed.InterventionEligible,
-                        armed.InterventionArmed,
-                        armed.InterventionServedPages,
-                        armed.ShadowMismatches,
-                        armed.PayloadMismatches);
-                    result = 52;
-                    break;
-                }
-
-                wprintf(L"INTERVENTION_ARM_BEFORE_TARGET_READ=PASS "
-                        L"capacity=%lld payloadMatches=%lld\n",
-                    armed.InterventionCapacity,
-                    armed.PayloadMatches);
-            }
-            else
-            {
-                wprintf(L"INTERVENTION_ARM_PRESERVED_TO_TARGET_READ=YES\n");
-            }
-        }
-        else
-        {
-            wprintf(L"INTERVENTION_ALREADY_SERVED_BEFORE_TARGET_READ=YES\n");
-        }
-
-        SetEvent(go);
-
-        HANDLE verifyWaitHandles[2] = { done, pi.hProcess };
+        HANDLE pass2WaitHandles[2] = { cold2, pi.hProcess };
         wait = WaitForMultipleObjects(
             2,
-            verifyWaitHandles,
+            pass2WaitHandles,
+            FALSE,
+            kTargetGoWaitMs);
+
+        if (wait != WAIT_OBJECT_0)
+        {
+            fwprintf(stderr, L"RESULT=ABORT reason=PASS2_TARGET_NOT_COLD wait=%lu\n", wait);
+            break;
+        }
+
+        H3B_COUNTERS armed = {};
+        if (!SendH3BCommand(kCommandArm, armed) ||
+            (armed.InterventionArmed != 1) ||
+            (armed.InterventionEligible != 1) ||
+            (armed.PayloadMismatches != afterPass1.PayloadMismatches))
+        {
+            fwprintf(stderr,
+                L"RESULT=ABORT reason=PASS2_ARM_REJECTED eligible=%lld armed=%lld "
+                L"payloadMismatches=%lld\n",
+                armed.InterventionEligible,
+                armed.InterventionArmed,
+                armed.PayloadMismatches);
+            break;
+        }
+
+        wprintf(L"INTERVENTION_ARM_BEFORE_PASS2=PASS capacity=%lld payloadMatches=%lld\n",
+            armed.InterventionCapacity,
+            armed.PayloadMatches);
+
+        const int64_t attemptsBeforePass2 = armed.InterventionAttempts;
+        const int64_t servedBeforePass2 = armed.InterventionServedPages;
+        const int64_t fallbacksBeforePass2 = armed.InterventionFallbacks;
+        const int64_t guardsBeforePass2 = armed.InterventionGuardRejects;
+        const int64_t missesBeforePass2 = armed.InterventionPayloadMisses;
+
+        wprintf(L"PASS2_INTERVENTION_READ_BEGIN\n");
+        if (!SetEvent(go2))
+        {
+            fwprintf(stderr, L"RESULT=ABORT reason=SIGNAL_GO2\n");
+            break;
+        }
+
+        HANDLE done2WaitHandles[2] = { done2, pi.hProcess };
+        wait = WaitForMultipleObjects(
+            2,
+            done2WaitHandles,
             FALSE,
             kTargetVerifyWaitMs);
 
         if ((wait != WAIT_OBJECT_0) &&
             (wait != (WAIT_OBJECT_0 + 1)))
         {
-            fwprintf(stderr, L"RESULT=ABORT reason=TARGET_VERIFY_TIMEOUT wait=%lu\n", wait);
+            fwprintf(stderr, L"RESULT=ABORT reason=PASS2_VERIFY_TIMEOUT wait=%lu\n", wait);
             break;
         }
 
@@ -1413,10 +1250,9 @@ static int ParentMode()
 
         DWORD childCode = STILL_ACTIVE;
         GetExitCodeProcess(pi.hProcess, &childCode);
-
         if (childCode != 0)
         {
-            fwprintf(stderr, L"RESULT=ABORT reason=TARGET_VERIFY_FAILED code=%lu\n",
+            fwprintf(stderr, L"RESULT=ABORT reason=PASS2_TARGET_VERIFY_FAILED code=%lu\n",
                 static_cast<unsigned long>(childCode));
             result = 41;
             break;
@@ -1429,70 +1265,52 @@ static int ParentMode()
             break;
         }
 
-        PrintDelta(before, after);
+        const int64_t attemptsDelta =
+            after.InterventionAttempts - attemptsBeforePass2;
+        const int64_t servedDelta =
+            after.InterventionServedPages - servedBeforePass2;
+        const int64_t fallbackDelta =
+            after.InterventionFallbacks - fallbacksBeforePass2;
+        const int64_t guardDelta =
+            after.InterventionGuardRejects - guardsBeforePass2;
+        const int64_t payloadMissDelta =
+            after.InterventionPayloadMisses - missesBeforePass2;
 
-        if (after.PayloadMismatches != before.PayloadMismatches)
-        {
-            fwprintf(stderr,
-                L"RESULT=STOP_PAYLOAD_MISMATCH shadowDiagnosticDelta=%lld payloadDelta=%lld\n",
-                after.ShadowMismatches - before.ShadowMismatches,
-                after.PayloadMismatches - before.PayloadMismatches);
-            result = 42;
-            break;
-        }
+        wprintf(L"PASS2_INTERVENTION_RESULT attempts=%lld servedPages=%lld fallbacks=%lld "
+                L"guardRejects=%lld payloadMisses=%lld armedFinal=%lld\n",
+            attemptsDelta,
+            servedDelta,
+            fallbackDelta,
+            guardDelta,
+            payloadMissDelta,
+            after.InterventionArmed);
 
-        if (after.PagefileTableFull != 0)
-        {
-            fwprintf(stderr,
-                L"RESULT=ABORT reason=PAGEFILE_TABLE_FULL_FINAL value=%lld\n",
-                after.PagefileTableFull);
-            result = 48;
-            break;
-        }
-
-        int64_t servedDelta =
-            after.InterventionServedPages - before.InterventionServedPages;
-        int64_t attemptsDelta =
-            after.InterventionAttempts - before.InterventionAttempts;
-        int64_t hashRejectDelta =
-            after.InterventionHashRejects - before.InterventionHashRejects;
-        int64_t payloadMissDelta =
-            after.InterventionPayloadMisses - before.InterventionPayloadMisses;
-        int64_t guardRejectDelta =
-            after.InterventionGuardRejects - before.InterventionGuardRejects;
-
-        if ((servedDelta > 0) &&
+        if ((after.PayloadMismatches == before.PayloadMismatches) &&
+            (servedDelta > 0) &&
             (servedDelta <= after.InterventionCapacity) &&
             (attemptsDelta >= 1) &&
-            (after.InterventionArmed == 0) &&
-            (hashRejectDelta == 0) &&
-            (after.PayloadMismatches == before.PayloadMismatches))
+            (after.InterventionArmed == 0))
         {
             wprintf(L"RESULT=INTERVENTION_PASS verifiedPayloadClusterPages=%lld attemptsDelta=%lld "
-                    L"fallbacksDelta=%lld guardRejectsDelta=%lld payloadMissesDelta=%lld "
-                    L"hashRejectsDelta=%lld armedFinal=%lld\n",
+                    L"fallbacksDelta=%lld guardRejectsDelta=%lld payloadMissesDelta=%lld\n",
                 servedDelta,
                 attemptsDelta,
-                after.InterventionFallbacks - before.InterventionFallbacks,
-                guardRejectDelta,
-                payloadMissDelta,
-                hashRejectDelta,
-                after.InterventionArmed);
+                fallbackDelta,
+                guardDelta,
+                payloadMissDelta);
             result = 0;
         }
         else
         {
             wprintf(L"RESULT=INTERVENTION_NOT_SERVED servedPagesDelta=%lld attemptsDelta=%lld "
                     L"fallbacksDelta=%lld guardRejectsDelta=%lld payloadMissesDelta=%lld "
-                    L"hashRejectsDelta=%lld armedFinal=%lld eligibleFinal=%lld\n",
+                    L"payloadMismatches=%lld\n",
                 servedDelta,
                 attemptsDelta,
-                after.InterventionFallbacks - before.InterventionFallbacks,
-                guardRejectDelta,
+                fallbackDelta,
+                guardDelta,
                 payloadMissDelta,
-                hashRejectDelta,
-                after.InterventionArmed,
-                after.InterventionEligible);
+                after.PayloadMismatches - before.PayloadMismatches);
             result = 53;
         }
     }
@@ -1506,12 +1324,9 @@ static int ParentMode()
             disarmed.InterventionServedPages,
             disarmed.InterventionAttempts);
     }
-    else
-    {
-        fwprintf(stderr, L"INTERVENTION_CLEANUP=QUERY_FAILED\n");
-    }
 
-    SetEvent(go);
+    SetEvent(go1);
+    SetEvent(go2);
 
     for (void* block : pressure)
     {
@@ -1527,10 +1342,8 @@ static int ParentMode()
 
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
-    CloseHandle(ready);
-    CloseHandle(cold);
-    CloseHandle(go);
-    CloseHandle(done);
+    CloseHandle(ready); CloseHandle(cold1); CloseHandle(go1); CloseHandle(done1);
+    CloseHandle(cold2); CloseHandle(go2); CloseHandle(done2);
 
     MemSnapshot finalMem = {};
     if (GetMemorySnapshot(finalMem))
