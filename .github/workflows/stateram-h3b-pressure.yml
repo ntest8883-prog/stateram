@@ -8,6 +8,7 @@ on:
       - h3-payload-mirror-c1
       - h3-pagefile-shadow-b51
       - h3-intervention-d1
+      - h3-mdlfix-passive-deep
     paths:
       - "h3/pagefile-read-pressure/**"
       - ".github/workflows/stateram-h3b-pressure.yml"
