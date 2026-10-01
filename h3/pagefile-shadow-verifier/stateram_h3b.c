@@ -13,7 +13,7 @@
 #define H3B_PAYLOAD_SLOTS    2048
 #define H3B_PAYLOAD_WRITES_RETAINED (H3B_PAYLOAD_SLOTS / H3B_MAX_HASH_PAGES_PER_IO)
 #define H3B_POOL_TAG         'B3HS'
-#define H3B_MAX_HASH_PAGES_PER_IO 4
+#define H3B_MAX_HASH_PAGES_PER_IO 32
 #define H3B_MAX_TAG_SCAN_PAGES 64
 #define H3B_MAX_INTERVENTION_PAGES 32
 #define H3B_TAG_MAGIC1 0x535441544552414DULL
@@ -1397,8 +1397,9 @@ H3BPayloadWriteBase (
 
     /*
      * A payload record is retained by write sequence rather than by hashing
-     * its pagefile offset.  Each recent write gets four dedicated page slots,
-     * matching H3B_MAX_HASH_PAGES_PER_IO.  This removes direct-map collision
+     * its pagefile offset. Each recent write gets one dedicated slot per
+     * tracked page, matching H3B_MAX_HASH_PAGES_PER_IO (32 pages / 128 KiB).
+     * This removes direct-map collision
      * eviction between unrelated offsets.
      */
     writeSlot = WriteSequence & (H3B_PAYLOAD_WRITES_RETAINED - 1);
