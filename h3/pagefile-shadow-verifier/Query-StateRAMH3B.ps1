@@ -104,6 +104,15 @@ public static class StateRAMH3BNative
         public Int64 DiagActualHash2;
         public Int64 DiagWriterSameObject;
         public Int64 DiagGeneration;
+
+        public Int64 TaggedWritePages;
+        public Int64 TaggedReadPages;
+        public Int64 TaggedFirstWriteOffset;
+        public Int64 TaggedFirstReadOffset;
+        public Int64 TaggedFirstWritePageIndex;
+        public Int64 TaggedFirstReadPageIndex;
+        public Int64 TaggedFirstWriteSequence;
+        public Int64 TaggedFirstReadIdentityIndex;
     }
 
     [DllImport("fltlib.dll", CharSet = CharSet.Unicode)]
@@ -141,11 +150,11 @@ if ($SelfTest) {
         throw "Protocol self-test failed: Command size is $commandSize, expected 8."
     }
 
-    if ($counterSize -ne 624) {
-        throw "Protocol self-test failed: Counters size is $counterSize, expected 624."
+    if ($counterSize -ne 688) {
+        throw "Protocol self-test failed: Counters size is $counterSize, expected 688."
     }
 
-    Write-Host "StateRAMH3B query protocol self-test: PASS (Command=8, Counters=624)"
+    Write-Host "StateRAMH3B query protocol self-test: PASS (Command=8, Counters=688)"
     exit 0
 }
 
@@ -164,7 +173,7 @@ if ($hr -ne 0) {
 
 try {
     $cmd = New-Object StateRAMH3BNative+Command
-    $cmd.Version = 6
+    $cmd.Version = 7
     $cmd.CommandId = switch ($Command) {
         "query"  { 1 }
         "reset"  { 2 }
@@ -270,6 +279,15 @@ try {
         DiagActualHash2Hex         = ("0x{0:X16}" -f [uint64]$reply.DiagActualHash2)
         DiagWriterSameObject       = $reply.DiagWriterSameObject
         DiagGeneration             = $reply.DiagGeneration
+
+        TaggedWritePages            = $reply.TaggedWritePages
+        TaggedReadPages             = $reply.TaggedReadPages
+        TaggedFirstWriteOffset      = $reply.TaggedFirstWriteOffset
+        TaggedFirstReadOffset       = $reply.TaggedFirstReadOffset
+        TaggedFirstWritePageIndex   = $reply.TaggedFirstWritePageIndex
+        TaggedFirstReadPageIndex    = $reply.TaggedFirstReadPageIndex
+        TaggedFirstWriteSequence    = $reply.TaggedFirstWriteSequence
+        TaggedFirstReadIdentityIndex = $reply.TaggedFirstReadIdentityIndex
     } | Format-List
 }
 finally {
