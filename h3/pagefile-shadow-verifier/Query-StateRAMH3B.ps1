@@ -79,6 +79,31 @@ public static class StateRAMH3BNative
         public Int64 InterventionPayloadMisses;
         public Int64 InterventionHashRejects;
         public Int64 InterventionCapacity;
+
+        public Int64 DiagCaptured;
+        public Int64 DiagIdentityIndex;
+        public Int64 DiagReadBaseOffset;
+        public Int64 DiagPageOffset;
+        public Int64 DiagReadRequestedBytes;
+        public Int64 DiagReadCompletedBytes;
+        public Int64 DiagReadMdlBytes;
+        public Int64 DiagReadPageOrdinal;
+        public Int64 DiagReadIrpFlags;
+        public Int64 DiagReadOperationFlags;
+        public Int64 DiagReadDataFlags;
+        public Int64 DiagWriteSequence;
+        public Int64 DiagWriteIoLength;
+        public Int64 DiagWriteMdlBytes;
+        public Int64 DiagWritePageOrdinal;
+        public Int64 DiagWriteIrpFlags;
+        public Int64 DiagWriteOperationFlags;
+        public Int64 DiagWriteDataFlags;
+        public Int64 DiagExpectedHash1;
+        public Int64 DiagExpectedHash2;
+        public Int64 DiagActualHash1;
+        public Int64 DiagActualHash2;
+        public Int64 DiagWriterSameObject;
+        public Int64 DiagGeneration;
     }
 
     [DllImport("fltlib.dll", CharSet = CharSet.Unicode)]
@@ -116,11 +141,11 @@ if ($SelfTest) {
         throw "Protocol self-test failed: Command size is $commandSize, expected 8."
     }
 
-    if ($counterSize -ne 432) {
-        throw "Protocol self-test failed: Counters size is $counterSize, expected 432."
+    if ($counterSize -ne 624) {
+        throw "Protocol self-test failed: Counters size is $counterSize, expected 624."
     }
 
-    Write-Host "StateRAMH3B query protocol self-test: PASS (Command=8, Counters=432)"
+    Write-Host "StateRAMH3B query protocol self-test: PASS (Command=8, Counters=624)"
     exit 0
 }
 
@@ -139,7 +164,7 @@ if ($hr -ne 0) {
 
 try {
     $cmd = New-Object StateRAMH3BNative+Command
-    $cmd.Version = 5
+    $cmd.Version = 6
     $cmd.CommandId = switch ($Command) {
         "query"  { 1 }
         "reset"  { 2 }
@@ -220,6 +245,31 @@ try {
         InterventionPayloadMisses  = $reply.InterventionPayloadMisses
         InterventionHashRejects    = $reply.InterventionHashRejects
         InterventionCapacity       = $reply.InterventionCapacity
+
+        DiagCaptured               = $reply.DiagCaptured
+        DiagIdentityIndex          = $reply.DiagIdentityIndex
+        DiagReadBaseOffset         = $reply.DiagReadBaseOffset
+        DiagPageOffset             = $reply.DiagPageOffset
+        DiagReadRequestedBytes     = $reply.DiagReadRequestedBytes
+        DiagReadCompletedBytes     = $reply.DiagReadCompletedBytes
+        DiagReadMdlBytes           = $reply.DiagReadMdlBytes
+        DiagReadPageOrdinal        = $reply.DiagReadPageOrdinal
+        DiagReadIrpFlagsHex        = ("0x{0:X}" -f [uint64]$reply.DiagReadIrpFlags)
+        DiagReadOperationFlagsHex  = ("0x{0:X}" -f [uint64]$reply.DiagReadOperationFlags)
+        DiagReadDataFlagsHex       = ("0x{0:X}" -f [uint64]$reply.DiagReadDataFlags)
+        DiagWriteSequence          = $reply.DiagWriteSequence
+        DiagWriteIoLength          = $reply.DiagWriteIoLength
+        DiagWriteMdlBytes          = $reply.DiagWriteMdlBytes
+        DiagWritePageOrdinal       = $reply.DiagWritePageOrdinal
+        DiagWriteIrpFlagsHex       = ("0x{0:X}" -f [uint64]$reply.DiagWriteIrpFlags)
+        DiagWriteOperationFlagsHex = ("0x{0:X}" -f [uint64]$reply.DiagWriteOperationFlags)
+        DiagWriteDataFlagsHex      = ("0x{0:X}" -f [uint64]$reply.DiagWriteDataFlags)
+        DiagExpectedHash1Hex       = ("0x{0:X16}" -f [uint64]$reply.DiagExpectedHash1)
+        DiagExpectedHash2Hex       = ("0x{0:X16}" -f [uint64]$reply.DiagExpectedHash2)
+        DiagActualHash1Hex         = ("0x{0:X16}" -f [uint64]$reply.DiagActualHash1)
+        DiagActualHash2Hex         = ("0x{0:X16}" -f [uint64]$reply.DiagActualHash2)
+        DiagWriterSameObject       = $reply.DiagWriterSameObject
+        DiagGeneration             = $reply.DiagGeneration
     } | Format-List
 }
 finally {
