@@ -1,0 +1,69 @@
+name: StateRAM H5 adaptive governor
+
+on:
+  push:
+    branches:
+      - h5-adaptive-governor
+    paths:
+      - "windows/h5-governor/**"
+      - ".github/workflows/stateram-h5-governor.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Locate MSVC
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found" }
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ([string]::IsNullOrWhiteSpace($vs)) { throw "MSVC installation not found" }
+          "VSINSTALL=$vs" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build x64 governor
+        shell: pwsh
+        run: |
+          $src = "windows\h5-governor\StateRAMH5Governor.cpp"
+          $out = "windows\h5-governor\StateRAMH5Governor.exe"
+          $devcmd = Join-Path $env:VSINSTALL "Common7\Tools\VsDevCmd.bat"
+          $cmd = '"' + $devcmd + '" -arch=x64 -host_arch=x64 && cl.exe /nologo /std:c++17 /O2 /W4 /WX /EHsc /MT /DUNICODE /D_UNICODE "' + $src + '" /Fe:"' + $out + '" Psapi.lib'
+          cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw "cl.exe failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path $out)) { throw "Expected executable was not produced" }
+
+      - name: Run self-test
+        shell: pwsh
+        run: |
+          & "windows\h5-governor\StateRAMH5Governor.exe" --selftest
+          if ($LASTEXITCODE -ne 0) { throw "H5 self-test failed with exit code $LASTEXITCODE" }
+
+      - name: Stage package and hash
+        shell: pwsh
+        run: |
+          $root = "windows\h5-governor"
+          $package = "$root\package"
+          New-Item -ItemType Directory -Path $package -Force | Out-Null
+          Copy-Item "$root\StateRAMH5Governor.exe" "$package\StateRAMH5Governor.exe" -Force
+          Copy-Item "$root\README.md" "$package\README.md" -Force
+          $hash = (Get-FileHash "$package\StateRAMH5Governor.exe" -Algorithm SHA256).Hash
+          $size = (Get-Item "$package\StateRAMH5Governor.exe").Length
+          Write-Host "H5_EXE_SHA256=$hash"
+          Write-Host "H5_EXE_SIZE=$size"
+          @("H5_EXE_SHA256=$hash", "H5_EXE_SIZE=$size") |
+            Out-File "$package\SHA256.txt" -Encoding ascii
+
+      - name: Upload H5 governor
+        uses: actions/upload-artifact@v4
+        with:
+          name: StateRAM-H5-Adaptive-Governor
+          path: windows/h5-governor/package/*
+          if-no-files-found: error
