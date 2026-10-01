@@ -8,6 +8,7 @@ on:
       - h3-payload-mirror-c1
       - h3-pagefile-shadow-b51
       - h3-intervention-d1
+      - h3-d1-tagdiag
     paths:
       - "h3/pagefile-read-pressure/**"
       - ".github/workflows/stateram-h3b-pressure.yml"
@@ -43,6 +44,23 @@ jobs:
           cmd.exe /d /s /c $cmd
           if ($LASTEXITCODE -ne 0) { throw "cl.exe failed with exit code $LASTEXITCODE" }
           if (-not (Test-Path $out)) { throw "Expected executable was not produced" }
+
+      - name: Build x64 tagged diagnostic harness
+        shell: pwsh
+        run: |
+          $src = "h3\pagefile-read-pressure\StateRAMTagDiag.cpp"
+          $out = "h3\pagefile-read-pressure\StateRAMTagDiag.exe"
+          $devcmd = Join-Path $env:VSINSTALL "Common7\Tools\VsDevCmd.bat"
+          $cmd = '"' + $devcmd + '" -arch=x64 -host_arch=x64 && cl.exe /nologo /std:c++17 /O2 /W4 /WX /EHsc /MT /DUNICODE /D_UNICODE "' + $src + '" /Fe:"' + $out + '"'
+          cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw "Tagged diagnostic cl.exe failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path $out)) { throw "Expected tagged diagnostic executable was not produced" }
+
+      - name: Run tagged diagnostic harness self-test
+        shell: pwsh
+        run: |
+          & "h3\pagefile-read-pressure\StateRAMTagDiag.exe" --selftest
+          if ($LASTEXITCODE -ne 0) { throw "Tagged diagnostic harness self-test failed with exit code $LASTEXITCODE" }
 
       - name: Build x64 D1 intervention harness
         shell: pwsh
@@ -103,6 +121,26 @@ jobs:
         with:
           name: StateRAM-H3B-pagefile-read-pressure
           path: h3/pagefile-read-pressure/package/*
+          if-no-files-found: error
+
+      - name: Stage tagged diagnostic harness
+        shell: pwsh
+        run: |
+          $root = "h3\pagefile-read-pressure"
+          $package = "$root\tagdiag-package"
+          New-Item -ItemType Directory -Path $package -Force | Out-Null
+          Copy-Item "$root\StateRAMTagDiag.exe" "$package\StateRAMTagDiag.exe" -Force
+          $exeHash = (Get-FileHash "$package\StateRAMTagDiag.exe" -Algorithm SHA256).Hash
+          $exeSize = (Get-Item "$package\StateRAMTagDiag.exe").Length
+          Write-Host "TAGDIAG_EXE_SHA256=$exeHash"
+          Write-Host "TAGDIAG_EXE_SIZE=$exeSize"
+          @("TAGDIAG_EXE_SHA256=$exeHash", "TAGDIAG_EXE_SIZE=$exeSize") | Out-File "$package\StateRAMTagDiag-SHA256.txt" -Encoding ascii
+
+      - name: Upload tagged diagnostic harness
+        uses: actions/upload-artifact@v4
+        with:
+          name: StateRAM-H3D1-tagged-diagnostic-harness
+          path: h3/pagefile-read-pressure/tagdiag-package/*
           if-no-files-found: error
 
       - name: Stage D1 intervention harness
