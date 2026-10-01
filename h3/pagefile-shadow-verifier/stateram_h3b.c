@@ -1484,51 +1484,183 @@ H3BStorePayload (
 }
 
 static
-BOOLEAN
-H3BComparePayload (
+VOID
+H3BVerifyRetainedPayloadsForRead (
     _In_ ULONG IdentityIndex,
-    _In_ ULONGLONG Offset,
-    _In_ ULONGLONG WriteSequence,
-    _In_reads_bytes_(PAGE_SIZE) const UCHAR* Bytes,
-    _Out_ PBOOLEAN Match
+    _In_ ULONGLONG BaseOffset,
+    _In_reads_bytes_(PageCount * PAGE_SIZE) const UCHAR* Bytes,
+    _In_ ULONG PageCount
     )
 {
     KIRQL oldIrql;
-    ULONG baseIndex;
+    ULONG slotByPage[H3B_MAX_HASH_PAGES_PER_IO];
+    ULONGLONG sequenceByPage[H3B_MAX_HASH_PAGES_PER_IO];
     ULONG i;
     LONG generation;
-    PH3B_PAYLOAD_ENTRY entry;
-    BOOLEAN found;
 
-    found = FALSE;
-    *Match = FALSE;
+    if ((PageCount == 0) ||
+        (PageCount > H3B_MAX_HASH_PAGES_PER_IO))
+    {
+        return;
+    }
+
+    for (i = 0; i < PageCount; i++)
+    {
+        slotByPage[i] = MAXULONG;
+        sequenceByPage[i] = 0;
+    }
 
     generation = InterlockedCompareExchange(&g_ShadowGeneration, 0, 0);
-    baseIndex = H3BPayloadWriteBase(WriteSequence);
 
+    /*
+     * Payload verification is intentionally independent of the shadow table.
+     * Build one best-candidate map for the whole completed read while holding
+     * the payload lock only once.  Shadow hashes remain diagnostic only.
+     */
     KeAcquireSpinLock(&g_PayloadLock, &oldIrql);
 
-    for (i = 0; i < H3B_MAX_HASH_PAGES_PER_IO; i++)
+    for (i = 0; i < H3B_PAYLOAD_SLOTS; i++)
     {
-        entry = &g_PayloadTable[baseIndex + i];
+        PH3B_PAYLOAD_ENTRY entry;
+        ULONGLONG delta;
+        ULONG pageOrdinal;
 
-        if ((entry->Generation == (ULONG)generation) &&
-            (entry->IdentityIndex == IdentityIndex) &&
-            (entry->Offset == Offset) &&
-            (entry->WriteSequence == WriteSequence))
+        entry = &g_PayloadTable[i];
+
+        if ((entry->Generation != (ULONG)generation) ||
+            (entry->IdentityIndex != IdentityIndex) ||
+            (entry->Offset < BaseOffset))
         {
-            *Match = H3BPayloadBytesEqual(entry->Bytes, Bytes);
-            if (*Match)
-            {
-                entry->Verified = 1;
-            }
-            found = TRUE;
-            break;
+            continue;
+        }
+
+        delta = entry->Offset - BaseOffset;
+
+        if ((delta & (PAGE_SIZE - 1)) != 0)
+        {
+            continue;
+        }
+
+        pageOrdinal = (ULONG)(delta / PAGE_SIZE);
+
+        if (pageOrdinal >= PageCount)
+        {
+            continue;
+        }
+
+        if ((slotByPage[pageOrdinal] == MAXULONG) ||
+            (entry->WriteSequence > sequenceByPage[pageOrdinal]))
+        {
+            slotByPage[pageOrdinal] = i;
+            sequenceByPage[pageOrdinal] = entry->WriteSequence;
         }
     }
 
     KeReleaseSpinLock(&g_PayloadLock, oldIrql);
-    return found;
+
+    for (i = 0; i < PageCount; i++)
+    {
+        PH3B_PAYLOAD_ENTRY entry;
+        ULONGLONG offset;
+        ULONGLONG writeSequence;
+        BOOLEAN entryStillCurrent;
+        BOOLEAN match;
+
+        if (slotByPage[i] == MAXULONG)
+        {
+            InterlockedIncrement64(&g_PayloadLookupMisses);
+            continue;
+        }
+
+        offset = BaseOffset + ((ULONGLONG)i * PAGE_SIZE);
+        writeSequence = sequenceByPage[i];
+
+        if (!H3BHistoryAllowsVerify(
+                IdentityIndex,
+                offset,
+                writeSequence))
+        {
+            continue;
+        }
+
+        entryStillCurrent = FALSE;
+        match = FALSE;
+
+        KeAcquireSpinLock(&g_PayloadLock, &oldIrql);
+
+        entry = &g_PayloadTable[slotByPage[i]];
+
+        if ((entry->Generation == (ULONG)generation) &&
+            (entry->IdentityIndex == IdentityIndex) &&
+            (entry->Offset == offset) &&
+            (entry->WriteSequence == writeSequence))
+        {
+            match = H3BPayloadBytesEqual(
+                entry->Bytes,
+                Bytes + ((SIZE_T)i * PAGE_SIZE));
+            entryStillCurrent = TRUE;
+        }
+
+        KeReleaseSpinLock(&g_PayloadLock, oldIrql);
+
+        if (!entryStillCurrent)
+        {
+            InterlockedIncrement64(&g_PayloadLookupMisses);
+            continue;
+        }
+
+        /*
+         * Recheck freshness after comparing.  A newer overlapping pagefile
+         * write that raced the comparison makes this observation unusable.
+         */
+        if (!H3BHistoryAllowsVerify(
+                IdentityIndex,
+                offset,
+                writeSequence))
+        {
+            continue;
+        }
+
+        InterlockedIncrement64(&g_PayloadReadPages);
+
+        if (!match)
+        {
+            InterlockedIncrement64(&g_PayloadMismatches);
+            InterlockedExchange(&g_InterventionArmed, 0);
+            continue;
+        }
+
+        /*
+         * Mark only the exact retained record we compared.  If its slot was
+         * replaced meanwhile, treat that as a lookup miss rather than
+         * certifying a different payload.
+         */
+        entryStillCurrent = FALSE;
+
+        KeAcquireSpinLock(&g_PayloadLock, &oldIrql);
+
+        entry = &g_PayloadTable[slotByPage[i]];
+
+        if ((entry->Generation == (ULONG)generation) &&
+            (entry->IdentityIndex == IdentityIndex) &&
+            (entry->Offset == offset) &&
+            (entry->WriteSequence == writeSequence))
+        {
+            entry->Verified = 1;
+            entryStillCurrent = TRUE;
+        }
+
+        KeReleaseSpinLock(&g_PayloadLock, oldIrql);
+
+        if (entryStillCurrent)
+        {
+            InterlockedIncrement64(&g_PayloadMatches);
+        }
+        else
+        {
+            InterlockedIncrement64(&g_PayloadLookupMisses);
+        }
+    }
 }
 
 
@@ -2146,7 +2278,6 @@ H3BShadowCompletedWrite (
 {
     PVOID mappedBuffer;
     PUCHAR bytes;
-    PUCHAR payloadScratch;
     ULONGLONG baseOffset;
     ULONGLONG writeSequence;
     ULONG_PTR completedBytes;
@@ -2475,8 +2606,6 @@ H3BVerifyCompletedRead (
     PMDL mdl;
     BOOLEAN newSystemBufferRead;
 
-    payloadScratch = NULL;
-
     if (KeGetCurrentIrql() > DISPATCH_LEVEL)
     {
         InterlockedIncrement64(&g_ShadowHighIrqlSkips);
@@ -2556,19 +2685,6 @@ H3BVerifyCompletedRead (
             identityIndex);
     }
 
-#pragma warning(push)
-#pragma warning(disable:4996)
-    payloadScratch = (PUCHAR)ExAllocatePoolWithTag(
-        NonPagedPoolNx,
-        PAGE_SIZE,
-        H3B_POOL_TAG);
-#pragma warning(pop)
-
-    if (payloadScratch == NULL)
-    {
-        InterlockedIncrement64(&g_PayloadBufferUnavailable);
-    }
-
     pageCount = (ULONG)(completedBytes / PAGE_SIZE);
     mdl = Data->Iopb->Parameters.Read.MdlAddress;
 
@@ -2587,6 +2703,12 @@ H3BVerifyCompletedRead (
     {
         pageCount = H3B_MAX_HASH_PAGES_PER_IO;
     }
+
+    H3BVerifyRetainedPayloadsForRead(
+        identityIndex,
+        baseOffset,
+        bytes,
+        pageCount);
 
     __try
     {
@@ -2657,40 +2779,6 @@ H3BVerifyCompletedRead (
                 (actual2 == expected2))
             {
                 InterlockedIncrement64(&g_ShadowMatches);
-
-                if (payloadScratch != NULL)
-                {
-                    BOOLEAN payloadMatch;
-
-                    RtlCopyMemory(
-                        payloadScratch,
-                        bytes + ((SIZE_T)i * PAGE_SIZE),
-                        PAGE_SIZE);
-
-                    if (H3BComparePayload(
-                            identityIndex,
-                            offset,
-                            writeSequence,
-                            payloadScratch,
-                            &payloadMatch))
-                    {
-                        InterlockedIncrement64(&g_PayloadReadPages);
-
-                        if (payloadMatch)
-                        {
-                            InterlockedIncrement64(&g_PayloadMatches);
-                        }
-                        else
-                        {
-                            InterlockedIncrement64(&g_PayloadMismatches);
-                            InterlockedExchange(&g_InterventionArmed, 0);
-                        }
-                    }
-                    else
-                    {
-                        InterlockedIncrement64(&g_PayloadLookupMisses);
-                    }
-                }
 
                 if (crossObject)
                 {
